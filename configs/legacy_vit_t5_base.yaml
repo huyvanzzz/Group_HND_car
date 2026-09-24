@@ -1,0 +1,38 @@
+project:
+  output_dir: outputs/legacy_vit_t5_base
+data:
+  hf_repo_id: minhdang0901/drivelm-nuscenes-v1-0
+  revision: main
+  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
+  expected_counts: {train: 341381, val: 19785, test: 16817}
+cache:
+  dir: outputs/legacy_vit_t5_base/cache
+runtime:
+  device: auto
+  precision: auto
+model:
+  profile: legacy_vit_t5_base
+  vision:
+    name: legacy_vit_b32_patch
+    model_id: torchvision/vit_b_32
+    revision: IMAGENET1K_V1
+    output_dim: 768
+    seq_len: 49
+    image_size: 224
+  text:
+    model_id: google-t5/t5-base
+    d_model: 768
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  weight_decay: 0.05
+  scheduler_gamma: 0.9
+  align_epochs: 6
+  finetune_epochs: 6
+  gpa_hidden_size: 128
+  val_every_steps: 1000
+  save_every_steps: 1000
+generation:
+  max_new_tokens: 64
+  num_beams: 1
