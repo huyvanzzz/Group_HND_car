@@ -9,6 +9,7 @@ from typing import Any, Iterable
 from huggingface_hub import HfApi, snapshot_download
 
 from .config import CAMERA_ORDER, ExperimentConfig
+from .data import normalize_camera_paths
 from .debugging import DebugPrinter, path_status, safe_preview
 from .progress import progress
 
@@ -196,6 +197,7 @@ def prepare_data(
         counts[split] = len(records)
         if debug:
             for record in records[: debug.samples]:
+                normalized_paths = normalize_camera_paths(root, record.camera_paths, CAMERA_ORDER)
                 debug.log(
                     "SAMPLE",
                     {
@@ -205,7 +207,7 @@ def prepare_data(
                         "question": safe_preview(record.question),
                         "answer": safe_preview(record.answer),
                         "camera_order": CAMERA_ORDER,
-                        "paths": path_status([(root / record.camera_paths[camera]).resolve() for camera in CAMERA_ORDER]),
+                        "paths": path_status(normalized_paths),
                     },
                 )
         (prepared_dir / f"{split}.jsonl").write_text(
