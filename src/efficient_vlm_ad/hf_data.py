@@ -12,6 +12,15 @@ from .config import CAMERA_ORDER, ExperimentConfig
 from .debugging import DebugPrinter, path_status, safe_preview
 from .progress import progress
 
+NUSCENES_CAMERA_TO_CANONICAL = {
+    "CAM_FRONT": "Front",
+    "CAM_FRONT_LEFT": "Front-Left",
+    "CAM_FRONT_RIGHT": "Front-Right",
+    "CAM_BACK": "Back",
+    "CAM_BACK_LEFT": "Back-Left",
+    "CAM_BACK_RIGHT": "Back-Right",
+}
+
 
 @dataclass(frozen=True)
 class DatasetRecord:
@@ -27,9 +36,15 @@ class DatasetRecord:
 
 
 def _extract_cameras(row: dict[str, Any]) -> dict[str, str]:
-    if "cameras" in row and isinstance(row["cameras"], dict):
-        return {camera: str(row["cameras"][camera]) for camera in CAMERA_ORDER}
-    return {camera: str(row[camera]) for camera in CAMERA_ORDER if camera in row}
+    source = row["cameras"] if "cameras" in row and isinstance(row["cameras"], dict) else row
+    cameras: dict[str, str] = {}
+    for camera in CAMERA_ORDER:
+        if camera in source:
+            cameras[camera] = str(source[camera])
+    for raw_key, canonical_key in NUSCENES_CAMERA_TO_CANONICAL.items():
+        if raw_key in source:
+            cameras[canonical_key] = str(source[raw_key])
+    return cameras
 
 
 def _record_from_row(row: dict[str, Any], split: str, idx: int) -> DatasetRecord:

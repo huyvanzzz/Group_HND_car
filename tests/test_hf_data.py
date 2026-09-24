@@ -53,6 +53,39 @@ def test_parse_upstream_raw_multi_frame_json(tmp_path: Path):
     ]
 
 
+def test_parse_nuscenes_camera_keys_from_hf_dataset(tmp_path: Path):
+    data_path = tmp_path / "multi_frame_train.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                [
+                    {"Q": "What actions can collide with <c4,CAM_BACK,567.7,518.1>?", "A": "Brake suddenly."},
+                    {
+                        "CAM_FRONT": "data/nuscenes/samples/CAM_FRONT/front.jpg",
+                        "CAM_FRONT_LEFT": "data/nuscenes/samples/CAM_FRONT_LEFT/fl.jpg",
+                        "CAM_FRONT_RIGHT": "data/nuscenes/samples/CAM_FRONT_RIGHT/fr.jpg",
+                        "CAM_BACK": "data/nuscenes/samples/CAM_BACK/back.jpg",
+                        "CAM_BACK_LEFT": "data/nuscenes/samples/CAM_BACK_LEFT/bl.jpg",
+                        "CAM_BACK_RIGHT": "data/nuscenes/samples/CAM_BACK_RIGHT/br.jpg",
+                    },
+                ]
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    records = parse_dataset_json(data_path, split="train")
+
+    assert records[0].camera_paths == {
+        "Front": "data/nuscenes/samples/CAM_FRONT/front.jpg",
+        "Front-Left": "data/nuscenes/samples/CAM_FRONT_LEFT/fl.jpg",
+        "Front-Right": "data/nuscenes/samples/CAM_FRONT_RIGHT/fr.jpg",
+        "Back": "data/nuscenes/samples/CAM_BACK/back.jpg",
+        "Back-Left": "data/nuscenes/samples/CAM_BACK_LEFT/bl.jpg",
+        "Back-Right": "data/nuscenes/samples/CAM_BACK_RIGHT/br.jpg",
+    }
+
+
 def test_parse_tabular_json_rows(tmp_path: Path):
     data_path = tmp_path / "rows.json"
     data_path.write_text(
@@ -106,4 +139,3 @@ def test_validate_split_counts_allows_smoke_subset():
 def test_validate_split_counts_rejects_full_mismatch():
     with pytest.raises(ValueError, match="train"):
         validate_split_counts({"train": 2}, {"train": 341381}, subset="full")
-
