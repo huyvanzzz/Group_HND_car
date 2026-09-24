@@ -107,6 +107,13 @@ generation:
     assert (output_dir / "predictions.jsonl").exists()
     assert (output_dir / "benchmark.json").exists()
     assert (output_dir / "debug" / "debug_events.jsonl").exists()
+    debug_events = [
+        json.loads(line)
+        for line in (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(event["section"] == "MODEL" and "device" in event["payload"] for event in debug_events)
+    assert any(event["section"] == "EVAL" and "compute_device" in event["payload"] for event in debug_events)
 
 
 def test_smoke_prepare_features_keeps_examples_from_each_split(tmp_path: Path):

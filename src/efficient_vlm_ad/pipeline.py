@@ -285,6 +285,8 @@ def train_stage(
             dbg.log(
                 "BATCH",
                 {
+                    "stage": "before_device_transfer",
+                    "target_device": str(device),
                     "input_ids": tensor_stats("input_ids", batch["input_ids"]),
                     "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
                     "visual_features": tensor_stats("visual_features", batch["visual_features"]),
@@ -348,6 +350,7 @@ def evaluate_checkpoint(
     model, tokenizer = build_vlm_model(cfg)
     model.to(device)
     metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
     dataset = CachedVLMDataset(cfg, "test", max_samples=max_samples)
@@ -371,7 +374,8 @@ def evaluate_checkpoint(
                     "EVAL",
                     {
                         "eval_id": batch["eval_ids"][0],
-                        "generated_tokens": tensor_stats("generated_tokens", ids.detach().cpu()),
+                        "compute_device": str(device),
+                        "generated_tokens": tensor_stats("generated_tokens", ids),
                         "prediction": safe_preview(pred),
                         "reference": safe_preview(batch["answers"][0]),
                     },
@@ -400,6 +404,7 @@ def benchmark_checkpoint(
     model, tokenizer = build_vlm_model(cfg)
     model.to(device)
     metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
     dataset = CachedVLMDataset(cfg, "test", max_samples=max_samples)
