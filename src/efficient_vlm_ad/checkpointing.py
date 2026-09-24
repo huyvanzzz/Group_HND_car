@@ -25,7 +25,7 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
     torch_state = state["torch"].detach().to(device="cpu", dtype=torch.uint8)
     torch.set_rng_state(torch_state)
     if torch.cuda.is_available() and "cuda" in state:
-        cuda_states = [cuda_state.detach().to(device="cuda", dtype=torch.uint8) for cuda_state in state["cuda"]]
+        cuda_states = [cuda_state.detach().to(device="cpu", dtype=torch.uint8) for cuda_state in state["cuda"]]
         torch.cuda.set_rng_state_all(cuda_states)
 
 

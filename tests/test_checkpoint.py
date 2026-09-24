@@ -56,3 +56,25 @@ def test_restore_rng_state_accepts_non_byte_torch_state():
     }
 
     _restore_rng_state(state)
+
+
+def test_restore_rng_state_passes_cpu_byte_tensors_to_cuda_rng(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def fake_set_rng_state_all(states):
+        captured["states"] = states
+
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", fake_set_rng_state_all)
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": [torch.arange(8, dtype=torch.int64)],
+    }
+
+    _restore_rng_state(state)
+
+    assert captured["states"][0].device.type == "cpu"
+    assert captured["states"][0].dtype == torch.uint8
