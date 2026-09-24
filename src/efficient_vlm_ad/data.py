@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Mapping
 
@@ -16,6 +17,7 @@ def normalize_camera_paths(
     view_order: list[str] | None = None,
 ) -> list[Path]:
     root = Path(snapshot_root).resolve()
+    root_str = os.path.normcase(str(root))
     order = CAMERA_ORDER if view_order is None else view_order
     missing = [camera for camera in order if camera not in camera_paths]
     if missing:
@@ -24,10 +26,11 @@ def normalize_camera_paths(
     normalized: list[Path] = []
     for camera in order:
         raw_path = Path(camera_paths[camera])
-        candidate = (root / raw_path).resolve()
+        candidate = Path(os.path.abspath(root / raw_path))
         if not candidate.exists() and raw_path.parts and raw_path.parts[0] == "data":
-            candidate = (root / Path(*raw_path.parts[1:])).resolve()
-        if root not in [candidate, *candidate.parents]:
+            candidate = Path(os.path.abspath(root / Path(*raw_path.parts[1:])))
+        candidate_str = os.path.normcase(str(candidate))
+        if os.path.commonpath([root_str, candidate_str]) != root_str:
             raise ValueError(f"Camera path escapes snapshot root: {camera}={camera_paths[camera]}")
         normalized.append(candidate)
     return normalized
