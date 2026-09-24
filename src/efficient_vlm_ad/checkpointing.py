@@ -22,9 +22,11 @@ def _rng_state() -> dict[str, Any]:
 def _restore_rng_state(state: dict[str, Any]) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch_state = state["torch"].detach().to(device="cpu", dtype=torch.uint8)
+    torch.set_rng_state(torch_state)
     if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_states = [cuda_state.detach().to(device="cuda", dtype=torch.uint8) for cuda_state in state["cuda"]]
+        torch.cuda.set_rng_state_all(cuda_states)
 
 
 def save_checkpoint(
@@ -68,4 +70,3 @@ def load_checkpoint(
         scaler.load_state_dict(payload["scaler"])
     _restore_rng_state(payload["rng_state"])
     return dict(payload.get("metadata", {}))
-
