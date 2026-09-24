@@ -75,11 +75,15 @@ def prepare_features(
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     manifest = _read_prepared_manifest(cfg)
     root = Path(manifest["root"])
-    records = load_prepared_records(cfg, "train")
-    records += load_prepared_records(cfg, "val")
-    records += load_prepared_records(cfg, "test")
-    if subset != "full":
-        records = records[: int(cfg.training.max_steps or 64)]
+    records: list[DatasetRecord] = []
+    split_counts: dict[str, int] = {}
+    per_split_limit = int(cfg.training.max_steps or 64) if subset != "full" else None
+    for split in ("train", "val", "test"):
+        split_records = load_prepared_records(cfg, split)
+        if per_split_limit is not None:
+            split_records = split_records[:per_split_limit]
+        split_counts[split] = len(split_records)
+        records.extend(split_records)
 
     unique: dict[str, DatasetRecord] = {}
     for record in records:
@@ -96,6 +100,7 @@ def prepare_features(
             "precision": str(resolve_precision(cfg)),
             "vision": cfg.model.vision.name,
             "feature_shape": [len(unique), 6, cfg.model.vision.seq_len, cfg.model.vision.output_dim],
+            "split_counts": split_counts,
         },
     )
 
