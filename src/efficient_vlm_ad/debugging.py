@@ -8,6 +8,11 @@ from typing import Any
 
 import torch
 
+try:
+    from .progress import progress_write
+except Exception:  # pragma: no cover - fallback for partial installs
+    progress_write = print
+
 
 def _secret_values() -> list[str]:
     values = []
@@ -113,7 +118,7 @@ class DebugPrinter:
             "section": section,
             "payload": redact(payload),
         }
-        print(f"[DEBUG][{section}] {json.dumps(event['payload'], ensure_ascii=False, default=str)}")
+        progress_write(f"[DEBUG][{section}] {json.dumps(event['payload'], ensure_ascii=False, default=str)}")
         if self.jsonl_path:
             with self.jsonl_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
@@ -121,4 +126,3 @@ class DebugPrinter:
 
 def default_debug_jsonl(output_dir: str | Path) -> Path:
     return Path(output_dir) / "debug" / "debug_events.jsonl"
-

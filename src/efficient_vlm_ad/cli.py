@@ -38,7 +38,7 @@ def prepare_data(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     debug = make_debug(args, cfg)
     debug.log("CONFIG", config_debug_payload(cfg))
-    report = prepare_data_command(cfg, subset=args.subset, debug=debug)
+    report = prepare_data_command(cfg, subset=args.subset, debug=debug, disable_progress=args.no_progress)
     print(json.dumps(report, indent=2))
 
 
@@ -46,7 +46,14 @@ def prepare_features(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     debug = make_debug(args, cfg)
     debug.log("CONFIG", config_debug_payload(cfg))
-    report = prepare_features_command(cfg, subset=args.subset, debug=args.debug, debug_samples=args.debug_samples, debug_jsonl=args.debug_jsonl)
+    report = prepare_features_command(
+        cfg,
+        subset=args.subset,
+        debug=args.debug,
+        debug_samples=args.debug_samples,
+        debug_jsonl=args.debug_jsonl,
+        disable_progress=args.no_progress,
+    )
     print(json.dumps(report, indent=2))
 
 
@@ -64,6 +71,7 @@ def train(args: argparse.Namespace) -> None:
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
+        disable_progress=args.no_progress,
     )
     print(json.dumps({"checkpoint": str(ckpt), "stage": args.stage}, indent=2))
 
@@ -79,6 +87,7 @@ def evaluate(args: argparse.Namespace) -> None:
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
+        disable_progress=args.no_progress,
     )
     print(json.dumps(metrics, indent=2))
 
@@ -94,6 +103,7 @@ def benchmark(args: argparse.Namespace) -> None:
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
+        disable_progress=args.no_progress,
     )
     print(json.dumps(summary, indent=2))
 
@@ -132,6 +142,7 @@ def add_debug_args(cmd: argparse.ArgumentParser) -> None:
     cmd.add_argument("--debug", action="store_true")
     cmd.add_argument("--debug-samples", type=int, default=3)
     cmd.add_argument("--debug-jsonl")
+    cmd.add_argument("--no-progress", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:

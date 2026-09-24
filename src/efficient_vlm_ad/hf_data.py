@@ -10,6 +10,7 @@ from huggingface_hub import HfApi, snapshot_download
 
 from .config import CAMERA_ORDER, ExperimentConfig
 from .debugging import DebugPrinter, path_status, safe_preview
+from .progress import progress
 
 
 @dataclass(frozen=True)
@@ -142,7 +143,12 @@ def inspect_hf_dataset(cfg: ExperimentConfig, token: str | None, debug: DebugPri
     return report
 
 
-def prepare_data(cfg: ExperimentConfig, subset: str = "full", debug: DebugPrinter | None = None) -> dict[str, Any]:
+def prepare_data(
+    cfg: ExperimentConfig,
+    subset: str = "full",
+    debug: DebugPrinter | None = None,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
     output_dir = Path(cfg.project.output_dir)
     prepared_dir = output_dir / "prepared_data"
     prepared_dir.mkdir(parents=True, exist_ok=True)
@@ -167,7 +173,7 @@ def prepare_data(cfg: ExperimentConfig, subset: str = "full", debug: DebugPrinte
     candidates = split_file_candidates(files)
     all_records: dict[str, list[DatasetRecord]] = {}
     counts: dict[str, int] = {}
-    for split, rel_path in candidates.items():
+    for split, rel_path in progress(candidates.items(), desc="prepare-data", total=len(candidates), disable=disable_progress):
         records = parse_dataset_json(root / rel_path, split)
         if subset != "full":
             records = records[:64]

@@ -12,6 +12,7 @@ dependencies = [
   "timm",
   "torch",
   "torchvision",
+  "tqdm",
   "transformers",
 ]
 
@@ -21,4 +22,3 @@ dev = ["pytest"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-

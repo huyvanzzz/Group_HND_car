@@ -21,6 +21,7 @@ from .evaluation import caption_metrics, metric_display_values, write_prediction
 from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
+from .progress import progress
 
 
 def resolve_device(cfg: ExperimentConfig) -> torch.device:
@@ -69,6 +70,7 @@ def prepare_features(
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
+    disable_progress: bool = False,
 ) -> dict[str, Any]:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     manifest = _read_prepared_manifest(cfg)
@@ -103,7 +105,12 @@ def prepare_features(
     index: dict[str, int] = {}
 
     with torch.no_grad():
-        for idx, (key, record) in enumerate(unique.items()):
+        for idx, (key, record) in progress(
+            enumerate(unique.items()),
+            desc="prepare-features",
+            total=len(unique),
+            disable=disable_progress,
+        ):
             camera_paths = normalize_camera_paths(root, record.camera_paths, cfg.data.view_order)
             images = torch.stack([_load_image(path, cfg.model.vision.image_size, transform) for path in camera_paths])
             if idx < dbg.samples:
@@ -208,6 +215,7 @@ def train_stage(
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
+    disable_progress: bool = False,
 ) -> Path:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     device = resolve_device(cfg)
@@ -241,49 +249,53 @@ def train_stage(
     limit = max_steps or cfg.training.max_steps or len(loader)
     global_step = start_step
     model.train()
-    while global_step < start_step + limit:
-        for batch in loader:
-            if debug and global_step == start_step:
-                dbg.log(
-                    "BATCH",
-                    {
-                        "input_ids": tensor_stats("input_ids", batch["input_ids"]),
-                        "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
-                        "visual_features": tensor_stats("visual_features", batch["visual_features"]),
-                        "labels": tensor_stats("labels", batch["labels"].float()),
-                        "label_ignore_count": int((batch["labels"] == -100).sum().item()),
-                    },
-                )
-            for key in ("input_ids", "attention_mask", "visual_features", "labels"):
-                batch[key] = batch[key].to(device)
-            with torch.autocast(device_type=device.type, dtype=resolve_precision(cfg), enabled=device.type == "cuda" and resolve_precision(cfg) != torch.float32):
-                output = model.forward_from_features(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    visual_features=batch["visual_features"],
-                    labels=batch["labels"],
-                )
-                loss = output.loss / cfg.training.gradient_accumulation_steps
-            scaler.scale(loss).backward()
-            if debug and global_step < start_step + dbg.samples:
-                loss_value = float(loss.detach().cpu().item())
-                dbg.log(
-                    "TRAIN",
-                    {
-                        "step": global_step,
-                        "loss": loss_value,
-                        "finite_loss": bool(torch.isfinite(loss.detach()).item()),
-                        "lr": optimizer.param_groups[0]["lr"],
-                    },
-                )
-            if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-            if global_step >= start_step + limit:
-                break
-        scheduler.step()
+    loader_iter = iter(loader)
+    for _ in progress(range(limit), desc=f"train-{stage}", total=limit, disable=disable_progress):
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            scheduler.step()
+            loader_iter = iter(loader)
+            batch = next(loader_iter)
+        if debug and global_step == start_step:
+            dbg.log(
+                "BATCH",
+                {
+                    "input_ids": tensor_stats("input_ids", batch["input_ids"]),
+                    "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
+                    "visual_features": tensor_stats("visual_features", batch["visual_features"]),
+                    "labels": tensor_stats("labels", batch["labels"].float()),
+                    "label_ignore_count": int((batch["labels"] == -100).sum().item()),
+                },
+            )
+        for key in ("input_ids", "attention_mask", "visual_features", "labels"):
+            batch[key] = batch[key].to(device)
+        with torch.autocast(device_type=device.type, dtype=resolve_precision(cfg), enabled=device.type == "cuda" and resolve_precision(cfg) != torch.float32):
+            output = model.forward_from_features(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                visual_features=batch["visual_features"],
+                labels=batch["labels"],
+            )
+            loss = output.loss / cfg.training.gradient_accumulation_steps
+        scaler.scale(loss).backward()
+        if debug and global_step < start_step + dbg.samples:
+            loss_value = float(loss.detach().cpu().item())
+            dbg.log(
+                "TRAIN",
+                {
+                    "step": global_step,
+                    "loss": loss_value,
+                    "finite_loss": bool(torch.isfinite(loss.detach()).item()),
+                    "lr": optimizer.param_groups[0]["lr"],
+                },
+            )
+        if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        global_step += 1
+    scheduler.step()
 
     ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_latest.pt"
     save_checkpoint(
@@ -305,6 +317,7 @@ def evaluate_checkpoint(
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
+    disable_progress: bool = False,
 ) -> dict[str, float]:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     device = resolve_device(cfg)
@@ -317,7 +330,7 @@ def evaluate_checkpoint(
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
     rows: list[dict[str, Any]] = []
     with torch.no_grad():
-        for idx, batch in enumerate(loader):
+        for idx, batch in progress(enumerate(loader), desc="evaluate", total=len(loader), disable=disable_progress):
             for key in ("input_ids", "attention_mask", "visual_features"):
                 batch[key] = batch[key].to(device)
             ids = model.generate_from_features(
@@ -355,6 +368,7 @@ def benchmark_checkpoint(
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
+    disable_progress: bool = False,
 ) -> dict[str, Any]:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     device = resolve_device(cfg)
@@ -367,7 +381,7 @@ def benchmark_checkpoint(
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
     e2e, gen, token_counts = [], [], []
     with torch.no_grad():
-        for idx, batch in enumerate(loader):
+        for idx, batch in progress(enumerate(loader), desc="benchmark", total=len(loader), disable=disable_progress):
             start = time.perf_counter()
             for key in ("input_ids", "attention_mask", "visual_features"):
                 batch[key] = batch[key].to(device)
