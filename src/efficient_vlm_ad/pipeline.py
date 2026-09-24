@@ -160,6 +160,16 @@ class CachedVLMDataset(Dataset):
             shape=tuple(manifest.shape),
         )
         self.index = json.loads((Path(cfg.cache.dir) / "index.json").read_text(encoding="utf-8"))
+        prepared_count = len(self.records)
+        self.records = [record for record in self.records if _record_key(record) in self.index]
+        self.prepared_count = prepared_count
+        self.filtered_count = prepared_count - len(self.records)
+        self.cache_count = len(self.index)
+        if not self.records:
+            raise ValueError(
+                f"No {split} records have cached visual features. "
+                "Run prepare-features for this split/subset before training or evaluation."
+            )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -173,6 +183,14 @@ class CachedVLMDataset(Dataset):
             "visual_features": torch.from_numpy(np.array(self.features[feature_idx], dtype=np.float32)),
             "sample_id": record.sample_id,
             "eval_id": record.eval_id,
+        }
+
+    def summary(self) -> dict[str, int]:
+        return {
+            "prepared_records": self.prepared_count,
+            "cached_records": len(self.records),
+            "filtered_missing_features": self.filtered_count,
+            "feature_index_count": self.cache_count,
         }
 
 
@@ -245,6 +263,7 @@ def train_stage(
 
     split = "train"
     dataset = CachedVLMDataset(cfg, split)
+    dbg.log("FEATURE", {"split": split, **dataset.summary()})
     loader = DataLoader(dataset, batch_size=cfg.training.batch_size, shuffle=True, collate_fn=CachedBatchCollator(tokenizer))
     limit = max_steps or cfg.training.max_steps or len(loader)
     global_step = start_step
@@ -327,6 +346,7 @@ def evaluate_checkpoint(
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
     dataset = CachedVLMDataset(cfg, "test", max_samples=max_samples)
+    dbg.log("FEATURE", {"split": "test", **dataset.summary()})
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
     rows: list[dict[str, Any]] = []
     with torch.no_grad():
@@ -378,6 +398,7 @@ def benchmark_checkpoint(
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
     dataset = CachedVLMDataset(cfg, "test", max_samples=max_samples)
+    dbg.log("FEATURE", {"split": "test", **dataset.summary()})
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
     e2e, gen, token_counts = [], [], []
     with torch.no_grad():
