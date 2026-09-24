@@ -35,6 +35,29 @@ def test_normalize_camera_paths_rejects_missing_camera(tmp_path: Path):
         normalize_camera_paths(tmp_path, {"Front": "front.jpg"})
 
 
+def test_normalize_camera_paths_falls_back_from_data_prefix(tmp_path: Path):
+    root = tmp_path / "snapshot"
+    target_dir = root / "nuscenes" / "samples"
+    target_dir.mkdir(parents=True)
+    for name in ["front.jpg", "fl.jpg", "fr.jpg", "back.jpg", "bl.jpg", "br.jpg"]:
+        (target_dir / name).write_bytes(b"x")
+
+    paths = normalize_camera_paths(
+        root,
+        {
+            "Front": "data/nuscenes/samples/front.jpg",
+            "Front-Left": "data/nuscenes/samples/fl.jpg",
+            "Front-Right": "data/nuscenes/samples/fr.jpg",
+            "Back": "data/nuscenes/samples/back.jpg",
+            "Back-Left": "data/nuscenes/samples/bl.jpg",
+            "Back-Right": "data/nuscenes/samples/br.jpg",
+        },
+    )
+
+    assert all(path.exists() for path in paths)
+    assert paths[0] == (root / "nuscenes" / "samples" / "front.jpg").resolve()
+
+
 def test_normalize_camera_paths_rejects_escape(tmp_path: Path):
     root = tmp_path / "snapshot"
     root.mkdir()
@@ -51,4 +74,3 @@ def test_normalize_camera_paths_rejects_escape(tmp_path: Path):
 
     with pytest.raises(ValueError, match="escapes"):
         normalize_camera_paths(root, camera_paths)
-

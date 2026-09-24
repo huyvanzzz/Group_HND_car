@@ -23,9 +23,11 @@ def normalize_camera_paths(
 
     normalized: list[Path] = []
     for camera in order:
-        candidate = (root / camera_paths[camera]).resolve()
+        raw_path = Path(camera_paths[camera])
+        candidate = (root / raw_path).resolve()
+        if not candidate.exists() and raw_path.parts and raw_path.parts[0] == "data":
+            candidate = (root / Path(*raw_path.parts[1:])).resolve()
         if root not in [candidate, *candidate.parents]:
             raise ValueError(f"Camera path escapes snapshot root: {camera}={camera_paths[camera]}")
         normalized.append(candidate)
     return normalized
-
