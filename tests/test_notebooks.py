@@ -26,6 +26,9 @@ def test_full_train_notebook_has_no_smoke_limits_by_default():
     assert "--debug --debug-samples 1" in source
     assert "--mixed_precision no" in source
     assert "--mixed_precision fp16" not in source
+    assert "PYTHONUNBUFFERED=1 accelerate launch" in source
+    assert "train_progress.jsonl" in source
+    assert "tail -n 20" in source
     assert "nvidia-smi" in source
     assert "RUN_FULL_2GPU = False" not in source
     assert "--max-samples" not in source

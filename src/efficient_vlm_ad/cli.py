@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import subprocess
+from pathlib import Path
 
 from .config import load_config
 from .debugging import DebugPrinter, default_debug_jsonl
@@ -16,6 +17,7 @@ from .pipeline import (
     prepare_features as prepare_features_command,
     train_stage,
 )
+from .progress_logging import default_progress_jsonl
 
 
 def _git_sha() -> str | None:
@@ -75,6 +77,7 @@ def train(args: argparse.Namespace) -> None:
         debug_jsonl=args.debug_jsonl,
         debug_numerics=args.debug_numerics,
         disable_progress=args.no_progress,
+        progress_log_every_steps=args.progress_log_every_steps,
     )
     if is_main_process():
         print(json.dumps({"checkpoint": str(ckpt), "stage": args.stage}, indent=2))
@@ -146,6 +149,27 @@ def debug_sample(args: argparse.Namespace) -> None:
     print(json.dumps(report, indent=2))
 
 
+def monitor_progress(args: argparse.Namespace) -> None:
+    progress_path = Path(args.progress_file) if args.progress_file else default_progress_jsonl(args.output_dir)
+    if not progress_path.exists():
+        raise SystemExit(f"Progress file not found: {progress_path}")
+    rows = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:
+        raise SystemExit(f"Progress file is empty: {progress_path}")
+    tail = rows[-args.last :]
+    last_step = next((row for row in reversed(rows) if row.get("event") == "train_step"), None)
+    last_checkpoint = next((row for row in reversed(rows) if row.get("event") == "checkpoint_saved"), None)
+    summary = {
+        "progress_file": str(progress_path),
+        "event_count": len(rows),
+        "last_event": rows[-1],
+        "last_train_step": last_step,
+        "last_checkpoint": last_checkpoint,
+        "tail": tail,
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
 def make_debug(args: argparse.Namespace, cfg) -> DebugPrinter:
     return DebugPrinter(args.debug and is_main_process(), args.debug_samples, args.debug_jsonl or default_debug_jsonl(cfg.project.output_dir))
 
@@ -202,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_cmd.add_argument("--stage", required=True)
     train_cmd.add_argument("--resume")
     train_cmd.add_argument("--max-steps", type=int)
+    train_cmd.add_argument("--progress-log-every-steps", type=int)
     add_debug_args(train_cmd)
     train_cmd.set_defaults(func=train)
 
@@ -218,6 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
     debug_cmd.add_argument("--index", type=int, default=0)
     add_debug_args(debug_cmd)
     debug_cmd.set_defaults(func=debug_sample)
+
+    monitor_cmd = sub.add_parser("monitor-progress")
+    monitor_cmd.add_argument("--output-dir", required=True)
+    monitor_cmd.add_argument("--progress-file")
+    monitor_cmd.add_argument("--last", type=int, default=5)
+    monitor_cmd.set_defaults(func=monitor_progress)
 
     return parser
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable, Iterator
 from typing import TypeVar
 
@@ -18,3 +19,5 @@ def progress_bar(iterable: Iterable[T], *, desc: str, total: int | None = None, 
 
 def progress_write(message: str) -> None:
     tqdm.write(message)
+    sys.stdout.flush()
+    sys.stderr.flush()

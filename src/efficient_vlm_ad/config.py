@@ -84,6 +84,7 @@ class TrainingConfig:
     max_grad_norm: float | None = None
     num_workers: int = 0
     pin_memory: bool = False
+    progress_log_every_steps: int = 50
 
     @property
     def effective_batch_size(self) -> int:
@@ -176,6 +177,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             max_grad_norm=float(train_raw["max_grad_norm"]) if train_raw.get("max_grad_norm") is not None else None,
             num_workers=int(train_raw.get("num_workers", 0)),
             pin_memory=bool(train_raw.get("pin_memory", False)),
+            progress_log_every_steps=int(train_raw.get("progress_log_every_steps", 50)),
         ),
         cache=CacheConfig(dir=str(cache_raw.get("dir", "outputs/cache"))),
         runtime=RuntimeConfig(device=str(runtime_raw.get("device", "auto")), precision=precision),

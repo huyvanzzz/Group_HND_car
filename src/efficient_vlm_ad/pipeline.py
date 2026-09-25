@@ -24,6 +24,7 @@ from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
 from .progress import progress, progress_bar
+from .progress_logging import ProgressEventWriter
 
 
 class _SingleProcessAccelerator:
@@ -119,6 +120,16 @@ def _heartbeat(dbg: DebugPrinter, started_at: float, stage: str, **payload: Any)
             **payload,
         },
     )
+
+
+def _cuda_memory_payload(device: torch.device) -> dict[str, int | None]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {"cuda_memory_allocated": None, "cuda_memory_peak": None}
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return {
+        "cuda_memory_allocated": int(torch.cuda.memory_allocated(index)),
+        "cuda_memory_peak": int(torch.cuda.max_memory_allocated(index)),
+    }
 
 
 def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -411,6 +422,7 @@ def train_stage(
     debug_jsonl: str | None = None,
     debug_numerics: bool = False,
     disable_progress: bool = False,
+    progress_log_every_steps: int | None = None,
 ) -> Path:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     started_at = time.perf_counter()
@@ -502,16 +514,28 @@ def train_stage(
     latest_ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_latest.pt"
     best_ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_best.pt"
     optimizer.zero_grad(set_to_none=True)
+    progress_interval = max(1, int(progress_log_every_steps or cfg.training.progress_log_every_steps))
+    progress_writer = ProgressEventWriter(cfg.project.output_dir, enabled=bool(accelerator.is_main_process))
 
     for epoch in range(start_epoch, total_epochs):
         epoch_number = epoch + 1
         epoch_loss = 0.0
         epoch_batches = 0
+        epoch_started_at = time.perf_counter()
         loader_iter = iter(loader)
         bar_source = range(step_limit) if step_limit is not None else loader
         bar_total = step_limit if step_limit is not None else len(loader)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "train_tqdm_start", epoch=epoch_number, total=bar_total)
+            progress_writer.write(
+                "epoch_start",
+                stage=stage,
+                epoch=epoch_number,
+                total_epochs=total_epochs,
+                global_step=global_step,
+                total_steps_epoch=bar_total,
+                learning_rate=_optimizer_lr(optimizer),
+            )
         bar = progress_bar(
             bar_source,
             desc=f"train-{stage} epoch {epoch_number}/{total_epochs}",
@@ -553,6 +577,21 @@ def train_stage(
                 loss = raw_loss / cfg.training.gradient_accumulation_steps
             if not torch.isfinite(raw_loss.detach()).item():
                 if accelerator.is_main_process:
+                    progress_writer.write(
+                        "train_step",
+                        stage=stage,
+                        epoch=epoch_number,
+                        global_step=global_step,
+                        step_in_epoch=epoch_batches,
+                        total_steps_epoch=bar_total,
+                        loss=float(raw_loss.detach().cpu().item()),
+                        lr=_optimizer_lr(optimizer),
+                        finite_loss=False,
+                        elapsed_seconds=round(time.perf_counter() - epoch_started_at, 3),
+                        steps_per_second=0.0,
+                        estimated_epoch_remaining_seconds=None,
+                        **_cuda_memory_payload(device),
+                    )
                     numerics = {}
                     debug_model = accelerator.unwrap_model(model)
                     if debug_numerics and hasattr(debug_model, "forward_debug"):
@@ -595,6 +634,27 @@ def train_stage(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            if accelerator.is_main_process and (
+                epoch_batches == 1 or epoch_batches % progress_interval == 0 or epoch_batches == bar_total
+            ):
+                elapsed = max(time.perf_counter() - epoch_started_at, 1e-9)
+                steps_per_second = epoch_batches / elapsed
+                remaining_steps = max(0, int(bar_total) - epoch_batches)
+                progress_writer.write(
+                    "train_step",
+                    stage=stage,
+                    epoch=epoch_number,
+                    global_step=global_step,
+                    step_in_epoch=epoch_batches,
+                    total_steps_epoch=bar_total,
+                    loss=loss_value,
+                    lr=_optimizer_lr(optimizer),
+                    finite_loss=True,
+                    elapsed_seconds=round(elapsed, 3),
+                    steps_per_second=round(steps_per_second, 6),
+                    estimated_epoch_remaining_seconds=round(remaining_steps / steps_per_second, 3) if steps_per_second > 0 else None,
+                    **_cuda_memory_payload(device),
+                )
             if accelerator.is_main_process and hasattr(bar, "set_postfix"):
                 bar.set_postfix(loss=f"{loss_value:.4f}", lr=_optimizer_lr(optimizer), global_step=global_step)
         if epoch_batches == 0:
@@ -611,6 +671,13 @@ def train_stage(
         val_loss = None
         if accelerator.is_main_process:
             unwrapped = accelerator.unwrap_model(model)
+            progress_writer.write(
+                "validation_start",
+                stage=stage,
+                epoch=epoch_number,
+                global_step=global_step,
+                train_loss=epoch_train_loss,
+            )
             val_loss = validate_stage_loss(
                 cfg,
                 unwrapped,
@@ -620,6 +687,15 @@ def train_stage(
                 device=device,
                 debug=dbg if debug else None,
                 disable_progress=disable_progress,
+            )
+            progress_writer.write(
+                "validation_end",
+                stage=stage,
+                epoch=epoch_number,
+                global_step=global_step,
+                train_loss=epoch_train_loss,
+                val_loss=val_loss,
+                **_cuda_memory_payload(device),
             )
             if not np.isfinite(epoch_train_loss) or not np.isfinite(val_loss):
                 dbg.log(
@@ -677,6 +753,17 @@ def train_stage(
                     "val_loss": val_loss,
                 },
             )
+            progress_writer.write(
+                "checkpoint_saved",
+                stage=stage,
+                checkpoint_kind="latest",
+                path=str(latest_ckpt),
+                epoch=epoch_number,
+                global_step=global_step,
+                train_loss=epoch_train_loss,
+                val_loss=val_loss,
+                best_val_loss=best_val_loss,
+            )
             if is_best:
                 save_checkpoint(
                     best_ckpt,
@@ -687,8 +774,32 @@ def train_stage(
                     metadata=metadata,
                 )
                 dbg.log("CHECKPOINT", {"saved": str(best_ckpt), "stage": stage, "best_val_loss": best_val_loss})
+                progress_writer.write(
+                    "checkpoint_saved",
+                    stage=stage,
+                    checkpoint_kind="best",
+                    path=str(best_ckpt),
+                    epoch=epoch_number,
+                    global_step=global_step,
+                    train_loss=epoch_train_loss,
+                    val_loss=val_loss,
+                    best_val_loss=best_val_loss,
+                )
                 if stage == "finetune":
                     shutil.copy2(best_ckpt, Path(cfg.project.output_dir) / "checkpoints" / "best_model.pt")
+            progress_writer.write(
+                "epoch_end",
+                stage=stage,
+                epoch=epoch_number,
+                total_epochs=total_epochs,
+                global_step=global_step,
+                train_loss=epoch_train_loss,
+                val_loss=val_loss,
+                best_val_loss=best_val_loss,
+                best_epoch=best_epoch,
+                elapsed_seconds=round(time.perf_counter() - epoch_started_at, 3),
+                **_cuda_memory_payload(device),
+            )
         accelerator.wait_for_everyone()
 
     return latest_ckpt

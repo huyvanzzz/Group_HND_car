@@ -35,6 +35,7 @@ training:
   max_grad_norm: 1.0
   num_workers: 2
   pin_memory: true
+  progress_log_every_steps: 50
 generation:
   max_new_tokens: 512
   num_beams: 3

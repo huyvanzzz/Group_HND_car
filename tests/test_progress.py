@@ -1,10 +1,12 @@
 import subprocess
 import sys
 from pathlib import Path
+import json
 
 from PIL import Image
 
 from efficient_vlm_ad.progress import progress
+from efficient_vlm_ad.progress_logging import ProgressEventWriter
 
 
 def test_pyproject_declares_tqdm_dependency():
@@ -27,6 +29,36 @@ def test_cli_help_exposes_no_progress():
     )
 
     assert "--no-progress" in result.stdout
+
+
+def test_cli_help_exposes_progress_log_every_steps():
+    result = subprocess.run(
+        [sys.executable, "-m", "efficient_vlm_ad", "train", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--progress-log-every-steps" in result.stdout
+
+
+def test_progress_event_writer_appends_jsonl_and_redacts_token(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
+    writer = ProgressEventWriter(tmp_path / "outputs")
+
+    writer.write("train_step", stage="align", global_step=1, note="token=hf_secret_value")
+    writer.write("checkpoint_saved", stage="align", path="checkpoint.pt")
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "outputs" / "debug" / "train_progress.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert [row["event"] for row in rows] == ["train_step", "checkpoint_saved"]
+    assert rows[0]["stage"] == "align"
+    assert rows[0]["global_step"] == 1
+    assert rows[0]["note"] == "token=[REDACTED]"
+    assert "hf_secret_value" not in json.dumps(rows)
 
 
 def test_prepare_data_no_progress_runs(tmp_path: Path):

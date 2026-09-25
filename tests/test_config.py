@@ -30,6 +30,7 @@ def test_loads_kaggle_2gpu_profiles():
     assert cfg.training.finetune_epochs == 6
     assert cfg.training.align_max_steps is None
     assert cfg.training.finetune_max_steps is None
+    assert cfg.training.progress_log_every_steps == 50
     assert cfg.training.max_grad_norm == 1.0
     assert cfg.generation.max_new_tokens == 512
     assert cfg.generation.num_beams == 3

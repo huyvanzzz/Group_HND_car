@@ -123,6 +123,16 @@ generation:
     assert all("effective_batch_size" in event["payload"] for event in train_events)
     align_payload = torch.load(output_dir / "checkpoints" / "align_latest.pt", map_location="cpu", weights_only=False)
     assert align_payload["metadata"]["global_step"] == 2
+    progress_path = output_dir / "debug" / "train_progress.jsonl"
+    assert progress_path.exists()
+    progress_events = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    event_names = {event["event"] for event in progress_events}
+    assert {"epoch_start", "train_step", "validation_end", "checkpoint_saved"}.issubset(event_names)
+    first_train_step = next(event for event in progress_events if event["event"] == "train_step")
+    assert first_train_step["stage"] == "align"
+    assert first_train_step["finite_loss"] is True
+    assert "elapsed_seconds" in first_train_step
+    assert "estimated_epoch_remaining_seconds" in first_train_step
 
 
 def test_smoke_prepare_features_keeps_examples_from_each_split(tmp_path: Path):
@@ -221,6 +231,7 @@ generation:
     )
 
     assert (output_dir / "checkpoints" / "align_latest.pt").exists()
+    assert (output_dir / "debug" / "train_progress.jsonl").exists()
     assert (output_dir / "checkpoints" / "align_best.pt").exists()
     assert (output_dir / "checkpoints" / "finetune_latest.pt").exists()
     assert (output_dir / "checkpoints" / "finetune_best.pt").exists()
