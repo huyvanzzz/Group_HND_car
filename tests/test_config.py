@@ -21,7 +21,7 @@ def test_loads_kaggle_2gpu_profiles():
     safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_safe.yaml")
 
     assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu"
-    assert cfg.runtime.precision == "fp16"
+    assert cfg.runtime.precision == "fp32"
     assert cfg.training.batch_size == 16
     assert cfg.training.gradient_accumulation_steps == 2
     assert cfg.training.effective_batch_size == 32
@@ -37,6 +37,7 @@ def test_loads_kaggle_2gpu_profiles():
     assert cfg.generation.length_penalty == 1.0
 
     assert safe_cfg.training.batch_size == 8
+    assert safe_cfg.runtime.precision == "fp32"
     assert safe_cfg.training.gradient_accumulation_steps == 4
     assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
     assert safe_cfg.training.align_epochs == 6

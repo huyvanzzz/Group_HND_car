@@ -9,7 +9,7 @@ cache:
   dir: outputs/repvit_t5_efficient_mini_kaggle_2gpu_safe/cache
 runtime:
   device: auto
-  precision: fp16
+  precision: fp32
 model:
   profile: repvit_t5_efficient_mini_kaggle_2gpu_safe
   vision:
