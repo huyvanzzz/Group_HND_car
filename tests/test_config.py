@@ -1,4 +1,5 @@
 from pathlib import Path
+import tomllib
 
 import pytest
 
@@ -13,6 +14,30 @@ def test_loads_repvit_mini_profile():
     assert cfg.model.text.d_model == 384
     assert cfg.data.view_order == CAMERA_ORDER
     assert cfg.training.effective_batch_size == 4
+
+
+def test_loads_kaggle_2gpu_profiles():
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
+    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_safe.yaml")
+
+    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu"
+    assert cfg.runtime.precision == "fp16"
+    assert cfg.training.batch_size == 16
+    assert cfg.training.gradient_accumulation_steps == 2
+    assert cfg.training.effective_batch_size == 32
+    assert cfg.training.effective_batch_size_for_processes(2) == 64
+    assert cfg.training.align_max_steps == 3000
+    assert cfg.training.finetune_max_steps == 8000
+
+    assert safe_cfg.training.batch_size == 8
+    assert safe_cfg.training.gradient_accumulation_steps == 4
+    assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
+
+
+def test_accelerate_is_declared_dependency():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "accelerate" in pyproject["project"]["dependencies"]
 
 
 def test_rejects_non_canonical_view_order(tmp_path: Path):
@@ -44,4 +69,3 @@ training:
 
     with pytest.raises(ValueError, match="view_order"):
         load_config(config_path)
-

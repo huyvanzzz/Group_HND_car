@@ -44,6 +44,7 @@ def main() -> None:
         print("cuda available:", torch.cuda.is_available())
         if torch.cuda.is_available():
             print("gpu:", torch.cuda.get_device_name(0))
+            print("gpu count:", torch.cuda.device_count())
     except Exception as exc:
         print(f"torch env debug failed: {exc}")
     subprocess.call(["nvidia-smi"])
@@ -91,6 +92,13 @@ def main() -> None:
     ]
     for command in commands:
         subprocess.check_call([sys.executable, "-m", "efficient_vlm_ad", *command])
+
+    print("\nSmoke run complete. For 2-GPU training on Kaggle T4 x2, run:")
+    print(
+        "accelerate launch --multi_gpu --num_processes 2 --num_machines 1 --mixed_precision fp16 --dynamo_backend no "
+        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml "
+        "--stage align --debug --debug-samples 1"
+    )
 
 
 if __name__ == "__main__":

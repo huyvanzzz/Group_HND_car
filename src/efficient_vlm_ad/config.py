@@ -75,12 +75,17 @@ class TrainingConfig:
     finetune_epochs: int = 6
     gpa_hidden_size: int = 128
     max_steps: int | None = None
+    align_max_steps: int | None = None
+    finetune_max_steps: int | None = None
     val_every_steps: int | None = None
     save_every_steps: int | None = None
 
     @property
     def effective_batch_size(self) -> int:
         return self.batch_size * self.gradient_accumulation_steps
+
+    def effective_batch_size_for_processes(self, num_processes: int) -> int:
+        return self.effective_batch_size * max(1, int(num_processes))
 
 
 @dataclass(frozen=True)
@@ -159,6 +164,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             finetune_epochs=int(train_raw.get("finetune_epochs", 6)),
             gpa_hidden_size=int(train_raw.get("gpa_hidden_size", 128)),
             max_steps=int(train_raw["max_steps"]) if train_raw.get("max_steps") is not None else None,
+            align_max_steps=int(train_raw["align_max_steps"]) if train_raw.get("align_max_steps") is not None else None,
+            finetune_max_steps=int(train_raw["finetune_max_steps"]) if train_raw.get("finetune_max_steps") is not None else None,
             val_every_steps=int(train_raw["val_every_steps"]) if train_raw.get("val_every_steps") is not None else None,
             save_every_steps=int(train_raw["save_every_steps"]) if train_raw.get("save_every_steps") is not None else None,
         ),

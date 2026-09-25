@@ -114,6 +114,10 @@ generation:
     ]
     assert any(event["section"] == "MODEL" and "device" in event["payload"] for event in debug_events)
     assert any(event["section"] == "EVAL" and "compute_device" in event["payload"] for event in debug_events)
+    train_events = [event for event in debug_events if event["section"] == "DISTRIBUTED"]
+    assert train_events
+    assert all("num_processes" in event["payload"] for event in train_events)
+    assert all("effective_batch_size" in event["payload"] for event in train_events)
 
 
 def test_smoke_prepare_features_keeps_examples_from_each_split(tmp_path: Path):

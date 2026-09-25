@@ -63,6 +63,21 @@ class EfficientVLMForAD(nn.Module):
         combined_mask = torch.cat([visual_mask, attention_mask], dim=1)
         return self.text_model(inputs_embeds=inputs_embeds, attention_mask=combined_mask, labels=labels)
 
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        visual_features: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ):
+        return self.forward_from_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            visual_features=visual_features,
+            labels=labels,
+        )
+
     def generate_from_features(
         self,
         *,

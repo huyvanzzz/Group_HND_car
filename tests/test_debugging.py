@@ -2,12 +2,14 @@ import json
 import os
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import torch
 from PIL import Image
 
 from efficient_vlm_ad.debugging import DebugPrinter, model_param_summary, tensor_stats
+from efficient_vlm_ad.cli import make_debug
 
 
 def _make_fake_data(root: Path):
@@ -82,6 +84,16 @@ def test_debug_printer_redacts_secret_and_writes_jsonl(tmp_path, capsys, monkeyp
     assert "[DEBUG][ENV]" in stdout
 
 
+def test_cli_debug_is_disabled_on_non_main_distributed_rank(tmp_path, monkeypatch):
+    monkeypatch.setenv("RANK", "1")
+    args = Namespace(debug=True, debug_samples=1, debug_jsonl=None)
+    cfg = Namespace(project=Namespace(output_dir=tmp_path))
+
+    printer = make_debug(args, cfg)
+
+    assert printer.enabled is False
+
+
 def test_model_param_summary_counts_trainable_params():
     model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1))
     for param in model[1].parameters():
@@ -146,4 +158,3 @@ def test_debug_sample_cli_outputs_sections_and_jsonl(tmp_path):
     assert "[DEBUG][MODEL]" in result.stdout
     assert debug_jsonl.exists()
     assert "hf_" not in debug_jsonl.read_text(encoding="utf-8")
-

@@ -49,3 +49,23 @@ def test_vlm_fuses_visual_tokens_before_text_and_builds_combined_mask():
     assert text_model.last_attention_mask[:, 49:].tolist() == attention_mask.tolist()
     assert model.last_gpa_weights.shape == (2, 6)
 
+
+def test_vlm_forward_delegates_to_forward_from_features_for_ddp_wrappers():
+    text_model = FakeSeq2Seq(d_model=384)
+    model = EfficientVLMForAD(
+        text_model=text_model,
+        vision_dim=512,
+        d_model=384,
+        seq_len=49,
+        gpa_hidden_size=8,
+    )
+
+    out = model(
+        input_ids=torch.tensor([[1, 2, 0]]),
+        attention_mask=torch.tensor([[1, 1, 0]]),
+        visual_features=torch.randn(1, 6, 49, 512),
+        labels=torch.ones(1, 2, dtype=torch.long),
+    )
+
+    assert out.loss is not None
+    assert text_model.last_inputs_embeds.shape == (1, 52, 384)

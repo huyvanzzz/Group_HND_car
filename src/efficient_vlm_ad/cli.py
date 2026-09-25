@@ -122,7 +122,8 @@ def debug_sample(args: argparse.Namespace) -> None:
 
 
 def make_debug(args: argparse.Namespace, cfg) -> DebugPrinter:
-    return DebugPrinter(args.debug, args.debug_samples, args.debug_jsonl or default_debug_jsonl(cfg.project.output_dir))
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    return DebugPrinter(args.debug and rank == 0, args.debug_samples, args.debug_jsonl or default_debug_jsonl(cfg.project.output_dir))
 
 
 def config_debug_payload(cfg) -> dict:

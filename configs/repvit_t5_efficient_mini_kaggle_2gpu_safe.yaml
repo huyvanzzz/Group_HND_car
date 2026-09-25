@@ -1,0 +1,41 @@
+project:
+  output_dir: outputs/repvit_t5_efficient_mini_kaggle_2gpu_safe
+data:
+  hf_repo_id: minhdang0901/drivelm-nuscenes-v1-0
+  revision: main
+  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
+  expected_counts: {train: 341381, val: 19785, test: 16817}
+cache:
+  dir: outputs/repvit_t5_efficient_mini_kaggle_2gpu_safe/cache
+runtime:
+  device: auto
+  precision: fp16
+model:
+  profile: repvit_t5_efficient_mini_kaggle_2gpu_safe
+  vision:
+    name: repvit_m1_5
+    model_id: timm/repvit_m1_5.dist_450e_in1k
+    revision: 0b7e7367d18cc662e09be43e41479067b226cb4b
+    output_dim: 512
+    seq_len: 49
+    image_size: 224
+  text:
+    model_id: google/t5-efficient-mini
+    revision: af3816c2dbd386f7786f7757c536f0314084ff8b
+    d_model: 384
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0001
+  weight_decay: 0.05
+  scheduler_gamma: 0.9
+  align_epochs: 1
+  finetune_epochs: 1
+  gpa_hidden_size: 128
+  align_max_steps: 3000
+  finetune_max_steps: 8000
+  val_every_steps: 1000
+  save_every_steps: 1000
+generation:
+  max_new_tokens: 64
+  num_beams: 1

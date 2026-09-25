@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import platform
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,87 @@ from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
 from .progress import progress
+
+
+class _SingleProcessAccelerator:
+    device: torch.device
+    num_processes = 1
+    process_index = 0
+    local_process_index = 0
+    distributed_type = "NO"
+    mixed_precision = "no"
+    is_main_process = True
+    sync_gradients = True
+
+    def __init__(self, device: torch.device, mixed_precision: str = "no") -> None:
+        self.device = device
+        self.mixed_precision = mixed_precision
+
+    def prepare(self, *objects):
+        return objects
+
+    def backward(self, loss: torch.Tensor) -> None:
+        loss.backward()
+
+    def autocast(self):
+        dtype = torch.float16 if self.mixed_precision == "fp16" else torch.bfloat16
+        enabled = self.device.type == "cuda" and self.mixed_precision in {"fp16", "bf16"}
+        return torch.autocast(device_type=self.device.type, dtype=dtype, enabled=enabled)
+
+    def accumulate(self, _model):
+        return nullcontext()
+
+    def unwrap_model(self, model):
+        return model
+
+    def wait_for_everyone(self) -> None:
+        return None
+
+
+def _accelerate_precision(cfg: ExperimentConfig) -> str:
+    if cfg.runtime.precision == "fp16":
+        return "fp16"
+    if cfg.runtime.precision == "bf16":
+        return "bf16"
+    if cfg.runtime.precision == "auto" and torch.cuda.is_available():
+        return "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    return "no"
+
+
+def _build_accelerator(cfg: ExperimentConfig):
+    mixed_precision = _accelerate_precision(cfg)
+    try:
+        from accelerate import Accelerator
+    except Exception:
+        return _SingleProcessAccelerator(resolve_device(cfg), mixed_precision=mixed_precision)
+    return Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
+    )
+
+
+def _distributed_debug_payload(accelerator, cfg: ExperimentConfig) -> dict[str, Any]:
+    return {
+        "num_processes": int(getattr(accelerator, "num_processes", 1)),
+        "process_index": int(getattr(accelerator, "process_index", 0)),
+        "local_process_index": int(getattr(accelerator, "local_process_index", 0)),
+        "distributed_type": str(getattr(accelerator, "distributed_type", "NO")),
+        "mixed_precision": str(getattr(accelerator, "mixed_precision", "no")),
+        "per_process_batch_size": cfg.training.batch_size,
+        "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
+        "effective_batch_size": cfg.training.effective_batch_size_for_processes(
+            int(getattr(accelerator, "num_processes", 1))
+        ),
+    }
+
+
+def _optimizer_lr(optimizer) -> float | None:
+    param_groups = getattr(optimizer, "param_groups", None)
+    if param_groups is None and hasattr(optimizer, "optimizer"):
+        param_groups = getattr(optimizer.optimizer, "param_groups", None)
+    if not param_groups:
+        return None
+    return float(param_groups[0]["lr"])
 
 
 def resolve_device(cfg: ExperimentConfig) -> torch.device:
@@ -241,19 +323,22 @@ def train_stage(
     disable_progress: bool = False,
 ) -> Path:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
-    device = resolve_device(cfg)
+    accelerator = _build_accelerator(cfg)
+    device = accelerator.device
     model, tokenizer = build_vlm_model(cfg)
     model.to(device)
     set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
-    dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
+    if accelerator.is_main_process:
+        dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
+        dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
 
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and resolve_precision(cfg) == torch.float16)
 
     start_step = 0
     if resume:
-        dbg.log("CHECKPOINT", {"resume": resume})
+        if accelerator.is_main_process:
+            dbg.log("CHECKPOINT", {"resume": resume})
         metadata = load_checkpoint(resume, model=model, map_location=device)
         if metadata.get("stage") == stage:
             metadata = load_checkpoint(
@@ -261,31 +346,38 @@ def train_stage(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                scaler=scaler,
                 map_location=device,
             )
             start_step = int(metadata.get("global_step", 0))
 
     split = "train"
     dataset = CachedVLMDataset(cfg, split)
-    dbg.log("FEATURE", {"split": split, **dataset.summary()})
+    if accelerator.is_main_process:
+        dbg.log("FEATURE", {"split": split, **dataset.summary()})
     loader = DataLoader(dataset, batch_size=cfg.training.batch_size, shuffle=True, collate_fn=CachedBatchCollator(tokenizer))
-    limit = max_steps or cfg.training.max_steps or len(loader)
+    model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    configured_stage_steps = cfg.training.align_max_steps if stage == "align" else cfg.training.finetune_max_steps
+    limit = max_steps or configured_stage_steps or cfg.training.max_steps or len(loader)
     global_step = start_step
     model.train()
     loader_iter = iter(loader)
-    for _ in progress(range(limit), desc=f"train-{stage}", total=limit, disable=disable_progress):
+    for _ in progress(
+        range(limit),
+        desc=f"train-{stage}",
+        total=limit,
+        disable=disable_progress or not accelerator.is_main_process,
+    ):
         try:
             batch = next(loader_iter)
         except StopIteration:
             scheduler.step()
             loader_iter = iter(loader)
             batch = next(loader_iter)
-        if debug and global_step == start_step:
+        if debug and accelerator.is_main_process and global_step == start_step:
             dbg.log(
                 "BATCH",
                 {
-                    "stage": "before_device_transfer",
+                    "stage": "after_accelerator_prepare",
                     "target_device": str(device),
                     "input_ids": tensor_stats("input_ids", batch["input_ids"]),
                     "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
@@ -294,45 +386,53 @@ def train_stage(
                     "label_ignore_count": int((batch["labels"] == -100).sum().item()),
                 },
             )
-        for key in ("input_ids", "attention_mask", "visual_features", "labels"):
-            batch[key] = batch[key].to(device)
-        with torch.autocast(device_type=device.type, dtype=resolve_precision(cfg), enabled=device.type == "cuda" and resolve_precision(cfg) != torch.float32):
-            output = model.forward_from_features(
+        if isinstance(accelerator, _SingleProcessAccelerator):
+            for key in ("input_ids", "attention_mask", "visual_features", "labels"):
+                batch[key] = batch[key].to(device)
+        with accelerator.autocast():
+            output = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 visual_features=batch["visual_features"],
                 labels=batch["labels"],
             )
             loss = output.loss / cfg.training.gradient_accumulation_steps
-        scaler.scale(loss).backward()
-        if debug and global_step < start_step + dbg.samples:
+        accelerator.backward(loss)
+        if debug and accelerator.is_main_process and global_step < start_step + dbg.samples:
             loss_value = float(loss.detach().cpu().item())
             dbg.log(
                 "TRAIN",
                 {
-                    "step": global_step,
-                    "loss": loss_value,
-                    "finite_loss": bool(torch.isfinite(loss.detach()).item()),
-                    "lr": optimizer.param_groups[0]["lr"],
-                },
-            )
+                        "step": global_step,
+                        "loss": loss_value,
+                        "finite_loss": bool(torch.isfinite(loss.detach()).item()),
+                        "lr": _optimizer_lr(optimizer),
+                    },
+                )
         if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         global_step += 1
     scheduler.step()
 
     ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_latest.pt"
-    save_checkpoint(
-        ckpt,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        metadata={"stage": stage, "global_step": global_step, "profile": cfg.model.profile},
-    )
-    dbg.log("CHECKPOINT", {"saved": str(ckpt), "stage": stage, "global_step": global_step})
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        save_checkpoint(
+            ckpt,
+            model=accelerator.unwrap_model(model),
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            metadata={
+                "stage": stage,
+                "global_step": global_step,
+                "profile": cfg.model.profile,
+                "distributed": _distributed_debug_payload(accelerator, cfg),
+            },
+        )
+        dbg.log("CHECKPOINT", {"saved": str(ckpt), "stage": stage, "global_step": global_step})
+    accelerator.wait_for_everyone()
     return ckpt
 
 
