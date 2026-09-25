@@ -26,12 +26,23 @@ def test_loads_kaggle_2gpu_profiles():
     assert cfg.training.gradient_accumulation_steps == 2
     assert cfg.training.effective_batch_size == 32
     assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert cfg.training.align_max_steps == 3000
-    assert cfg.training.finetune_max_steps == 8000
+    assert cfg.training.align_epochs == 6
+    assert cfg.training.finetune_epochs == 6
+    assert cfg.training.align_max_steps is None
+    assert cfg.training.finetune_max_steps is None
+    assert cfg.training.max_grad_norm == 1.0
+    assert cfg.generation.max_new_tokens == 512
+    assert cfg.generation.num_beams == 3
+    assert cfg.generation.early_stopping is True
+    assert cfg.generation.length_penalty == 1.0
 
     assert safe_cfg.training.batch_size == 8
     assert safe_cfg.training.gradient_accumulation_steps == 4
     assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
+    assert safe_cfg.training.align_epochs == 6
+    assert safe_cfg.training.finetune_epochs == 6
+    assert safe_cfg.generation.max_new_tokens == 512
+    assert safe_cfg.generation.num_beams == 3
 
 
 def test_accelerate_is_declared_dependency():

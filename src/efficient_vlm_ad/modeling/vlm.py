@@ -86,6 +86,8 @@ class EfficientVLMForAD(nn.Module):
         visual_features: torch.Tensor,
         max_new_tokens: int,
         num_beams: int = 1,
+        early_stopping: bool = False,
+        length_penalty: float = 1.0,
     ) -> torch.Tensor:
         visual_features = self.add_spatial_embeddings(visual_features)
         fused, weights = self.gpa(visual_features)
@@ -106,4 +108,6 @@ class EfficientVLMForAD(nn.Module):
             attention_mask=combined_mask,
             max_new_tokens=max_new_tokens,
             num_beams=num_beams,
+            early_stopping=early_stopping,
+            length_penalty=length_penalty,
         )

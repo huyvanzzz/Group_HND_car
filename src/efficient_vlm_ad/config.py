@@ -38,6 +38,8 @@ class RuntimeConfig:
 class GenerationConfig:
     max_new_tokens: int = 64
     num_beams: int = 1
+    early_stopping: bool = False
+    length_penalty: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,9 @@ class TrainingConfig:
     finetune_max_steps: int | None = None
     val_every_steps: int | None = None
     save_every_steps: int | None = None
+    max_grad_norm: float | None = None
+    num_workers: int = 0
+    pin_memory: bool = False
 
     @property
     def effective_batch_size(self) -> int:
@@ -168,11 +173,16 @@ def load_config(path: str | Path) -> ExperimentConfig:
             finetune_max_steps=int(train_raw["finetune_max_steps"]) if train_raw.get("finetune_max_steps") is not None else None,
             val_every_steps=int(train_raw["val_every_steps"]) if train_raw.get("val_every_steps") is not None else None,
             save_every_steps=int(train_raw["save_every_steps"]) if train_raw.get("save_every_steps") is not None else None,
+            max_grad_norm=float(train_raw["max_grad_norm"]) if train_raw.get("max_grad_norm") is not None else None,
+            num_workers=int(train_raw.get("num_workers", 0)),
+            pin_memory=bool(train_raw.get("pin_memory", False)),
         ),
         cache=CacheConfig(dir=str(cache_raw.get("dir", "outputs/cache"))),
         runtime=RuntimeConfig(device=str(runtime_raw.get("device", "auto")), precision=precision),
         generation=GenerationConfig(
             max_new_tokens=int(generation_raw.get("max_new_tokens", 64)),
             num_beams=int(generation_raw.get("num_beams", 1)),
+            early_stopping=bool(generation_raw.get("early_stopping", False)),
+            length_penalty=float(generation_raw.get("length_penalty", 1.0)),
         ),
     )

@@ -93,11 +93,17 @@ def main() -> None:
     for command in commands:
         subprocess.check_call([sys.executable, "-m", "efficient_vlm_ad", *command])
 
-    print("\nSmoke run complete. For 2-GPU training on Kaggle T4 x2, run:")
+    print("\nSmoke run complete.")
+    print("For full training, open notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu.ipynb.")
+    print("Core full-train commands:")
+    print(
+        "accelerate launch --multi_gpu --num_processes 2 --num_machines 1 --mixed_precision fp16 --dynamo_backend no "
+        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml --stage align"
+    )
     print(
         "accelerate launch --multi_gpu --num_processes 2 --num_machines 1 --mixed_precision fp16 --dynamo_backend no "
         "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml "
-        "--stage align --debug --debug-samples 1"
+        "--stage finetune --resume outputs/repvit_t5_efficient_mini_kaggle_2gpu/checkpoints/align_best.pt"
     )
 
 

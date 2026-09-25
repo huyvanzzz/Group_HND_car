@@ -29,13 +29,14 @@ training:
   learning_rate: 0.0001
   weight_decay: 0.05
   scheduler_gamma: 0.9
-  align_epochs: 1
-  finetune_epochs: 1
+  align_epochs: 6
+  finetune_epochs: 6
   gpa_hidden_size: 128
-  align_max_steps: 3000
-  finetune_max_steps: 8000
-  val_every_steps: 1000
-  save_every_steps: 1000
+  max_grad_norm: 1.0
+  num_workers: 2
+  pin_memory: true
 generation:
-  max_new_tokens: 64
-  num_beams: 1
+  max_new_tokens: 512
+  num_beams: 3
+  early_stopping: true
+  length_penalty: 1.0

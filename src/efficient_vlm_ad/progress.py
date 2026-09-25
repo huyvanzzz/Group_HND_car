@@ -12,6 +12,9 @@ def progress(iterable: Iterable[T], *, desc: str, total: int | None = None, disa
     yield from tqdm(iterable, desc=desc, total=total, disable=disable)
 
 
+def progress_bar(iterable: Iterable[T], *, desc: str, total: int | None = None, disable: bool = False):
+    return tqdm(iterable, desc=desc, total=total, disable=disable)
+
+
 def progress_write(message: str) -> None:
     tqdm.write(message)
-

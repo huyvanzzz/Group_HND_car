@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import platform
+import shutil
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -22,7 +23,7 @@ from .evaluation import caption_metrics, metric_display_values, write_prediction
 from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
-from .progress import progress
+from .progress import progress, progress_bar
 
 
 class _SingleProcessAccelerator:
@@ -58,6 +59,9 @@ class _SingleProcessAccelerator:
 
     def wait_for_everyone(self) -> None:
         return None
+
+    def clip_grad_norm_(self, parameters, max_norm: float) -> None:
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm)
 
 
 def _accelerate_precision(cfg: ExperimentConfig) -> str:
@@ -104,6 +108,22 @@ def _optimizer_lr(optimizer) -> float | None:
     if not param_groups:
         return None
     return float(param_groups[0]["lr"])
+
+
+def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    for key in ("input_ids", "attention_mask", "visual_features", "labels"):
+        if key in batch:
+            batch[key] = batch[key].to(device)
+    return batch
+
+
+def _stage_epochs(cfg: ExperimentConfig, stage: str) -> int:
+    return cfg.training.align_epochs if stage == "align" else cfg.training.finetune_epochs
+
+
+def _stage_step_limit(cfg: ExperimentConfig, stage: str, max_steps: int | None) -> int | None:
+    configured_stage_steps = cfg.training.align_max_steps if stage == "align" else cfg.training.finetune_max_steps
+    return max_steps or configured_stage_steps or cfg.training.max_steps
 
 
 def resolve_device(cfg: ExperimentConfig) -> torch.device:
@@ -248,7 +268,16 @@ class CachedVLMDataset(Dataset):
         )
         self.index = json.loads((Path(cfg.cache.dir) / "index.json").read_text(encoding="utf-8"))
         prepared_count = len(self.records)
-        self.records = [record for record in self.records if _record_key(record) in self.index]
+        self.records = [
+            record
+            for record in progress(
+                self.records,
+                desc=f"filter-cache-{split}",
+                total=len(self.records),
+                disable=len(self.records) < 1000,
+            )
+            if _record_key(record) in self.index
+        ]
         self.prepared_count = prepared_count
         self.filtered_count = prepared_count - len(self.records)
         self.cache_count = len(self.index)
@@ -299,6 +328,55 @@ class CachedBatchCollator:
         }
 
 
+def validate_stage_loss(
+    cfg: ExperimentConfig,
+    model: torch.nn.Module,
+    tokenizer,
+    *,
+    stage: str,
+    epoch: int,
+    device: torch.device,
+    debug: DebugPrinter | None = None,
+    disable_progress: bool = False,
+) -> float:
+    dataset = CachedVLMDataset(cfg, "val")
+    if debug:
+        debug.log("FEATURE", {"split": "val", **dataset.summary()})
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        collate_fn=CachedBatchCollator(tokenizer),
+        num_workers=cfg.training.num_workers,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    total_batches = 0
+    with torch.no_grad():
+        for batch in progress(
+            loader,
+            desc=f"validate-{stage} epoch {epoch}",
+            total=len(loader),
+            disable=disable_progress,
+        ):
+            batch = _move_batch_to_device(batch, device)
+            output = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                visual_features=batch["visual_features"],
+                labels=batch["labels"],
+            )
+            total_loss += float(output.loss.detach().cpu().item())
+            total_batches += 1
+    if was_training:
+        model.train()
+    if total_batches == 0:
+        raise ValueError("Validation dataloader was empty")
+    return total_loss / total_batches
+
+
 def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
     return torch.nn.ModuleDict(
         {
@@ -336,6 +414,9 @@ def train_stage(
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
 
     start_step = 0
+    start_epoch = 0
+    best_val_loss = float("inf")
+    best_epoch = 0
     if resume:
         if accelerator.is_main_process:
             dbg.log("CHECKPOINT", {"resume": resume})
@@ -349,91 +430,184 @@ def train_stage(
                 map_location=device,
             )
             start_step = int(metadata.get("global_step", 0))
+            start_epoch = int(metadata.get("completed_epochs", metadata.get("epoch", 0)))
+            best_val_loss = float(metadata.get("best_val_loss", best_val_loss))
+            best_epoch = int(metadata.get("best_epoch", best_epoch))
 
     split = "train"
     dataset = CachedVLMDataset(cfg, split)
     if accelerator.is_main_process:
         dbg.log("FEATURE", {"split": split, **dataset.summary()})
-    loader = DataLoader(dataset, batch_size=cfg.training.batch_size, shuffle=True, collate_fn=CachedBatchCollator(tokenizer))
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        collate_fn=CachedBatchCollator(tokenizer),
+        num_workers=cfg.training.num_workers,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
-    configured_stage_steps = cfg.training.align_max_steps if stage == "align" else cfg.training.finetune_max_steps
-    limit = max_steps or configured_stage_steps or cfg.training.max_steps or len(loader)
+    step_limit = _stage_step_limit(cfg, stage, max_steps)
+    total_epochs = 1 if step_limit is not None else _stage_epochs(cfg, stage)
     global_step = start_step
     model.train()
-    loader_iter = iter(loader)
-    for _ in progress(
-        range(limit),
-        desc=f"train-{stage}",
-        total=limit,
-        disable=disable_progress or not accelerator.is_main_process,
-    ):
-        try:
-            batch = next(loader_iter)
-        except StopIteration:
-            scheduler.step()
-            loader_iter = iter(loader)
-            batch = next(loader_iter)
-        if debug and accelerator.is_main_process and global_step == start_step:
-            dbg.log(
-                "BATCH",
-                {
-                    "stage": "after_accelerator_prepare",
-                    "target_device": str(device),
-                    "input_ids": tensor_stats("input_ids", batch["input_ids"]),
-                    "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
-                    "visual_features": tensor_stats("visual_features", batch["visual_features"]),
-                    "labels": tensor_stats("labels", batch["labels"].float()),
-                    "label_ignore_count": int((batch["labels"] == -100).sum().item()),
-                },
-            )
-        if isinstance(accelerator, _SingleProcessAccelerator):
-            for key in ("input_ids", "attention_mask", "visual_features", "labels"):
-                batch[key] = batch[key].to(device)
-        with accelerator.autocast():
-            output = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                visual_features=batch["visual_features"],
-                labels=batch["labels"],
-            )
-            loss = output.loss / cfg.training.gradient_accumulation_steps
-        accelerator.backward(loss)
-        if debug and accelerator.is_main_process and global_step < start_step + dbg.samples:
-            loss_value = float(loss.detach().cpu().item())
-            dbg.log(
-                "TRAIN",
-                {
+    latest_ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_latest.pt"
+    best_ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_best.pt"
+    optimizer.zero_grad(set_to_none=True)
+
+    for epoch in range(start_epoch, total_epochs):
+        epoch_number = epoch + 1
+        epoch_loss = 0.0
+        epoch_batches = 0
+        loader_iter = iter(loader)
+        bar_source = range(step_limit) if step_limit is not None else loader
+        bar_total = step_limit if step_limit is not None else len(loader)
+        bar = progress_bar(
+            bar_source,
+            desc=f"train-{stage} epoch {epoch_number}/{total_epochs}",
+            total=bar_total,
+            disable=disable_progress or not accelerator.is_main_process,
+        )
+        for item in bar:
+            if step_limit is not None:
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    loader_iter = iter(loader)
+                    batch = next(loader_iter)
+            else:
+                batch = item
+            if debug and accelerator.is_main_process and global_step == start_step:
+                dbg.log(
+                    "BATCH",
+                    {
+                        "stage": "after_accelerator_prepare",
+                        "target_device": str(device),
+                        "input_ids": tensor_stats("input_ids", batch["input_ids"]),
+                        "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
+                        "visual_features": tensor_stats("visual_features", batch["visual_features"]),
+                        "labels": tensor_stats("labels", batch["labels"].float()),
+                        "label_ignore_count": int((batch["labels"] == -100).sum().item()),
+                    },
+                )
+            if isinstance(accelerator, _SingleProcessAccelerator):
+                batch = _move_batch_to_device(batch, device)
+            with accelerator.autocast():
+                output = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    visual_features=batch["visual_features"],
+                    labels=batch["labels"],
+                )
+                raw_loss = output.loss
+                loss = raw_loss / cfg.training.gradient_accumulation_steps
+            accelerator.backward(loss)
+            loss_value = float(raw_loss.detach().cpu().item())
+            epoch_loss += loss_value
+            epoch_batches += 1
+            if debug and accelerator.is_main_process and global_step < start_step + dbg.samples:
+                dbg.log(
+                    "TRAIN",
+                    {
                         "step": global_step,
+                        "epoch": epoch_number,
                         "loss": loss_value,
-                        "finite_loss": bool(torch.isfinite(loss.detach()).item()),
+                        "finite_loss": bool(torch.isfinite(raw_loss.detach()).item()),
                         "lr": _optimizer_lr(optimizer),
                     },
                 )
-        if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
+            if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
+                if cfg.training.max_grad_norm is not None:
+                    accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            if accelerator.is_main_process and hasattr(bar, "set_postfix"):
+                bar.set_postfix(loss=f"{loss_value:.4f}", lr=_optimizer_lr(optimizer), global_step=global_step)
+        if epoch_batches == 0:
+            raise ValueError("Training dataloader was empty")
+        if global_step % cfg.training.gradient_accumulation_steps != 0:
+            if cfg.training.max_grad_norm is not None:
+                accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-        global_step += 1
-    scheduler.step()
 
-    ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_latest.pt"
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        save_checkpoint(
-            ckpt,
-            model=accelerator.unwrap_model(model),
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=None,
-            metadata={
+        scheduler.step()
+        epoch_train_loss = epoch_loss / epoch_batches
+        accelerator.wait_for_everyone()
+        val_loss = None
+        if accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
+            val_loss = validate_stage_loss(
+                cfg,
+                unwrapped,
+                tokenizer,
+                stage=stage,
+                epoch=epoch_number,
+                device=device,
+                debug=dbg if debug else None,
+                disable_progress=disable_progress,
+            )
+            is_best = val_loss < best_val_loss
+            if is_best:
+                best_val_loss = val_loss
+                best_epoch = epoch_number
+            metadata = {
                 "stage": stage,
+                "epoch": epoch_number,
+                "completed_epochs": epoch_number,
                 "global_step": global_step,
                 "profile": cfg.model.profile,
+                "train_loss": epoch_train_loss,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+                "best_epoch": best_epoch,
+                "learning_rate": _optimizer_lr(optimizer),
+                "effective_batch_size": cfg.training.effective_batch_size_for_processes(
+                    int(getattr(accelerator, "num_processes", 1))
+                ),
                 "distributed": _distributed_debug_payload(accelerator, cfg),
-            },
-        )
-        dbg.log("CHECKPOINT", {"saved": str(ckpt), "stage": stage, "global_step": global_step})
-    accelerator.wait_for_everyone()
-    return ckpt
+                "generation": {
+                    "max_new_tokens": cfg.generation.max_new_tokens,
+                    "num_beams": cfg.generation.num_beams,
+                    "early_stopping": cfg.generation.early_stopping,
+                    "length_penalty": cfg.generation.length_penalty,
+                },
+            }
+            save_checkpoint(
+                latest_ckpt,
+                model=unwrapped,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=None,
+                metadata=metadata,
+            )
+            dbg.log(
+                "CHECKPOINT",
+                {
+                    "saved": str(latest_ckpt),
+                    "stage": stage,
+                    "epoch": epoch_number,
+                    "global_step": global_step,
+                    "train_loss": epoch_train_loss,
+                    "val_loss": val_loss,
+                },
+            )
+            if is_best:
+                save_checkpoint(
+                    best_ckpt,
+                    model=unwrapped,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=None,
+                    metadata=metadata,
+                )
+                dbg.log("CHECKPOINT", {"saved": str(best_ckpt), "stage": stage, "best_val_loss": best_val_loss})
+                if stage == "finetune":
+                    shutil.copy2(best_ckpt, Path(cfg.project.output_dir) / "checkpoints" / "best_model.pt")
+        accelerator.wait_for_everyone()
+
+    return latest_ckpt
 
 
 def evaluate_checkpoint(
@@ -467,6 +641,8 @@ def evaluate_checkpoint(
                 visual_features=batch["visual_features"],
                 max_new_tokens=cfg.generation.max_new_tokens,
                 num_beams=cfg.generation.num_beams,
+                early_stopping=cfg.generation.early_stopping,
+                length_penalty=cfg.generation.length_penalty,
             )
             pred = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)[0]
             if idx < dbg.samples:
@@ -525,6 +701,8 @@ def benchmark_checkpoint(
                 visual_features=batch["visual_features"],
                 max_new_tokens=cfg.generation.max_new_tokens,
                 num_beams=cfg.generation.num_beams,
+                early_stopping=cfg.generation.early_stopping,
+                length_penalty=cfg.generation.length_penalty,
             )
             if device.type == "cuda":
                 torch.cuda.synchronize()

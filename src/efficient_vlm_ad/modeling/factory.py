@@ -99,7 +99,16 @@ class TinySeq2Seq(nn.Module):
             loss = torch.nn.functional.cross_entropy(logits[:, 0], target)
         return type("Output", (), {"loss": loss, "logits": logits})()
 
-    def generate(self, *, inputs_embeds, attention_mask, max_new_tokens, num_beams=1):
+    def generate(
+        self,
+        *,
+        inputs_embeds,
+        attention_mask,
+        max_new_tokens,
+        num_beams=1,
+        early_stopping=False,
+        length_penalty=1.0,
+    ):
         batch = inputs_embeds.shape[0]
         return torch.ones((batch, max(1, min(max_new_tokens, 4))), dtype=torch.long, device=inputs_embeds.device)
 
@@ -157,4 +166,3 @@ def build_vlm_model(cfg):
         gpa_hidden_size=cfg.training.gpa_hidden_size,
     )
     return model, tokenizer
-

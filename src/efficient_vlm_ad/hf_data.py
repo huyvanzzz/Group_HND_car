@@ -67,10 +67,15 @@ def _record_from_row(row: dict[str, Any], split: str, idx: int) -> DatasetRecord
     )
 
 
-def parse_dataset_json(path: str | Path, split: str) -> list[DatasetRecord]:
+def parse_dataset_json(path: str | Path, split: str, disable_progress: bool = True) -> list[DatasetRecord]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     records: list[DatasetRecord] = []
-    for idx, item in enumerate(data):
+    for idx, item in progress(
+        enumerate(data),
+        desc=f"parse-{split}",
+        total=len(data),
+        disable=disable_progress,
+    ):
         if isinstance(item, list) and len(item) == 2 and isinstance(item[0], dict) and isinstance(item[1], dict):
             row = {"Q": item[0].get("Q"), "A": item[0].get("A"), "cameras": item[1]}
         elif isinstance(item, dict):
@@ -190,7 +195,7 @@ def prepare_data(
     all_records: dict[str, list[DatasetRecord]] = {}
     counts: dict[str, int] = {}
     for split, rel_path in progress(candidates.items(), desc="prepare-data", total=len(candidates), disable=disable_progress):
-        records = parse_dataset_json(root / rel_path, split)
+        records = parse_dataset_json(root / rel_path, split, disable_progress=disable_progress)
         if subset != "full":
             records = records[:64]
         all_records[split] = records
@@ -227,5 +232,12 @@ def load_prepared_records(cfg: ExperimentConfig, split: str) -> list[DatasetReco
     path = Path(cfg.project.output_dir) / "prepared_data" / f"{split}.jsonl"
     if not path.exists():
         prepare_data(cfg, subset="smoke" if cfg.training.max_steps else "full")
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    return [DatasetRecord(**row) for row in rows]
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows = [
+        json.loads(line)
+        for line in progress(lines, desc=f"load-prepared-{split}", total=len(lines), disable=len(lines) < 1000)
+    ]
+    return [
+        DatasetRecord(**row)
+        for row in progress(rows, desc=f"records-{split}", total=len(rows), disable=len(rows) < 1000)
+    ]
