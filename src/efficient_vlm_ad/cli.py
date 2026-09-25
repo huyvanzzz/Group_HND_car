@@ -11,6 +11,7 @@ from .hf_data import inspect_hf_dataset, prepare_data as prepare_data_command
 from .pipeline import (
     benchmark_checkpoint,
     debug_sample as debug_sample_command,
+    diagnose_train as diagnose_train_command,
     evaluate_checkpoint,
     prepare_features as prepare_features_command,
     train_stage,
@@ -61,6 +62,7 @@ def train(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     debug = make_debug(args, cfg)
     debug.log("CONFIG", config_debug_payload(cfg))
+    debug.log("HEARTBEAT", {"stage": "cli_train_args_received", "command": "train", "train_stage": args.stage, "resume": bool(args.resume), "max_steps": args.max_steps})
     if args.stage not in {"align", "finetune"}:
         raise SystemExit("--stage must be align or finetune")
     ckpt = train_stage(
@@ -75,6 +77,26 @@ def train(args: argparse.Namespace) -> None:
     )
     if is_main_process():
         print(json.dumps({"checkpoint": str(ckpt), "stage": args.stage}, indent=2))
+
+
+def diagnose_train(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    debug = make_debug(args, cfg)
+    debug.log("CONFIG", config_debug_payload(cfg))
+    debug.log("HEARTBEAT", {"stage": "cli_diagnose_args_received", "command": "diagnose-train", "train_stage": args.stage, "resume": bool(args.resume)})
+    if args.stage not in {"align", "finetune"}:
+        raise SystemExit("--stage must be align or finetune")
+    report = diagnose_train_command(
+        cfg,
+        args.stage,
+        resume=args.resume,
+        debug=args.debug,
+        debug_samples=args.debug_samples,
+        debug_jsonl=args.debug_jsonl,
+        disable_progress=args.no_progress,
+    )
+    if is_main_process():
+        print(json.dumps(report, indent=2))
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -179,6 +201,13 @@ def build_parser() -> argparse.ArgumentParser:
     train_cmd.add_argument("--max-steps", type=int)
     add_debug_args(train_cmd)
     train_cmd.set_defaults(func=train)
+
+    diagnose_cmd = sub.add_parser("diagnose-train")
+    diagnose_cmd.add_argument("--config", required=True)
+    diagnose_cmd.add_argument("--stage", required=True)
+    diagnose_cmd.add_argument("--resume")
+    add_debug_args(diagnose_cmd)
+    diagnose_cmd.set_defaults(func=diagnose_train)
 
     debug_cmd = sub.add_parser("debug-sample")
     debug_cmd.add_argument("--config", required=True)

@@ -70,3 +70,8 @@ def load_checkpoint(
         scaler.load_state_dict(payload["scaler"])
     _restore_rng_state(payload["rng_state"])
     return dict(payload.get("metadata", {}))
+
+
+def read_checkpoint_metadata(path: str | Path, *, map_location: str | torch.device = "cpu") -> dict[str, Any]:
+    payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    return dict(payload.get("metadata", {}))

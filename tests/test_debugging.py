@@ -126,6 +126,19 @@ def test_cli_accepts_debug_flags():
     assert "--debug-jsonl" in result.stdout
 
 
+def test_diagnose_train_cli_is_available():
+    result = subprocess.run(
+        [sys.executable, "-m", "efficient_vlm_ad", "diagnose-train", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--config" in result.stdout
+    assert "--stage" in result.stdout
+    assert "--resume" in result.stdout
+
+
 def test_debug_sample_cli_outputs_sections_and_jsonl(tmp_path):
     cfg = _write_fake_config(tmp_path)
     output_dir = tmp_path / "outputs"
@@ -165,3 +178,41 @@ def test_debug_sample_cli_outputs_sections_and_jsonl(tmp_path):
     assert "[DEBUG][MODEL]" in result.stdout
     assert debug_jsonl.exists()
     assert "hf_" not in debug_jsonl.read_text(encoding="utf-8")
+
+
+def test_diagnose_train_cli_reports_boundaries_and_batch(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_for_diagnose_test")
+    cfg = _write_fake_config(tmp_path)
+    output_dir = tmp_path / "outputs"
+
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "smoke"], check=True)
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg), "--subset", "smoke"], check=True)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "efficient_vlm_ad",
+            "diagnose-train",
+            "--config",
+            str(cfg),
+            "--stage",
+            "align",
+            "--debug",
+            "--debug-samples",
+            "1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    json_start = result.stdout.rfind("\n{")
+    payload = json.loads(result.stdout[json_start + 1 :])
+    assert payload["stage"] == "align"
+    assert payload["dataset"]["cached_records"] == 1
+    assert payload["batch"]["input_ids"]["shape"][0] == 1
+    assert "build_vlm_model" in payload["durations"]
+    debug_events = (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8")
+    assert "[DEBUG][HEARTBEAT]" in result.stdout
+    assert "hf_secret_for_diagnose_test" not in debug_events
+    assert "hf_secret_for_diagnose_test" not in result.stdout

@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .benchmarking import summarize_latencies
 from .cache import FeatureCacheManifest, create_memmap, validate_manifest
-from .checkpointing import load_checkpoint, save_checkpoint
+from .checkpointing import load_checkpoint, read_checkpoint_metadata, save_checkpoint
 from .config import ExperimentConfig
 from .data import format_prompt, normalize_camera_paths
 from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats
@@ -108,6 +108,17 @@ def _optimizer_lr(optimizer) -> float | None:
     if not param_groups:
         return None
     return float(param_groups[0]["lr"])
+
+
+def _heartbeat(dbg: DebugPrinter, started_at: float, stage: str, **payload: Any) -> None:
+    dbg.log(
+        "HEARTBEAT",
+        {
+            "stage": stage,
+            "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+            **payload,
+        },
+    )
 
 
 def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -401,10 +412,21 @@ def train_stage(
     disable_progress: bool = False,
 ) -> Path:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    started_at = time.perf_counter()
+    _heartbeat(dbg, started_at, "train_stage_start", train_stage=stage, resume=bool(resume), max_steps=max_steps)
+    _heartbeat(dbg, started_at, "build_accelerator_start")
     accelerator = _build_accelerator(cfg)
     device = accelerator.device
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "build_accelerator_done", device=str(device), distributed=_distributed_debug_payload(accelerator, cfg))
+        _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
     model, tokenizer = build_vlm_model(cfg)
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "build_vlm_model_done")
+        _heartbeat(dbg, started_at, "model_to_device_start", device=str(device))
     model.to(device)
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "model_to_device_done", device=str(device))
     set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
     if accelerator.is_main_process:
         dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
@@ -418,9 +440,21 @@ def train_stage(
     best_val_loss = float("inf")
     best_epoch = 0
     if resume:
+        resume_path = Path(resume)
         if accelerator.is_main_process:
-            dbg.log("CHECKPOINT", {"resume": resume})
-        metadata = load_checkpoint(resume, model=model, map_location=device)
+            dbg.log(
+                "CHECKPOINT",
+                {
+                    "resume": resume,
+                    "exists": resume_path.exists(),
+                    "size_bytes": resume_path.stat().st_size if resume_path.exists() else None,
+                },
+            )
+            _heartbeat(dbg, started_at, "checkpoint_metadata_start", path=resume)
+        metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        if accelerator.is_main_process:
+            _heartbeat(dbg, started_at, "checkpoint_metadata_done", metadata=metadata)
+            _heartbeat(dbg, started_at, "checkpoint_load_start", path=resume, same_stage=metadata.get("stage") == stage)
         if metadata.get("stage") == stage:
             metadata = load_checkpoint(
                 resume,
@@ -433,11 +467,19 @@ def train_stage(
             start_epoch = int(metadata.get("completed_epochs", metadata.get("epoch", 0)))
             best_val_loss = float(metadata.get("best_val_loss", best_val_loss))
             best_epoch = int(metadata.get("best_epoch", best_epoch))
+        else:
+            metadata = load_checkpoint(resume, model=model, map_location=device)
+        if accelerator.is_main_process:
+            _heartbeat(dbg, started_at, "checkpoint_load_done", metadata=metadata)
 
     split = "train"
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "dataset_start", split=split)
     dataset = CachedVLMDataset(cfg, split)
     if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "dataset_done", split=split, **dataset.summary())
         dbg.log("FEATURE", {"split": split, **dataset.summary()})
+        _heartbeat(dbg, started_at, "dataloader_start", split=split, batch_size=cfg.training.batch_size, num_workers=cfg.training.num_workers)
     loader = DataLoader(
         dataset,
         batch_size=cfg.training.batch_size,
@@ -446,7 +488,12 @@ def train_stage(
         num_workers=cfg.training.num_workers,
         pin_memory=cfg.training.pin_memory and device.type == "cuda",
     )
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "dataloader_done", split=split, batches=len(loader))
+        _heartbeat(dbg, started_at, "accelerator_prepare_start")
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "accelerator_prepare_done")
     step_limit = _stage_step_limit(cfg, stage, max_steps)
     total_epochs = 1 if step_limit is not None else _stage_epochs(cfg, stage)
     global_step = start_step
@@ -462,6 +509,8 @@ def train_stage(
         loader_iter = iter(loader)
         bar_source = range(step_limit) if step_limit is not None else loader
         bar_total = step_limit if step_limit is not None else len(loader)
+        if accelerator.is_main_process:
+            _heartbeat(dbg, started_at, "train_tqdm_start", epoch=epoch_number, total=bar_total)
         bar = progress_bar(
             bar_source,
             desc=f"train-{stage} epoch {epoch_number}/{total_epochs}",
@@ -608,6 +657,120 @@ def train_stage(
         accelerator.wait_for_everyone()
 
     return latest_ckpt
+
+
+def _batch_debug_summary(batch: dict[str, Any], device: torch.device | None = None) -> dict[str, Any]:
+    keys = ("input_ids", "attention_mask", "visual_features", "labels")
+    summary = {key: tensor_stats(key, batch[key].float() if key == "labels" else batch[key]) for key in keys if key in batch}
+    if device is not None:
+        summary["target_device"] = str(device)
+    if "labels" in batch:
+        summary["label_ignore_count"] = int((batch["labels"] == -100).sum().item())
+    return summary
+
+
+def diagnose_train(
+    cfg: ExperimentConfig,
+    stage: str,
+    resume: str | None = None,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    started_at = time.perf_counter()
+    durations: dict[str, float] = {}
+
+    def mark(name: str, begin: float) -> None:
+        durations[name] = round(time.perf_counter() - begin, 3)
+        _heartbeat(dbg, started_at, f"{name}_done", duration_seconds=durations[name])
+
+    _heartbeat(dbg, started_at, "diagnose_start", train_stage=stage, resume=bool(resume))
+    begin = time.perf_counter()
+    accelerator = _build_accelerator(cfg)
+    device = accelerator.device
+    mark("build_accelerator", begin)
+    if accelerator.is_main_process:
+        dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
+
+    begin = time.perf_counter()
+    _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
+    model, tokenizer = build_vlm_model(cfg)
+    mark("build_vlm_model", begin)
+
+    begin = time.perf_counter()
+    model.to(device)
+    set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
+    mark("model_to_device", begin)
+    if accelerator.is_main_process:
+        dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
+
+    checkpoint_metadata = None
+    if resume:
+        resume_path = Path(resume)
+        begin = time.perf_counter()
+        checkpoint_metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        mark("checkpoint_metadata", begin)
+        if accelerator.is_main_process:
+            dbg.log(
+                "CHECKPOINT",
+                {
+                    "resume": resume,
+                    "exists": resume_path.exists(),
+                    "size_bytes": resume_path.stat().st_size if resume_path.exists() else None,
+                    "metadata": checkpoint_metadata,
+                },
+            )
+
+    begin = time.perf_counter()
+    dataset = CachedVLMDataset(cfg, "train")
+    mark("dataset", begin)
+    dataset_summary = dataset.summary()
+    if accelerator.is_main_process:
+        dbg.log("FEATURE", {"split": "train", **dataset_summary})
+
+    begin = time.perf_counter()
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        collate_fn=CachedBatchCollator(tokenizer),
+        num_workers=cfg.training.num_workers,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    mark("dataloader", begin)
+
+    begin = time.perf_counter()
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
+    model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    mark("accelerator_prepare", begin)
+
+    begin = time.perf_counter()
+    batch = next(iter(loader))
+    if isinstance(accelerator, _SingleProcessAccelerator):
+        batch = _move_batch_to_device(batch, device)
+    mark("first_batch", begin)
+    batch_summary = _batch_debug_summary(batch, device)
+    if accelerator.is_main_process:
+        dbg.log("BATCH", {"stage": "diagnose_first_batch", **batch_summary})
+
+    report = {
+        "stage": stage,
+        "device": str(device),
+        "cuda": torch.cuda.is_available(),
+        "gpu_count": torch.cuda.device_count(),
+        "peak_cuda_memory": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
+        "distributed": _distributed_debug_payload(accelerator, cfg),
+        "checkpoint_metadata": checkpoint_metadata,
+        "dataset": dataset_summary,
+        "feature_cache_shape": list(dataset.features.shape),
+        "batch": batch_summary,
+        "durations": durations,
+    }
+    _heartbeat(dbg, started_at, "diagnose_done")
+    return report
 
 
 def evaluate_checkpoint(
