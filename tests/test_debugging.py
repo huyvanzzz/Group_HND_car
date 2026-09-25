@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 
 from efficient_vlm_ad.debugging import DebugPrinter, model_param_summary, tensor_stats
-from efficient_vlm_ad.cli import make_debug
+from efficient_vlm_ad.cli import is_main_process, make_debug
 
 
 def _make_fake_data(root: Path):
@@ -92,6 +92,13 @@ def test_cli_debug_is_disabled_on_non_main_distributed_rank(tmp_path, monkeypatc
     printer = make_debug(args, cfg)
 
     assert printer.enabled is False
+
+
+def test_cli_main_process_detection_respects_rank(monkeypatch):
+    monkeypatch.setenv("RANK", "1")
+    assert is_main_process() is False
+    monkeypatch.setenv("RANK", "0")
+    assert is_main_process() is True
 
 
 def test_model_param_summary_counts_trainable_params():

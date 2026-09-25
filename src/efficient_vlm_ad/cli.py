@@ -73,7 +73,8 @@ def train(args: argparse.Namespace) -> None:
         debug_jsonl=args.debug_jsonl,
         disable_progress=args.no_progress,
     )
-    print(json.dumps({"checkpoint": str(ckpt), "stage": args.stage}, indent=2))
+    if is_main_process():
+        print(json.dumps({"checkpoint": str(ckpt), "stage": args.stage}, indent=2))
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -122,8 +123,12 @@ def debug_sample(args: argparse.Namespace) -> None:
 
 
 def make_debug(args: argparse.Namespace, cfg) -> DebugPrinter:
+    return DebugPrinter(args.debug and is_main_process(), args.debug_samples, args.debug_jsonl or default_debug_jsonl(cfg.project.output_dir))
+
+
+def is_main_process() -> bool:
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-    return DebugPrinter(args.debug and rank == 0, args.debug_samples, args.debug_jsonl or default_debug_jsonl(cfg.project.output_dir))
+    return rank == 0
 
 
 def config_debug_payload(cfg) -> dict:
