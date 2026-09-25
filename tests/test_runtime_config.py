@@ -1,3 +1,6 @@
+import sys
+from types import ModuleType
+
 import pytest
 
 from efficient_vlm_ad.config import load_config
@@ -46,3 +49,28 @@ runtime:
 
     with pytest.raises(ValueError, match="precision"):
         load_config(cfg)
+
+
+def test_accelerator_enables_unused_parameter_detection(monkeypatch):
+    from efficient_vlm_ad import pipeline
+
+    captured = {}
+
+    class FakeDistributedDataParallelKwargs:
+        def __init__(self, **kwargs):
+            captured["ddp_kwargs"] = kwargs
+
+    class FakeAccelerator:
+        def __init__(self, **kwargs):
+            captured["accelerator_kwargs"] = kwargs
+
+    fake_accelerate = ModuleType("accelerate")
+    fake_accelerate.Accelerator = FakeAccelerator
+    fake_accelerate.DistributedDataParallelKwargs = FakeDistributedDataParallelKwargs
+    monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
+
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
+    pipeline._build_accelerator(cfg)
+
+    assert captured["ddp_kwargs"] == {"find_unused_parameters": True}
+    assert len(captured["accelerator_kwargs"]["kwargs_handlers"]) == 1

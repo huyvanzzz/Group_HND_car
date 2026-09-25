@@ -78,12 +78,14 @@ def _accelerate_precision(cfg: ExperimentConfig) -> str:
 def _build_accelerator(cfg: ExperimentConfig):
     mixed_precision = _accelerate_precision(cfg)
     try:
-        from accelerate import Accelerator
+        from accelerate import Accelerator, DistributedDataParallelKwargs
     except Exception:
         return _SingleProcessAccelerator(resolve_device(cfg), mixed_precision=mixed_precision)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     return Accelerator(
         mixed_precision=mixed_precision,
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
+        kwargs_handlers=[ddp_kwargs],
     )
 
 
