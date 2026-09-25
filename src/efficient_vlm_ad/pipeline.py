@@ -409,6 +409,7 @@ def train_stage(
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
+    debug_numerics: bool = False,
     disable_progress: bool = False,
 ) -> Path:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
@@ -550,6 +551,29 @@ def train_stage(
                 )
                 raw_loss = output.loss
                 loss = raw_loss / cfg.training.gradient_accumulation_steps
+            if not torch.isfinite(raw_loss.detach()).item():
+                if accelerator.is_main_process:
+                    numerics = {}
+                    debug_model = accelerator.unwrap_model(model)
+                    if debug_numerics and hasattr(debug_model, "forward_debug"):
+                        with torch.no_grad():
+                            numerics = debug_model.forward_debug(
+                                input_ids=batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                                visual_features=batch["visual_features"],
+                                labels=batch["labels"],
+                            )
+                    dbg.log(
+                        "NUMERICS",
+                        {
+                            "stage": "non_finite_loss",
+                            "step": global_step,
+                            "epoch": epoch_number,
+                            "loss": float(raw_loss.detach().cpu().item()),
+                            **numerics,
+                        },
+                    )
+                raise FloatingPointError(f"Non-finite loss at step {global_step}: {raw_loss.detach().cpu().item()}")
             accelerator.backward(loss)
             loss_value = float(raw_loss.detach().cpu().item())
             epoch_loss += loss_value
@@ -597,6 +621,17 @@ def train_stage(
                 debug=dbg if debug else None,
                 disable_progress=disable_progress,
             )
+            if not np.isfinite(epoch_train_loss) or not np.isfinite(val_loss):
+                dbg.log(
+                    "NUMERICS",
+                    {
+                        "stage": "non_finite_epoch_loss",
+                        "epoch": epoch_number,
+                        "train_loss": epoch_train_loss,
+                        "val_loss": val_loss,
+                    },
+                )
+                raise FloatingPointError(f"Non-finite epoch loss at epoch {epoch_number}: train={epoch_train_loss}, val={val_loss}")
             is_best = val_loss < best_val_loss
             if is_best:
                 best_val_loss = val_loss
@@ -676,6 +711,7 @@ def diagnose_train(
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
+    debug_numerics: bool = False,
     disable_progress: bool = False,
 ) -> dict[str, Any]:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
@@ -755,6 +791,17 @@ def diagnose_train(
     batch_summary = _batch_debug_summary(batch, device)
     if accelerator.is_main_process:
         dbg.log("BATCH", {"stage": "diagnose_first_batch", **batch_summary})
+    numerics = None
+    debug_model = accelerator.unwrap_model(model)
+    if debug_numerics and accelerator.is_main_process and hasattr(debug_model, "forward_debug"):
+        with torch.no_grad(), accelerator.autocast():
+            numerics = debug_model.forward_debug(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                visual_features=batch["visual_features"],
+                labels=batch["labels"],
+            )
+        dbg.log("NUMERICS", {"stage": "diagnose_forward", **numerics})
 
     report = {
         "stage": stage,
@@ -767,6 +814,7 @@ def diagnose_train(
         "dataset": dataset_summary,
         "feature_cache_shape": list(dataset.features.shape),
         "batch": batch_summary,
+        "numerics": numerics,
         "durations": durations,
     }
     _heartbeat(dbg, started_at, "diagnose_done")

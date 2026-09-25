@@ -1,7 +1,8 @@
 import torch
 
-from efficient_vlm_ad.config import load_config
+from efficient_vlm_ad.config import CacheConfig, DataConfig, ExperimentConfig, GenerationConfig, ModelConfig, ProjectConfig, RuntimeConfig, TextConfig, TrainingConfig, VisionConfig, load_config
 from efficient_vlm_ad.modeling.gpa import GatedPoolingAttention
+from efficient_vlm_ad.modeling.factory import build_vlm_model
 from efficient_vlm_ad.modeling.multimodal import MultiModalProjector, set_trainable_for_stage
 
 
@@ -56,3 +57,43 @@ def test_stage_freeze_policy_for_repvit_mini():
     assert not any(p.requires_grad for p in modules["vision"].parameters())
     assert all(p.requires_grad for p in modules["text"].parameters())
 
+
+def test_forward_debug_reports_numerical_intermediates():
+    cfg = ExperimentConfig(
+        project=ProjectConfig(output_dir="unused"),
+        data=DataConfig(hf_repo_id="local/fake", view_order=["Front", "Front-Left", "Front-Right", "Back", "Back-Left", "Back-Right"]),
+        model=ModelConfig(
+            profile="debug",
+            vision=VisionConfig(name="fake_vision", model_id="fake", output_dim=8, seq_len=4, image_size=16),
+            text=TextConfig(model_id="fake_t5", d_model=8),
+        ),
+        training=TrainingConfig(batch_size=1, gradient_accumulation_steps=1, gpa_hidden_size=4),
+        cache=CacheConfig(dir="unused"),
+        runtime=RuntimeConfig(precision="fp32"),
+        generation=GenerationConfig(),
+    )
+    model, tokenizer = build_vlm_model(cfg)
+    encoded = tokenizer(["Question: What is visible? Answer:"], padding=True, return_tensors="pt")
+    labels = tokenizer(["A road."], padding=True, return_tensors="pt")["input_ids"]
+    visual_features = torch.randn(2, cfg.model.vision.seq_len, cfg.model.vision.output_dim).unsqueeze(0)
+
+    report = model.forward_debug(
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        visual_features=visual_features,
+        labels=labels,
+    )
+
+    assert report["loss"]["finite"] is True
+    for key in [
+        "raw_visual_features",
+        "spatial_visual_features",
+        "gpa_weights",
+        "fused_visual_features",
+        "visual_tokens",
+        "text_tokens",
+        "inputs_embeds",
+    ]:
+        assert key in report
+        assert "nan_count" in report[key]
+        assert report[key]["finite"] is True

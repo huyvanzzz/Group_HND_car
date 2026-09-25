@@ -137,6 +137,7 @@ def test_diagnose_train_cli_is_available():
     assert "--config" in result.stdout
     assert "--stage" in result.stdout
     assert "--resume" in result.stdout
+    assert "--debug-numerics" in result.stdout
 
 
 def test_debug_sample_cli_outputs_sections_and_jsonl(tmp_path):
@@ -216,3 +217,33 @@ def test_diagnose_train_cli_reports_boundaries_and_batch(tmp_path, monkeypatch):
     assert "[DEBUG][HEARTBEAT]" in result.stdout
     assert "hf_secret_for_diagnose_test" not in debug_events
     assert "hf_secret_for_diagnose_test" not in result.stdout
+
+
+def test_diagnose_train_cli_reports_numerics_when_requested(tmp_path):
+    cfg = _write_fake_config(tmp_path)
+    output_dir = tmp_path / "outputs"
+
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "smoke"], check=True)
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg), "--subset", "smoke"], check=True)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "efficient_vlm_ad",
+            "diagnose-train",
+            "--config",
+            str(cfg),
+            "--stage",
+            "align",
+            "--debug",
+            "--debug-numerics",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    debug_events = (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8")
+    assert "[DEBUG][NUMERICS]" in result.stdout
+    assert '"inputs_embeds"' in debug_events
+    assert '"loss"' in debug_events

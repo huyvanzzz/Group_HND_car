@@ -73,6 +73,7 @@ def train(args: argparse.Namespace) -> None:
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
+        debug_numerics=args.debug_numerics,
         disable_progress=args.no_progress,
     )
     if is_main_process():
@@ -93,6 +94,7 @@ def diagnose_train(args: argparse.Namespace) -> None:
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
+        debug_numerics=args.debug_numerics,
         disable_progress=args.no_progress,
     )
     if is_main_process():
@@ -170,6 +172,7 @@ def add_debug_args(cmd: argparse.ArgumentParser) -> None:
     cmd.add_argument("--debug", action="store_true")
     cmd.add_argument("--debug-samples", type=int, default=3)
     cmd.add_argument("--debug-jsonl")
+    cmd.add_argument("--debug-numerics", action="store_true")
     cmd.add_argument("--no-progress", action="store_true")
 
 

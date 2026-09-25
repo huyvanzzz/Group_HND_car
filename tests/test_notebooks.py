@@ -21,7 +21,8 @@ def test_full_train_notebook_has_no_smoke_limits_by_default():
 
     assert "repvit_t5_efficient_mini_kaggle_2gpu.yaml" in source
     assert "diagnose-train" in source
-    assert "--max-steps 20" in source
+    assert "--max-steps 1" in source
+    assert "--debug-numerics" in source
     assert "--debug --debug-samples 1" in source
     assert "nvidia-smi" in source
     assert "RUN_FULL_2GPU = False" not in source

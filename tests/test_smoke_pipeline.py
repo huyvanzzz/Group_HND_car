@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 from PIL import Image
@@ -224,3 +225,71 @@ generation:
     assert (output_dir / "checkpoints" / "finetune_latest.pt").exists()
     assert (output_dir / "checkpoints" / "finetune_best.pt").exists()
     assert (output_dir / "checkpoints" / "best_model.pt").exists()
+
+
+def test_train_stage_raises_on_nan_loss_without_saving_checkpoint(tmp_path: Path, monkeypatch):
+    from efficient_vlm_ad.config import load_config
+    from efficient_vlm_ad import pipeline
+
+    data_root = tmp_path / "dataset"
+    _make_fake_data(data_root)
+    output_dir = tmp_path / "outputs"
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        f"""
+project:
+  output_dir: {output_dir.as_posix()}
+data:
+  hf_repo_id: local/fake
+  local_dir: {data_root.as_posix()}
+  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
+model:
+  profile: offline_nan
+  vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
+  text: {{model_id: fake_t5, d_model: 8}}
+cache:
+  dir: {str(output_dir / "cache").replace(chr(92), "/")}
+runtime:
+  precision: fp32
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 1
+  gpa_hidden_size: 4
+generation:
+  max_new_tokens: 4
+  num_beams: 1
+""",
+        encoding="utf-8",
+    )
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg_path), "--subset", "smoke"], check=True)
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg_path), "--subset", "smoke"], check=True)
+    cfg = load_config(cfg_path)
+    _, tokenizer = pipeline.build_vlm_model(cfg)
+
+    class NanModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.text_model = torch.nn.Linear(1, 1)
+            self.gpa = torch.nn.Linear(1, 1)
+            self.projector = torch.nn.Linear(1, 1)
+            self.modal_embeddings = torch.nn.Embedding(2, 1)
+            self.row_embeddings = None
+            self.col_embeddings = None
+
+        def forward(self, **_kwargs):
+            return SimpleNamespace(loss=torch.tensor(float("nan"), requires_grad=True))
+
+        def forward_debug(self, **_kwargs):
+            return {"loss": {"finite": False, "nan_count": 1}}
+
+    monkeypatch.setattr(pipeline, "build_vlm_model", lambda _cfg: (NanModel(), tokenizer))
+
+    try:
+        pipeline.train_stage(cfg, "align", debug=True, debug_numerics=True, disable_progress=True)
+    except FloatingPointError:
+        pass
+    else:
+        raise AssertionError("Expected FloatingPointError for NaN loss")
+
+    assert not (output_dir / "checkpoints" / "align_latest.pt").exists()
