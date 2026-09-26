@@ -53,6 +53,9 @@ def test_end_to_end_debug_notebook_exercises_raw_image_training_path():
     assert "prepare-features" not in source
     assert "train_progress.jsonl" in source
     assert "nvidia-smi" in source
+    assert "--stage align" in source
+    assert "--stage finetune" in source
+    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
 
 
 def test_end_to_end_full_notebook_runs_full_epochs_without_smoke_limits():
