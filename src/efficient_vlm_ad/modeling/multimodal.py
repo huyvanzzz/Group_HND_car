@@ -29,13 +29,13 @@ def set_trainable_for_stage(modules: nn.ModuleDict, cfg, stage: str) -> None:
     if stage not in {"align", "finetune"}:
         raise ValueError("stage must be 'align' or 'finetune'")
 
-    _set_module_trainable(modules["vision"], False)
+    train_vision = getattr(getattr(cfg, "training", None), "vision_training", "feature_cache") == "end_to_end"
+    _set_module_trainable(modules["vision"], train_vision)
     _set_module_trainable(modules["text"], stage == "finetune")
 
     for name in ("gpa", "projector", "spatial_pos", "modal_embeddings"):
         if name in modules:
             _set_module_trainable(modules[name], True)
 
-    if cfg.model.vision.name.startswith("repvit"):
+    if cfg.model.vision.name.startswith("repvit") and not train_vision:
         modules["vision"].eval()
-

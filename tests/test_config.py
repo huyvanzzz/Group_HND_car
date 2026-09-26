@@ -36,6 +36,10 @@ def test_loads_kaggle_2gpu_profiles():
     assert cfg.generation.num_beams == 3
     assert cfg.generation.early_stopping is True
     assert cfg.generation.length_penalty == 1.0
+    assert cfg.evaluation.eval_batch_size == 16
+    assert cfg.evaluation.eval_progress_log_every_samples == 256
+    assert cfg.evaluation.benchmark_max_samples == 200
+    assert cfg.evaluation.benchmark_progress_log_every_samples == 20
 
     assert safe_cfg.training.batch_size == 8
     assert safe_cfg.runtime.precision == "fp32"
@@ -45,6 +49,27 @@ def test_loads_kaggle_2gpu_profiles():
     assert safe_cfg.training.finetune_epochs == 6
     assert safe_cfg.generation.max_new_tokens == 512
     assert safe_cfg.generation.num_beams == 3
+    assert safe_cfg.evaluation.eval_batch_size == 16
+    assert safe_cfg.evaluation.benchmark_max_samples == 200
+
+
+def test_loads_kaggle_end_to_end_profile():
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_end2end.yaml")
+    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_end2end_safe.yaml")
+
+    assert cfg.training.vision_training == "end_to_end"
+    assert cfg.training.batch_size == 8
+    assert cfg.training.gradient_accumulation_steps == 4
+    assert cfg.training.effective_batch_size_for_processes(2) == 64
+    assert cfg.training.align_epochs == 8
+    assert cfg.training.finetune_epochs == 8
+    assert cfg.training.vision_learning_rate == 1e-5
+    assert cfg.training.text_learning_rate == 5e-5
+    assert cfg.training.head_learning_rate == 1e-4
+    assert safe_cfg.training.vision_training == "end_to_end"
+    assert safe_cfg.training.batch_size == 4
+    assert safe_cfg.training.gradient_accumulation_steps == 8
+    assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
 
 
 def test_accelerate_is_declared_dependency():

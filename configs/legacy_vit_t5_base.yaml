@@ -36,3 +36,8 @@ training:
 generation:
   max_new_tokens: 64
   num_beams: 1
+evaluation:
+  eval_batch_size: 16
+  eval_progress_log_every_samples: 256
+  benchmark_max_samples: 200
+  benchmark_progress_log_every_samples: 20

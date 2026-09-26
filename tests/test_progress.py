@@ -6,7 +6,7 @@ import json
 from PIL import Image
 
 from efficient_vlm_ad.progress import progress
-from efficient_vlm_ad.progress_logging import ProgressEventWriter
+from efficient_vlm_ad.progress_logging import MinimalProgressWriter, ProgressEventWriter
 
 
 def test_pyproject_declares_tqdm_dependency():
@@ -42,6 +42,25 @@ def test_cli_help_exposes_progress_log_every_steps():
     assert "--progress-log-every-steps" in result.stdout
 
 
+def test_cli_help_exposes_eval_benchmark_progress_flags():
+    eval_help = subprocess.run(
+        [sys.executable, "-m", "efficient_vlm_ad", "evaluate", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    benchmark_help = subprocess.run(
+        [sys.executable, "-m", "efficient_vlm_ad", "benchmark", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--batch-size" in eval_help.stdout
+    assert "--progress-log-every-samples" in eval_help.stdout
+    assert "--progress-log-every-samples" in benchmark_help.stdout
+
+
 def test_progress_event_writer_appends_jsonl_and_redacts_token(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
     writer = ProgressEventWriter(tmp_path / "outputs")
@@ -59,6 +78,25 @@ def test_progress_event_writer_appends_jsonl_and_redacts_token(tmp_path: Path, m
     assert rows[0]["global_step"] == 1
     assert rows[0]["note"] == "token=[REDACTED]"
     assert "hf_secret_value" not in json.dumps(rows)
+
+
+def test_minimal_progress_writer_writes_only_runtime_keys(tmp_path: Path):
+    writer = MinimalProgressWriter(tmp_path / "outputs", "eval_progress.jsonl")
+
+    writer.write(
+        stage="evaluate",
+        current=16,
+        total=32,
+        elapsed_seconds=2.5,
+        estimated_remaining_seconds=2.5,
+    )
+
+    row = json.loads((tmp_path / "outputs" / "debug" / "eval_progress.jsonl").read_text(encoding="utf-8"))
+
+    assert set(row) == {"stage", "current", "total", "elapsed_seconds", "estimated_remaining_seconds"}
+    assert row["stage"] == "evaluate"
+    assert row["current"] == 16
+    assert row["total"] == 32
 
 
 def test_prepare_data_no_progress_runs(tmp_path: Path):

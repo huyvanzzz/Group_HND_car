@@ -112,6 +112,8 @@ def evaluate(args: argparse.Namespace) -> None:
         cfg,
         args.checkpoint,
         max_samples=args.max_samples,
+        batch_size=args.batch_size,
+        progress_log_every_samples=args.progress_log_every_samples,
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
@@ -128,6 +130,7 @@ def benchmark(args: argparse.Namespace) -> None:
         cfg,
         args.checkpoint,
         max_samples=args.max_samples,
+        progress_log_every_samples=args.progress_log_every_samples,
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
@@ -219,6 +222,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name in {"evaluate", "benchmark"}:
             cmd.add_argument("--checkpoint", required=True)
             cmd.add_argument("--max-samples", type=int)
+            cmd.add_argument("--progress-log-every-samples", type=int)
+        if name == "evaluate":
+            cmd.add_argument("--batch-size", type=int)
         cmd.set_defaults(func=func)
 
     train_cmd = sub.add_parser("train")

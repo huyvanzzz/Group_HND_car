@@ -169,3 +169,84 @@ class EfficientVLMForAD(nn.Module):
             early_stopping=early_stopping,
             length_penalty=length_penalty,
         )
+
+
+class EndToEndEfficientVLMForAD(EfficientVLMForAD):
+    def __init__(
+        self,
+        *,
+        vision_encoder: nn.Module,
+        text_model: nn.Module,
+        vision_dim: int,
+        d_model: int,
+        seq_len: int,
+        gpa_hidden_size: int,
+    ) -> None:
+        super().__init__(
+            text_model=text_model,
+            vision_dim=vision_dim,
+            d_model=d_model,
+            seq_len=seq_len,
+            gpa_hidden_size=gpa_hidden_size,
+        )
+        self.vision_encoder = vision_encoder
+
+    def encode_images(self, images: torch.Tensor) -> torch.Tensor:
+        return self.vision_encoder(images)
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        images: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ):
+        return self.forward_from_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            visual_features=self.encode_images(images),
+            labels=labels,
+        )
+
+    def forward_debug(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        images: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> dict:
+        report = {"images": _stats("images", images)}
+        visual_features = self.encode_images(images)
+        report["vision_features"] = _stats("vision_features", visual_features)
+        report.update(
+            super().forward_debug(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                visual_features=visual_features,
+                labels=labels,
+            )
+        )
+        return report
+
+    def generate_from_images(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        images: torch.Tensor,
+        max_new_tokens: int,
+        num_beams: int = 1,
+        early_stopping: bool = False,
+        length_penalty: float = 1.0,
+    ) -> torch.Tensor:
+        return self.generate_from_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            visual_features=self.encode_images(images),
+            max_new_tokens=max_new_tokens,
+            num_beams=num_beams,
+            early_stopping=early_stopping,
+            length_penalty=length_penalty,
+        )

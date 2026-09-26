@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +71,9 @@ class TrainingConfig:
     batch_size: int
     gradient_accumulation_steps: int
     learning_rate: float = 1e-4
+    vision_learning_rate: float | None = None
+    text_learning_rate: float | None = None
+    head_learning_rate: float | None = None
     weight_decay: float = 0.05
     scheduler_gamma: float = 0.9
     align_epochs: int = 6
@@ -85,6 +88,7 @@ class TrainingConfig:
     num_workers: int = 0
     pin_memory: bool = False
     progress_log_every_steps: int = 50
+    vision_training: str = "feature_cache"
 
     @property
     def effective_batch_size(self) -> int:
@@ -92,6 +96,14 @@ class TrainingConfig:
 
     def effective_batch_size_for_processes(self, num_processes: int) -> int:
         return self.effective_batch_size * max(1, int(num_processes))
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    eval_batch_size: int = 16
+    eval_progress_log_every_samples: int = 256
+    benchmark_max_samples: int = 200
+    benchmark_progress_log_every_samples: int = 20
 
 
 @dataclass(frozen=True)
@@ -103,6 +115,7 @@ class ExperimentConfig:
     cache: CacheConfig
     runtime: RuntimeConfig
     generation: GenerationConfig
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
 
 def _require(mapping: dict[str, Any], key: str) -> Any:
@@ -130,9 +143,13 @@ def load_config(path: str | Path) -> ExperimentConfig:
     cache_raw = raw.get("cache", {})
     runtime_raw = raw.get("runtime", {})
     generation_raw = raw.get("generation", {})
+    evaluation_raw = raw.get("evaluation", {})
     precision = str(runtime_raw.get("precision", "auto"))
     if precision not in {"auto", "fp32", "fp16", "bf16"}:
         raise ValueError("runtime.precision must be one of: auto, fp32, fp16, bf16")
+    vision_training = str(train_raw.get("vision_training", "feature_cache"))
+    if vision_training not in {"feature_cache", "end_to_end"}:
+        raise ValueError("training.vision_training must be one of: feature_cache, end_to_end")
     expected_counts = data_raw.get("expected_counts") or {"train": 341381, "val": 19785, "test": 16817}
 
     return ExperimentConfig(
@@ -164,6 +181,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             batch_size=int(_require(train_raw, "batch_size")),
             gradient_accumulation_steps=int(_require(train_raw, "gradient_accumulation_steps")),
             learning_rate=float(train_raw.get("learning_rate", 1e-4)),
+            vision_learning_rate=float(train_raw["vision_learning_rate"]) if train_raw.get("vision_learning_rate") is not None else None,
+            text_learning_rate=float(train_raw["text_learning_rate"]) if train_raw.get("text_learning_rate") is not None else None,
+            head_learning_rate=float(train_raw["head_learning_rate"]) if train_raw.get("head_learning_rate") is not None else None,
             weight_decay=float(train_raw.get("weight_decay", 0.05)),
             scheduler_gamma=float(train_raw.get("scheduler_gamma", 0.9)),
             align_epochs=int(train_raw.get("align_epochs", 6)),
@@ -178,6 +198,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             num_workers=int(train_raw.get("num_workers", 0)),
             pin_memory=bool(train_raw.get("pin_memory", False)),
             progress_log_every_steps=int(train_raw.get("progress_log_every_steps", 50)),
+            vision_training=vision_training,
         ),
         cache=CacheConfig(dir=str(cache_raw.get("dir", "outputs/cache"))),
         runtime=RuntimeConfig(device=str(runtime_raw.get("device", "auto")), precision=precision),
@@ -186,5 +207,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
             num_beams=int(generation_raw.get("num_beams", 1)),
             early_stopping=bool(generation_raw.get("early_stopping", False)),
             length_penalty=float(generation_raw.get("length_penalty", 1.0)),
+        ),
+        evaluation=EvaluationConfig(
+            eval_batch_size=int(evaluation_raw.get("eval_batch_size", 16)),
+            eval_progress_log_every_samples=int(evaluation_raw.get("eval_progress_log_every_samples", 256)),
+            benchmark_max_samples=int(evaluation_raw.get("benchmark_max_samples", 200)),
+            benchmark_progress_log_every_samples=int(evaluation_raw.get("benchmark_progress_log_every_samples", 20)),
         ),
     )

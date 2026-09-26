@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
-from .vlm import EfficientVLMForAD
+from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
 
 
 class SimpleTokenizer:
@@ -159,6 +159,19 @@ def build_vision_encoder(cfg):
 def build_vlm_model(cfg):
     text_model, tokenizer = build_text_and_tokenizer(cfg)
     model = EfficientVLMForAD(
+        text_model=text_model,
+        vision_dim=cfg.model.vision.output_dim,
+        d_model=cfg.model.text.d_model,
+        seq_len=cfg.model.vision.seq_len,
+        gpa_hidden_size=cfg.training.gpa_hidden_size,
+    )
+    return model, tokenizer
+
+
+def build_end_to_end_vlm_model(cfg, vision_encoder: nn.Module):
+    text_model, tokenizer = build_text_and_tokenizer(cfg)
+    model = EndToEndEfficientVLMForAD(
+        vision_encoder=vision_encoder,
         text_model=text_model,
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,

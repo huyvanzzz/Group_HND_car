@@ -28,7 +28,7 @@ def _make_fake_data(root: Path, rows_per_split: int = 1):
 
 def test_offline_smoke_cli_sequence(tmp_path: Path):
     data_root = tmp_path / "dataset"
-    _make_fake_data(data_root)
+    _make_fake_data(data_root, rows_per_split=2)
     output_dir = tmp_path / "outputs"
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
@@ -86,7 +86,9 @@ generation:
             "--checkpoint",
             str(output_dir / "checkpoints" / "finetune_latest.pt"),
             "--max-samples",
-            "1",
+            "2",
+            "--batch-size",
+            "2",
             "--debug",
             "--debug-samples",
             "1",
@@ -97,8 +99,6 @@ generation:
             str(cfg),
             "--checkpoint",
             str(output_dir / "checkpoints" / "finetune_latest.pt"),
-            "--max-samples",
-            "1",
             "--debug",
             "--debug-samples",
             "1",
@@ -109,7 +109,21 @@ generation:
 
     assert (output_dir / "predictions.jsonl").exists()
     assert (output_dir / "benchmark.json").exists()
+    assert len([line for line in (output_dir / "predictions.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]) == 2
     assert (output_dir / "debug" / "debug_events.jsonl").exists()
+    eval_progress_path = output_dir / "debug" / "eval_progress.jsonl"
+    benchmark_progress_path = output_dir / "debug" / "benchmark_progress.jsonl"
+    assert eval_progress_path.exists()
+    assert benchmark_progress_path.exists()
+    eval_progress = [json.loads(line) for line in eval_progress_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    benchmark_progress = [json.loads(line) for line in benchmark_progress_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert set(eval_progress[-1]) == {"stage", "current", "total", "elapsed_seconds", "estimated_remaining_seconds"}
+    assert eval_progress[-1]["stage"] == "evaluate"
+    assert eval_progress[-1]["current"] == 2
+    assert eval_progress[-1]["total"] == 2
+    assert benchmark_progress[-1]["stage"] == "benchmark"
+    assert benchmark_progress[-1]["current"] == 2
+    assert benchmark_progress[-1]["total"] == 2
     debug_events = [
         json.loads(line)
         for line in (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8").splitlines()

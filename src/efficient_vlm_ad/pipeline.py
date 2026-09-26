@@ -21,10 +21,10 @@ from .data import format_prompt, normalize_camera_paths
 from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats
 from .evaluation import caption_metrics, metric_display_values, write_predictions
 from .hf_data import DatasetRecord, load_prepared_records
-from .modeling.factory import build_vision_encoder, build_vlm_model
+from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
 from .progress import progress, progress_bar
-from .progress_logging import ProgressEventWriter
+from .progress_logging import MinimalProgressWriter, ProgressEventWriter
 
 
 class _SingleProcessAccelerator:
@@ -124,6 +124,24 @@ def _heartbeat(dbg: DebugPrinter, started_at: float, stage: str, **payload: Any)
     )
 
 
+def _remaining_seconds(elapsed_seconds: float, current: int, total: int) -> float:
+    if current <= 0 or total <= current:
+        return 0.0
+    samples_per_second = current / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    return (total - current) / samples_per_second if samples_per_second > 0 else 0.0
+
+
+def _write_minimal_progress(writer: MinimalProgressWriter, *, stage: str, current: int, total: int, start: float) -> None:
+    elapsed = time.perf_counter() - start
+    writer.write(
+        stage=stage,
+        current=current,
+        total=total,
+        elapsed_seconds=elapsed,
+        estimated_remaining_seconds=_remaining_seconds(elapsed, current, total),
+    )
+
+
 def _cuda_memory_payload(device: torch.device) -> dict[str, int | None]:
     if device.type != "cuda" or not torch.cuda.is_available():
         return {"cuda_memory_allocated": None, "cuda_memory_peak": None}
@@ -148,6 +166,10 @@ def _stage_epochs(cfg: ExperimentConfig, stage: str) -> int:
 def _stage_step_limit(cfg: ExperimentConfig, stage: str, max_steps: int | None) -> int | None:
     configured_stage_steps = cfg.training.align_max_steps if stage == "align" else cfg.training.finetune_max_steps
     return max_steps or configured_stage_steps or cfg.training.max_steps
+
+
+def _uses_end_to_end_vision(cfg: ExperimentConfig) -> bool:
+    return cfg.training.vision_training == "end_to_end"
 
 
 def resolve_device(cfg: ExperimentConfig) -> torch.device:
@@ -352,6 +374,56 @@ class CachedBatchCollator:
         }
 
 
+class ImageVLMDataset(Dataset):
+    def __init__(self, cfg: ExperimentConfig, split: str, max_samples: int | None = None, transform=None) -> None:
+        self.cfg = cfg
+        self.split = split
+        self.transform = transform
+        self.records = load_prepared_records(cfg, split)
+        if max_samples is not None:
+            self.records = self.records[:max_samples]
+        manifest = _read_prepared_manifest(cfg)
+        self.root = Path(manifest["root"])
+        if not self.records:
+            raise ValueError(f"No {split} records are available. Run prepare-data before training or evaluation.")
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        record = self.records[idx]
+        camera_paths = normalize_camera_paths(self.root, record.camera_paths, self.cfg.data.view_order)
+        images = torch.stack([_load_image(path, self.cfg.model.vision.image_size, self.transform) for path in camera_paths])
+        return {
+            "question": record.question,
+            "answer": record.answer,
+            "images": images,
+            "sample_id": record.sample_id,
+            "eval_id": record.eval_id,
+        }
+
+    def summary(self) -> dict[str, int]:
+        return {"prepared_records": len(self.records), "image_records": len(self.records)}
+
+
+class ImageBatchCollator:
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        encoded = self.tokenizer([format_prompt(item["question"]) for item in batch], padding=True, return_tensors="pt")
+        labels = self.tokenizer([item["answer"] for item in batch], padding=True, return_tensors="pt")["input_ids"].clone()
+        labels[labels == getattr(self.tokenizer, "pad_token_id", 0)] = -100
+        return {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "images": torch.stack([item["images"] for item in batch]),
+            "labels": labels,
+            "answers": [item["answer"] for item in batch],
+            "eval_ids": [item["eval_id"] for item in batch],
+        }
+
+
 def validate_stage_loss(
     cfg: ExperimentConfig,
     model: torch.nn.Module,
@@ -362,15 +434,16 @@ def validate_stage_loss(
     device: torch.device,
     debug: DebugPrinter | None = None,
     disable_progress: bool = False,
+    transform=None,
 ) -> float:
-    dataset = CachedVLMDataset(cfg, "val")
+    dataset, collator = _make_dataset_and_collator(cfg, "val", tokenizer, transform=transform)
     if debug:
         debug.log("FEATURE", {"split": "val", **dataset.summary()})
     loader = DataLoader(
         dataset,
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        collate_fn=CachedBatchCollator(tokenizer),
+        collate_fn=collator,
         num_workers=cfg.training.num_workers,
         pin_memory=cfg.training.pin_memory and device.type == "cuda",
     )
@@ -385,13 +458,8 @@ def validate_stage_loss(
             total=len(loader),
             disable=disable_progress,
         ):
-            batch = _move_batch_to_device(batch, device)
-            output = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                visual_features=batch["visual_features"],
-                labels=batch["labels"],
-            )
+            batch = _move_training_batch(batch, device, cfg)
+            output = model(**_batch_model_inputs(batch, cfg))
             total_loss += float(output.loss.detach().cpu().item())
             total_batches += 1
     if was_training:
@@ -404,7 +472,7 @@ def validate_stage_loss(
 def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
     return torch.nn.ModuleDict(
         {
-            "vision": torch.nn.Identity(),
+            "vision": getattr(model, "vision_encoder", torch.nn.Identity()),
             "text": model.text_model,
             "gpa": model.gpa,
             "projector": model.projector,
@@ -412,6 +480,126 @@ def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
             "modal_embeddings": model.modal_embeddings,
         }
     )
+
+
+def _build_train_model(cfg: ExperimentConfig):
+    if _uses_end_to_end_vision(cfg):
+        vision, transform = build_vision_encoder(cfg)
+        model, tokenizer = build_end_to_end_vlm_model(cfg, vision)
+        return model, tokenizer, transform
+    model, tokenizer = build_vlm_model(cfg)
+    return model, tokenizer, None
+
+
+def _make_dataset_and_collator(cfg: ExperimentConfig, split: str, tokenizer, *, max_samples: int | None = None, transform=None):
+    if _uses_end_to_end_vision(cfg):
+        dataset = ImageVLMDataset(cfg, split, max_samples=max_samples, transform=transform)
+        return dataset, ImageBatchCollator(tokenizer)
+    dataset = CachedVLMDataset(cfg, split, max_samples=max_samples)
+    return dataset, CachedBatchCollator(tokenizer)
+
+
+def _move_training_batch(batch: dict[str, Any], device: torch.device, cfg: ExperimentConfig) -> dict[str, Any]:
+    keys = ("input_ids", "attention_mask", "images", "labels") if _uses_end_to_end_vision(cfg) else ("input_ids", "attention_mask", "visual_features", "labels")
+    for key in keys:
+        if key in batch:
+            batch[key] = batch[key].to(device)
+    return batch
+
+
+def _batch_model_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[str, torch.Tensor]:
+    inputs = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+        "labels": batch["labels"],
+    }
+    if _uses_end_to_end_vision(cfg):
+        inputs["images"] = batch["images"]
+    else:
+        inputs["visual_features"] = batch["visual_features"]
+    return inputs
+
+
+def _generation_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[str, torch.Tensor]:
+    inputs = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+    }
+    if _uses_end_to_end_vision(cfg):
+        inputs["images"] = batch["images"]
+    else:
+        inputs["visual_features"] = batch["visual_features"]
+    return inputs
+
+
+def _generate_batch(model, batch: dict[str, Any], cfg: ExperimentConfig) -> torch.Tensor:
+    kwargs = {
+        **_generation_inputs(batch, cfg),
+        "max_new_tokens": cfg.generation.max_new_tokens,
+        "num_beams": cfg.generation.num_beams,
+        "early_stopping": cfg.generation.early_stopping,
+        "length_penalty": cfg.generation.length_penalty,
+    }
+    if _uses_end_to_end_vision(cfg):
+        return model.generate_from_images(**kwargs)
+    return model.generate_from_features(**kwargs)
+
+
+def _debug_batch_payload(batch: dict[str, Any], cfg: ExperimentConfig, device: torch.device) -> dict[str, Any]:
+    payload = {
+        "stage": "after_accelerator_prepare",
+        "target_device": str(device),
+        "input_ids": tensor_stats("input_ids", batch["input_ids"]),
+        "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
+        "labels": tensor_stats("labels", batch["labels"].float()),
+        "label_ignore_count": int((batch["labels"] == -100).sum().item()),
+    }
+    if _uses_end_to_end_vision(cfg):
+        payload["images"] = tensor_stats("images", batch["images"])
+    else:
+        payload["visual_features"] = tensor_stats("visual_features", batch["visual_features"])
+    return payload
+
+
+def _optimizer_param_groups(model: torch.nn.Module, cfg: ExperimentConfig) -> list[dict[str, Any]]:
+    if not _uses_end_to_end_vision(cfg):
+        return [{"params": [p for p in model.parameters() if p.requires_grad], "lr": cfg.training.learning_rate}]
+    groups: list[dict[str, Any]] = []
+    vision_params = [p for p in getattr(model, "vision_encoder").parameters() if p.requires_grad]
+    text_params = [p for p in model.text_model.parameters() if p.requires_grad]
+    excluded = {id(p) for p in [*vision_params, *text_params]}
+    head_params = [p for p in model.parameters() if p.requires_grad and id(p) not in excluded]
+    if vision_params:
+        groups.append({"params": vision_params, "lr": cfg.training.vision_learning_rate or cfg.training.learning_rate})
+    if text_params:
+        groups.append({"params": text_params, "lr": cfg.training.text_learning_rate or cfg.training.learning_rate})
+    if head_params:
+        groups.append({"params": head_params, "lr": cfg.training.head_learning_rate or cfg.training.learning_rate})
+    return groups
+
+
+def _module_grad_norm(module: torch.nn.Module) -> float | None:
+    total = 0.0
+    seen = False
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        seen = True
+        total += float(param.grad.detach().float().norm(2).item() ** 2)
+    return total**0.5 if seen else None
+
+
+def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
+    payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    result = model.load_state_dict(payload["model"], strict=False)
+    unexpected = list(result.unexpected_keys)
+    missing_not_vision = [key for key in result.missing_keys if not key.startswith("vision_encoder.")]
+    if unexpected or missing_not_vision:
+        raise RuntimeError(
+            "Checkpoint is not compatible with the end-to-end model: "
+            f"missing_non_vision={missing_not_vision}, unexpected={unexpected}"
+        )
+    return dict(payload.get("metadata", {}))
 
 
 def train_stage(
@@ -435,7 +623,7 @@ def train_stage(
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "build_accelerator_done", device=str(device), distributed=_distributed_debug_payload(accelerator, cfg))
         _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
-    model, tokenizer = build_vlm_model(cfg)
+    model, tokenizer, transform = _build_train_model(cfg)
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "build_vlm_model_done")
         _heartbeat(dbg, started_at, "model_to_device_start", device=str(device))
@@ -447,7 +635,7 @@ def train_stage(
         dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
         dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
 
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
 
     start_step = 0
@@ -483,14 +671,17 @@ def train_stage(
             best_val_loss = float(metadata.get("best_val_loss", best_val_loss))
             best_epoch = int(metadata.get("best_epoch", best_epoch))
         else:
-            metadata = load_checkpoint(resume, model=model, map_location=device)
+            if _uses_end_to_end_vision(cfg):
+                metadata = _load_model_weights_allowing_new_vision(resume, model=model, map_location=device)
+            else:
+                metadata = load_checkpoint(resume, model=model, map_location=device)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_load_done", metadata=metadata)
 
     split = "train"
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "dataset_start", split=split)
-    dataset = CachedVLMDataset(cfg, split)
+    dataset, collator = _make_dataset_and_collator(cfg, split, tokenizer, transform=transform)
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "dataset_done", split=split, **dataset.summary())
         dbg.log("FEATURE", {"split": split, **dataset.summary()})
@@ -499,7 +690,7 @@ def train_stage(
         dataset,
         batch_size=cfg.training.batch_size,
         shuffle=True,
-        collate_fn=CachedBatchCollator(tokenizer),
+        collate_fn=collator,
         num_workers=cfg.training.num_workers,
         pin_memory=cfg.training.pin_memory and device.type == "cuda",
     )
@@ -554,27 +745,11 @@ def train_stage(
             else:
                 batch = item
             if debug and accelerator.is_main_process and global_step == start_step:
-                dbg.log(
-                    "BATCH",
-                    {
-                        "stage": "after_accelerator_prepare",
-                        "target_device": str(device),
-                        "input_ids": tensor_stats("input_ids", batch["input_ids"]),
-                        "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
-                        "visual_features": tensor_stats("visual_features", batch["visual_features"]),
-                        "labels": tensor_stats("labels", batch["labels"].float()),
-                        "label_ignore_count": int((batch["labels"] == -100).sum().item()),
-                    },
-                )
+                dbg.log("BATCH", _debug_batch_payload(batch, cfg, device))
             if isinstance(accelerator, _SingleProcessAccelerator):
-                batch = _move_batch_to_device(batch, device)
+                batch = _move_training_batch(batch, device, cfg)
             with accelerator.autocast():
-                output = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    visual_features=batch["visual_features"],
-                    labels=batch["labels"],
-                )
+                output = model(**_batch_model_inputs(batch, cfg))
                 raw_loss = output.loss
                 loss = raw_loss / cfg.training.gradient_accumulation_steps
             if not torch.isfinite(raw_loss.detach()).item():
@@ -599,10 +774,7 @@ def train_stage(
                     if debug_numerics and hasattr(debug_model, "forward_debug"):
                         with torch.no_grad():
                             numerics = debug_model.forward_debug(
-                                input_ids=batch["input_ids"],
-                                attention_mask=batch["attention_mask"],
-                                visual_features=batch["visual_features"],
-                                labels=batch["labels"],
+                                **_batch_model_inputs(batch, cfg),
                             )
                     dbg.log(
                         "NUMERICS",
@@ -620,15 +792,19 @@ def train_stage(
             epoch_loss += loss_value
             epoch_batches += 1
             if debug and accelerator.is_main_process and global_step < start_step + dbg.samples:
+                train_payload = {
+                    "step": global_step,
+                    "epoch": epoch_number,
+                    "loss": loss_value,
+                    "finite_loss": bool(torch.isfinite(raw_loss.detach()).item()),
+                    "lr": _optimizer_lr(optimizer),
+                }
+                debug_unwrapped = accelerator.unwrap_model(model)
+                if _uses_end_to_end_vision(cfg) and hasattr(debug_unwrapped, "vision_encoder"):
+                    train_payload["vision_grad_norm"] = _module_grad_norm(debug_unwrapped.vision_encoder)
                 dbg.log(
                     "TRAIN",
-                    {
-                        "step": global_step,
-                        "epoch": epoch_number,
-                        "loss": loss_value,
-                        "finite_loss": bool(torch.isfinite(raw_loss.detach()).item()),
-                        "lr": _optimizer_lr(optimizer),
-                    },
+                    train_payload,
                 )
             if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
                 if cfg.training.max_grad_norm is not None:
@@ -689,6 +865,7 @@ def train_stage(
                 device=device,
                 debug=dbg if debug else None,
                 disable_progress=disable_progress,
+                transform=transform,
             )
             progress_writer.write(
                 "validation_end",
@@ -725,6 +902,13 @@ def train_stage(
                 "best_val_loss": best_val_loss,
                 "best_epoch": best_epoch,
                 "learning_rate": _optimizer_lr(optimizer),
+                "vision_training": cfg.training.vision_training,
+                "learning_rates": {
+                    "base": cfg.training.learning_rate,
+                    "vision": cfg.training.vision_learning_rate,
+                    "text": cfg.training.text_learning_rate,
+                    "head": cfg.training.head_learning_rate,
+                },
                 "effective_batch_size": cfg.training.effective_batch_size_for_processes(
                     int(getattr(accelerator, "num_processes", 1))
                 ),
@@ -808,7 +992,7 @@ def train_stage(
 
 
 def _batch_debug_summary(batch: dict[str, Any], device: torch.device | None = None) -> dict[str, Any]:
-    keys = ("input_ids", "attention_mask", "visual_features", "labels")
+    keys = ("input_ids", "attention_mask", "visual_features", "images", "labels")
     summary = {key: tensor_stats(key, batch[key].float() if key == "labels" else batch[key]) for key in keys if key in batch}
     if device is not None:
         summary["target_device"] = str(device)
@@ -845,7 +1029,7 @@ def diagnose_train(
 
     begin = time.perf_counter()
     _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
-    model, tokenizer = build_vlm_model(cfg)
+    model, tokenizer, transform = _build_train_model(cfg)
     mark("build_vlm_model", begin)
 
     begin = time.perf_counter()
@@ -873,7 +1057,7 @@ def diagnose_train(
             )
 
     begin = time.perf_counter()
-    dataset = CachedVLMDataset(cfg, "train")
+    dataset, collator = _make_dataset_and_collator(cfg, "train", tokenizer, transform=transform)
     mark("dataset", begin)
     dataset_summary = dataset.summary()
     if accelerator.is_main_process:
@@ -884,14 +1068,14 @@ def diagnose_train(
         dataset,
         batch_size=cfg.training.batch_size,
         shuffle=True,
-        collate_fn=CachedBatchCollator(tokenizer),
+        collate_fn=collator,
         num_workers=cfg.training.num_workers,
         pin_memory=cfg.training.pin_memory and device.type == "cuda",
     )
     mark("dataloader", begin)
 
     begin = time.perf_counter()
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
     mark("accelerator_prepare", begin)
@@ -899,7 +1083,7 @@ def diagnose_train(
     begin = time.perf_counter()
     batch = next(iter(loader))
     if isinstance(accelerator, _SingleProcessAccelerator):
-        batch = _move_batch_to_device(batch, device)
+        batch = _move_training_batch(batch, device, cfg)
     mark("first_batch", begin)
     batch_summary = _batch_debug_summary(batch, device)
     if accelerator.is_main_process:
@@ -909,10 +1093,7 @@ def diagnose_train(
     if debug_numerics and accelerator.is_main_process and hasattr(debug_model, "forward_debug"):
         with torch.no_grad(), accelerator.autocast():
             numerics = debug_model.forward_debug(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                visual_features=batch["visual_features"],
-                labels=batch["labels"],
+                **_batch_model_inputs(batch, cfg),
             )
         dbg.log("NUMERICS", {"stage": "diagnose_forward", **numerics})
 
@@ -925,7 +1106,7 @@ def diagnose_train(
         "distributed": _distributed_debug_payload(accelerator, cfg),
         "checkpoint_metadata": checkpoint_metadata,
         "dataset": dataset_summary,
-        "feature_cache_shape": list(dataset.features.shape),
+        "feature_cache_shape": list(dataset.features.shape) if hasattr(dataset, "features") else None,
         "batch": batch_summary,
         "numerics": numerics,
         "durations": durations,
@@ -938,6 +1119,8 @@ def evaluate_checkpoint(
     cfg: ExperimentConfig,
     checkpoint: str,
     max_samples: int | None = None,
+    batch_size: int | None = None,
+    progress_log_every_samples: int | None = None,
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
@@ -945,42 +1128,50 @@ def evaluate_checkpoint(
 ) -> dict[str, float]:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     device = resolve_device(cfg)
-    model, tokenizer = build_vlm_model(cfg)
+    model, tokenizer, transform = _build_train_model(cfg)
     model.to(device)
     metadata = load_checkpoint(checkpoint, model=model, map_location=device)
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
-    dataset = CachedVLMDataset(cfg, "test", max_samples=max_samples)
+    dataset, collator = _make_dataset_and_collator(cfg, "test", tokenizer, max_samples=max_samples, transform=transform)
     dbg.log("FEATURE", {"split": "test", **dataset.summary()})
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
+    eval_batch_size = batch_size or cfg.evaluation.eval_batch_size
+    log_every = max(1, progress_log_every_samples or cfg.evaluation.eval_progress_log_every_samples)
+    loader = DataLoader(dataset, batch_size=eval_batch_size, shuffle=False, collate_fn=collator)
     rows: list[dict[str, Any]] = []
+    progress_writer = MinimalProgressWriter(cfg.project.output_dir, "eval_progress.jsonl")
+    progress_started = time.perf_counter()
+    total_samples = len(dataset)
+    processed = 0
+    next_log_at = log_every
+    _write_minimal_progress(progress_writer, stage="evaluate", current=0, total=total_samples, start=progress_started)
     with torch.no_grad():
         for idx, batch in progress(enumerate(loader), desc="evaluate", total=len(loader), disable=disable_progress):
-            for key in ("input_ids", "attention_mask", "visual_features"):
-                batch[key] = batch[key].to(device)
-            ids = model.generate_from_features(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                visual_features=batch["visual_features"],
-                max_new_tokens=cfg.generation.max_new_tokens,
-                num_beams=cfg.generation.num_beams,
-                early_stopping=cfg.generation.early_stopping,
-                length_penalty=cfg.generation.length_penalty,
-            )
-            pred = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)[0]
-            if idx < dbg.samples:
-                dbg.log(
-                    "EVAL",
-                    {
-                        "eval_id": batch["eval_ids"][0],
-                        "compute_device": str(device),
-                        "generated_tokens": tensor_stats("generated_tokens", ids),
-                        "prediction": safe_preview(pred),
-                        "reference": safe_preview(batch["answers"][0]),
-                    },
-                )
-            rows.append({"eval_id": batch["eval_ids"][0], "prediction": pred, "reference": batch["answers"][0]})
+            for key in ("input_ids", "attention_mask", "visual_features", "images"):
+                if key in batch:
+                    batch[key] = batch[key].to(device)
+            ids = _generate_batch(model, batch, cfg)
+            preds = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            for offset, pred in enumerate(preds):
+                sample_index = processed + offset
+                if sample_index < dbg.samples:
+                    dbg.log(
+                        "EVAL",
+                        {
+                            "eval_id": batch["eval_ids"][offset],
+                            "compute_device": str(device),
+                            "generated_tokens": tensor_stats("generated_tokens", ids[offset : offset + 1]),
+                            "prediction": safe_preview(pred),
+                            "reference": safe_preview(batch["answers"][offset]),
+                        },
+                    )
+                rows.append({"eval_id": batch["eval_ids"][offset], "prediction": pred, "reference": batch["answers"][offset]})
+            processed += len(preds)
+            if processed >= next_log_at or processed == total_samples:
+                _write_minimal_progress(progress_writer, stage="evaluate", current=processed, total=total_samples, start=progress_started)
+                while next_log_at <= processed:
+                    next_log_at += log_every
     output_dir = Path(cfg.project.output_dir)
     write_predictions(output_dir / "predictions.jsonl", rows)
     metrics = caption_metrics(rows)
@@ -994,6 +1185,7 @@ def benchmark_checkpoint(
     cfg: ExperimentConfig,
     checkpoint: str,
     max_samples: int | None = None,
+    progress_log_every_samples: int | None = None,
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
@@ -1001,33 +1193,33 @@ def benchmark_checkpoint(
 ) -> dict[str, Any]:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     device = resolve_device(cfg)
-    model, tokenizer = build_vlm_model(cfg)
+    model, tokenizer, transform = _build_train_model(cfg)
     model.to(device)
     metadata = load_checkpoint(checkpoint, model=model, map_location=device)
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
-    dataset = CachedVLMDataset(cfg, "test", max_samples=max_samples)
+    if max_samples is None:
+        max_samples = cfg.evaluation.benchmark_max_samples
+    dataset, collator = _make_dataset_and_collator(cfg, "test", tokenizer, max_samples=max_samples, transform=transform)
     dbg.log("FEATURE", {"split": "test", **dataset.summary()})
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collator)
     e2e, gen, token_counts = [], [], []
+    progress_writer = MinimalProgressWriter(cfg.project.output_dir, "benchmark_progress.jsonl")
+    progress_started = time.perf_counter()
+    total_samples = len(dataset)
+    log_every = max(1, progress_log_every_samples or cfg.evaluation.benchmark_progress_log_every_samples)
+    _write_minimal_progress(progress_writer, stage="benchmark", current=0, total=total_samples, start=progress_started)
     with torch.no_grad():
         for idx, batch in progress(enumerate(loader), desc="benchmark", total=len(loader), disable=disable_progress):
             start = time.perf_counter()
-            for key in ("input_ids", "attention_mask", "visual_features"):
-                batch[key] = batch[key].to(device)
+            for key in ("input_ids", "attention_mask", "visual_features", "images"):
+                if key in batch:
+                    batch[key] = batch[key].to(device)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             gen_start = time.perf_counter()
-            ids = model.generate_from_features(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                visual_features=batch["visual_features"],
-                max_new_tokens=cfg.generation.max_new_tokens,
-                num_beams=cfg.generation.num_beams,
-                early_stopping=cfg.generation.early_stopping,
-                length_penalty=cfg.generation.length_penalty,
-            )
+            ids = _generate_batch(model, batch, cfg)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             gen.append(time.perf_counter() - gen_start)
@@ -1036,6 +1228,9 @@ def benchmark_checkpoint(
             token_counts.append(int((ids != getattr(tokenizer, "pad_token_id", 0)).sum().item()))
             if idx < dbg.samples:
                 dbg.log("BENCHMARK", {"sample": idx, "e2e_seconds": e2e[-1], "generation_seconds": gen[-1], "output_tokens": token_counts[-1]})
+            current = idx + 1
+            if current % log_every == 0 or current == total_samples:
+                _write_minimal_progress(progress_writer, stage="benchmark", current=current, total=total_samples, start=progress_started)
     summary = summarize_latencies(e2e_seconds=e2e, generation_seconds=gen, output_tokens=token_counts)
     summary.update({"device": str(device), "python": platform.python_version(), "torch": torch.__version__})
     if torch.cuda.is_available():
@@ -1084,19 +1279,30 @@ def debug_sample(
         features = vision(images.unsqueeze(0).to(device)).detach().cpu()
     dbg.log("FEATURE", {"tensor": tensor_stats("features", features)})
 
-    model, tokenizer = build_vlm_model(cfg)
+    if _uses_end_to_end_vision(cfg):
+        model, tokenizer = build_end_to_end_vlm_model(cfg, vision)
+    else:
+        model, tokenizer = build_vlm_model(cfg)
     model.to(device)
     encoded = tokenizer([format_prompt(record.question)], padding=True, return_tensors="pt")
     labels = tokenizer([record.answer], padding=True, return_tensors="pt")["input_ids"]
     dbg.log("BATCH", {"input_ids": tensor_stats("input_ids", encoded["input_ids"]), "labels": tensor_stats("labels", labels.float())})
     dbg.log("MODEL", {"params": model_param_summary(model)})
     with torch.no_grad():
-        output = model.forward_from_features(
-            input_ids=encoded["input_ids"].to(device),
-            attention_mask=encoded["attention_mask"].to(device),
-            visual_features=features.to(device),
-            labels=labels.to(device),
-        )
+        if _uses_end_to_end_vision(cfg):
+            output = model(
+                input_ids=encoded["input_ids"].to(device),
+                attention_mask=encoded["attention_mask"].to(device),
+                images=images.unsqueeze(0).to(device),
+                labels=labels.to(device),
+            )
+        else:
+            output = model.forward_from_features(
+                input_ids=encoded["input_ids"].to(device),
+                attention_mask=encoded["attention_mask"].to(device),
+                visual_features=features.to(device),
+                labels=labels.to(device),
+            )
     report = {"split": split, "index": index, "loss": float(output.loss.detach().cpu().item())}
     dbg.log("MODEL", report)
     return report

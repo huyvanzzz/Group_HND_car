@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from efficient_vlm_ad.cache import FeatureCacheManifest, create_memmap
 from efficient_vlm_ad.config import (
@@ -16,7 +17,7 @@ from efficient_vlm_ad.config import (
     TrainingConfig,
     VisionConfig,
 )
-from efficient_vlm_ad.pipeline import CachedVLMDataset
+from efficient_vlm_ad.pipeline import CachedVLMDataset, ImageVLMDataset
 
 
 CAMERA_PATHS_A = {
@@ -107,3 +108,30 @@ def test_cached_vlm_dataset_filters_records_missing_from_feature_cache(tmp_path:
 
     assert len(dataset) == 1
     assert dataset[0]["sample_id"] == "train-0"
+
+
+def test_image_vlm_dataset_loads_six_camera_images_without_feature_cache(tmp_path: Path):
+    cfg = _cfg(tmp_path)
+    data_root = Path(cfg.data.local_dir)
+    for camera_path in CAMERA_PATHS_A.values():
+        path = data_root / camera_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (16, 16), color=(30, 60, 90)).save(path)
+    prepared_dir = Path(cfg.project.output_dir) / "prepared_data"
+    prepared_dir.mkdir(parents=True)
+    row = {
+        "question": "Question A?",
+        "answer": "Answer A.",
+        "camera_paths": CAMERA_PATHS_A,
+        "sample_id": "train-0",
+        "eval_id": 0,
+        "split": "train",
+    }
+    (prepared_dir / "train.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    (prepared_dir / "manifest.json").write_text(json.dumps({"root": str(data_root)}), encoding="utf-8")
+
+    dataset = ImageVLMDataset(cfg, "train")
+
+    assert len(dataset) == 1
+    assert dataset[0]["images"].shape == (6, 3, 16, 16)
+    assert dataset.summary() == {"prepared_records": 1, "image_records": 1}

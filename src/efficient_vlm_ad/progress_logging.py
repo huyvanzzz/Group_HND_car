@@ -53,3 +53,33 @@ class ProgressEventWriter:
 
 def default_progress_jsonl(output_dir: str | Path) -> Path:
     return Path(output_dir) / "debug" / "train_progress.jsonl"
+
+
+class MinimalProgressWriter:
+    def __init__(self, output_dir: str | Path, filename: str, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.path = Path(output_dir) / "debug" / filename
+        if self.enabled:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(
+        self,
+        *,
+        stage: str,
+        current: int,
+        total: int,
+        elapsed_seconds: float,
+        estimated_remaining_seconds: float,
+    ) -> None:
+        if not self.enabled:
+            return
+        row = {
+            "stage": stage,
+            "current": int(current),
+            "total": int(total),
+            "elapsed_seconds": round(float(elapsed_seconds), 3),
+            "estimated_remaining_seconds": round(float(estimated_remaining_seconds), 3),
+        }
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(_redact(row), ensure_ascii=False, default=str) + "\n")
+            f.flush()
