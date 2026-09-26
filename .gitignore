@@ -5,4 +5,6 @@ outputs/
 /data/
 /multi_frame_results/
 /wandb/
-
+.venv/
+.tmp/
+.pip-cache/
