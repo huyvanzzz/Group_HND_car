@@ -32,6 +32,7 @@ class EfficientVLMForAD(nn.Module):
         self,
         *,
         text_model: nn.Module,
+        visual_adapter: nn.Module | None = None,
         vision_dim: int,
         d_model: int,
         seq_len: int,
@@ -39,6 +40,7 @@ class EfficientVLMForAD(nn.Module):
     ) -> None:
         super().__init__()
         self.text_model = text_model
+        self.visual_adapter = visual_adapter
         self.seq_len = seq_len
         self.gpa = GatedPoolingAttention(seq_len=seq_len, input_dim=vision_dim, hidden_size=gpa_hidden_size)
         self.projector = MultiModalProjector(input_dim=vision_dim, d_model=d_model, seq_len=seq_len)
@@ -65,6 +67,9 @@ class EfficientVLMForAD(nn.Module):
         visual_features: torch.Tensor,
         labels: torch.Tensor | None = None,
     ):
+        text_tokens = self.text_model.get_input_embeddings()(input_ids)
+        if self.visual_adapter is not None:
+            visual_features = self.visual_adapter(visual_features, text_tokens, attention_mask)
         visual_features = self.add_spatial_embeddings(visual_features)
         fused, weights = self.gpa(visual_features)
         self.last_gpa_weights = weights
@@ -73,7 +78,6 @@ class EfficientVLMForAD(nn.Module):
             torch.ones((visual_tokens.shape[0], visual_tokens.shape[1]), dtype=torch.long, device=visual_tokens.device)
         )
 
-        text_tokens = self.text_model.get_input_embeddings()(input_ids)
         text_tokens = text_tokens + self.modal_embeddings(torch.zeros_like(input_ids))
 
         inputs_embeds = torch.cat([visual_tokens, text_tokens], dim=1)
@@ -92,6 +96,12 @@ class EfficientVLMForAD(nn.Module):
         labels: torch.Tensor | None = None,
     ) -> dict:
         report = {"raw_visual_features": _stats("raw_visual_features", visual_features)}
+        text_tokens = self.text_model.get_input_embeddings()(input_ids)
+        report["text_embedding_tokens"] = _stats("text_embedding_tokens", text_tokens)
+        if self.visual_adapter is not None:
+            report["adapter_input_visual_features"] = _stats("adapter_input_visual_features", visual_features)
+            visual_features = self.visual_adapter(visual_features, text_tokens, attention_mask)
+            report["adapter_output_visual_features"] = _stats("adapter_output_visual_features", visual_features)
         visual_features = self.add_spatial_embeddings(visual_features)
         report["spatial_visual_features"] = _stats("spatial_visual_features", visual_features)
         fused, weights = self.gpa(visual_features)
@@ -104,8 +114,6 @@ class EfficientVLMForAD(nn.Module):
             torch.ones((visual_tokens.shape[0], visual_tokens.shape[1]), dtype=torch.long, device=visual_tokens.device)
         )
         report["visual_tokens"] = _stats("visual_tokens", visual_tokens)
-        text_tokens = self.text_model.get_input_embeddings()(input_ids)
-        report["text_embedding_tokens"] = _stats("text_embedding_tokens", text_tokens)
         text_tokens = text_tokens + self.modal_embeddings(torch.zeros_like(input_ids))
         report["text_tokens"] = _stats("text_tokens", text_tokens)
         inputs_embeds = torch.cat([visual_tokens, text_tokens], dim=1)
@@ -147,6 +155,9 @@ class EfficientVLMForAD(nn.Module):
         early_stopping: bool = False,
         length_penalty: float = 1.0,
     ) -> torch.Tensor:
+        text_tokens = self.text_model.get_input_embeddings()(input_ids)
+        if self.visual_adapter is not None:
+            visual_features = self.visual_adapter(visual_features, text_tokens, attention_mask)
         visual_features = self.add_spatial_embeddings(visual_features)
         fused, weights = self.gpa(visual_features)
         self.last_gpa_weights = weights
@@ -154,7 +165,6 @@ class EfficientVLMForAD(nn.Module):
         visual_tokens = visual_tokens + self.modal_embeddings(
             torch.ones((visual_tokens.shape[0], visual_tokens.shape[1]), dtype=torch.long, device=visual_tokens.device)
         )
-        text_tokens = self.text_model.get_input_embeddings()(input_ids)
         text_tokens = text_tokens + self.modal_embeddings(torch.zeros_like(input_ids))
         inputs_embeds = torch.cat([visual_tokens, text_tokens], dim=1)
         visual_mask = torch.ones(
@@ -177,6 +187,7 @@ class EndToEndEfficientVLMForAD(EfficientVLMForAD):
         *,
         vision_encoder: nn.Module,
         text_model: nn.Module,
+        visual_adapter: nn.Module | None = None,
         vision_dim: int,
         d_model: int,
         seq_len: int,
@@ -184,6 +195,7 @@ class EndToEndEfficientVLMForAD(EfficientVLMForAD):
     ) -> None:
         super().__init__(
             text_model=text_model,
+            visual_adapter=visual_adapter,
             vision_dim=vision_dim,
             d_model=d_model,
             seq_len=seq_len,

@@ -60,10 +60,19 @@ class TextConfig:
 
 
 @dataclass(frozen=True)
+class AdapterConfig:
+    name: str = "none"
+    num_heads: int = 8
+    dropout: float = 0.1
+    residual_scale: float = 0.1
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     profile: str
     vision: VisionConfig
     text: TextConfig
+    adapter: AdapterConfig = field(default_factory=AdapterConfig)
 
 
 @dataclass(frozen=True)
@@ -139,6 +148,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     model_raw = _require(raw, "model")
     vision_raw = _require(model_raw, "vision")
     text_raw = _require(model_raw, "text")
+    adapter_raw = model_raw.get("adapter", {})
     train_raw = _require(raw, "training")
     cache_raw = raw.get("cache", {})
     runtime_raw = raw.get("runtime", {})
@@ -150,6 +160,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     vision_training = str(train_raw.get("vision_training", "feature_cache"))
     if vision_training not in {"feature_cache", "end_to_end"}:
         raise ValueError("training.vision_training must be one of: feature_cache, end_to_end")
+    adapter_name = str(adapter_raw.get("name", "none"))
+    if adapter_name not in {"none", "minidrive_di"}:
+        raise ValueError("model.adapter.name must be one of: none, minidrive_di")
     expected_counts = data_raw.get("expected_counts") or {"train": 341381, "val": 19785, "test": 16817}
 
     return ExperimentConfig(
@@ -175,6 +188,12 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 model_id=str(_require(text_raw, "model_id")),
                 revision=text_raw.get("revision"),
                 d_model=int(_require(text_raw, "d_model")),
+            ),
+            adapter=AdapterConfig(
+                name=adapter_name,
+                num_heads=int(adapter_raw.get("num_heads", 8)),
+                dropout=float(adapter_raw.get("dropout", 0.1)),
+                residual_scale=float(adapter_raw.get("residual_scale", 0.1)),
             ),
         ),
         training=TrainingConfig(

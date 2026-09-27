@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .adapters import DynamicInstructionAdapter
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
 
@@ -156,10 +157,25 @@ def build_vision_encoder(cfg):
     raise ValueError(f"Unknown vision model: {cfg.model.vision.name}")
 
 
+def build_visual_adapter(cfg):
+    if cfg.model.adapter.name == "none":
+        return None
+    if cfg.model.adapter.name == "minidrive_di":
+        return DynamicInstructionAdapter(
+            vision_dim=cfg.model.vision.output_dim,
+            text_dim=cfg.model.text.d_model,
+            num_heads=cfg.model.adapter.num_heads,
+            dropout=cfg.model.adapter.dropout,
+            residual_scale=cfg.model.adapter.residual_scale,
+        )
+    raise ValueError(f"Unknown adapter: {cfg.model.adapter.name}")
+
+
 def build_vlm_model(cfg):
     text_model, tokenizer = build_text_and_tokenizer(cfg)
     model = EfficientVLMForAD(
         text_model=text_model,
+        visual_adapter=build_visual_adapter(cfg),
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
@@ -173,6 +189,7 @@ def build_end_to_end_vlm_model(cfg, vision_encoder: nn.Module):
     model = EndToEndEfficientVLMForAD(
         vision_encoder=vision_encoder,
         text_model=text_model,
+        visual_adapter=build_visual_adapter(cfg),
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,

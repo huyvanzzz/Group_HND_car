@@ -75,3 +75,38 @@ def test_end_to_end_full_notebook_runs_full_epochs_without_smoke_limits():
     assert "eval_progress.jsonl" in source
     assert "benchmark_progress.jsonl" in source
     assert "--batch-size 16" in source
+
+
+def test_di_adapter_debug_notebook_exercises_cached_feature_adapter_path():
+    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_di_adapter.ipynb")
+
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter.yaml" in source
+    assert "prepare-features" in source
+    assert "diagnose-train" in source
+    assert "--debug-numerics" in source
+    assert "--max-steps 20" in source
+    assert "--stage align" in source
+    assert "--stage finetune" in source
+    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
+    assert "train_progress.jsonl" in source
+    assert "nvidia-smi" in source
+
+
+def test_di_adapter_full_notebook_runs_full_epochs_without_smoke_limits():
+    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_di_adapter.ipynb")
+
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter.yaml" in source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter_safe.yaml" in source
+    assert "prepare-data --config" in source
+    assert "prepare-features --config" in source
+    assert "accelerate launch" in source
+    assert "--stage align" in source
+    assert "--stage finetune" in source
+    assert "--max-steps" not in source
+    assert "--max-samples" not in source
+    assert "finetune_latest.pt" in source
+    assert "align_best.pt" in source
+    assert "train_progress.jsonl" in source
+    assert "eval_progress.jsonl" in source
+    assert "benchmark_progress.jsonl" in source
+    assert "--batch-size 16" in source
