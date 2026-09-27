@@ -164,5 +164,6 @@ def build_vlm_model(cfg):
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
         gpa_hidden_size=cfg.training.gpa_hidden_size,
+        gpa_conditioning=cfg.model.gpa_conditioning,
     )
     return model, tokenizer

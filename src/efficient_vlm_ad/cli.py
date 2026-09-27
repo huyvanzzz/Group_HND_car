@@ -185,6 +185,7 @@ def config_debug_payload(cfg) -> dict:
         "hf_repo_id": cfg.data.hf_repo_id,
         "local_dir": cfg.data.local_dir,
         "profile": cfg.model.profile,
+        "gpa_conditioning": cfg.model.gpa_conditioning,
         "vision": cfg.model.vision.name,
         "text": cfg.model.text.model_id,
         "cache_dir": cfg.cache.dir,

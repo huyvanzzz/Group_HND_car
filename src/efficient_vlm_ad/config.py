@@ -64,6 +64,7 @@ class ModelConfig:
     profile: str
     vision: VisionConfig
     text: TextConfig
+    gpa_conditioning: str = "none"
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     model_raw = _require(raw, "model")
     vision_raw = _require(model_raw, "vision")
     text_raw = _require(model_raw, "text")
+    gpa_conditioning = str(model_raw.get("gpa_conditioning", "none"))
+    if gpa_conditioning not in {"none", "question_gate"}:
+        raise ValueError("model.gpa_conditioning must be one of: none, question_gate")
     train_raw = _require(raw, "training")
     cache_raw = raw.get("cache", {})
     runtime_raw = raw.get("runtime", {})
@@ -159,6 +163,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 revision=text_raw.get("revision"),
                 d_model=int(_require(text_raw, "d_model")),
             ),
+            gpa_conditioning=gpa_conditioning,
         ),
         training=TrainingConfig(
             batch_size=int(_require(train_raw, "batch_size")),

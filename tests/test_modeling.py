@@ -17,6 +17,23 @@ def test_gpa_preserves_token_grid_and_returns_view_weights():
     assert torch.allclose(weights.sum(dim=1), torch.ones(2), atol=1e-6)
 
 
+def test_question_gated_gpa_returns_view_weights_and_responds_to_conditioning():
+    torch.manual_seed(0)
+    gpa = GatedPoolingAttention(seq_len=4, input_dim=8, hidden_size=6, conditioning_dim=8)
+    features = torch.randn(2, 6, 4, 8)
+    question_a = torch.randn(2, 8)
+    question_b = question_a + 3.0
+
+    fused_a, weights_a = gpa(features, conditioning=question_a)
+    fused_b, weights_b = gpa(features, conditioning=question_b)
+
+    assert fused_a.shape == (2, 4, 8)
+    assert weights_a.shape == (2, 6)
+    assert torch.allclose(weights_a.sum(dim=1), torch.ones(2), atol=1e-6)
+    assert torch.allclose(weights_b.sum(dim=1), torch.ones(2), atol=1e-6)
+    assert not torch.allclose(weights_a, weights_b)
+
+
 def test_projector_maps_repvit_tokens_to_t5_mini_dimension():
     projector = MultiModalProjector(input_dim=512, d_model=384, seq_len=49)
     features = torch.randn(2, 49, 512)
@@ -97,3 +114,35 @@ def test_forward_debug_reports_numerical_intermediates():
         assert key in report
         assert "nan_count" in report[key]
         assert report[key]["finite"] is True
+
+
+def test_question_gated_vlm_forward_from_cached_features():
+    cfg = ExperimentConfig(
+        project=ProjectConfig(output_dir="unused"),
+        data=DataConfig(hf_repo_id="local/fake", view_order=["Front", "Front-Left", "Front-Right", "Back", "Back-Left", "Back-Right"]),
+        model=ModelConfig(
+            profile="debug_question_gate",
+            vision=VisionConfig(name="fake_vision", model_id="fake", output_dim=8, seq_len=4, image_size=16),
+            text=TextConfig(model_id="fake_t5", d_model=8),
+            gpa_conditioning="question_gate",
+        ),
+        training=TrainingConfig(batch_size=1, gradient_accumulation_steps=1, gpa_hidden_size=4),
+        cache=CacheConfig(dir="unused"),
+        runtime=RuntimeConfig(precision="fp32"),
+        generation=GenerationConfig(),
+    )
+    model, tokenizer = build_vlm_model(cfg)
+    encoded = tokenizer(["Question: What is visible? Answer:"], padding=True, return_tensors="pt")
+    labels = tokenizer(["A road."], padding=True, return_tensors="pt")["input_ids"]
+    visual_features = torch.randn(1, 6, cfg.model.vision.seq_len, cfg.model.vision.output_dim)
+
+    output = model.forward_from_features(
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        visual_features=visual_features,
+        labels=labels,
+    )
+
+    assert torch.isfinite(output.loss)
+    assert model.last_gpa_weights is not None
+    assert model.last_gpa_weights.shape == (1, 6)
