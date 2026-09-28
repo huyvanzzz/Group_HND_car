@@ -124,10 +124,14 @@ def test_resume_verify_notebook_checks_same_stage_resume_cases():
     assert "CACHE_HF_REPO_ID" in source
     assert "FINETUNE_CHECKPOINT_HF_REPO_ID" in source
     assert "FINETUNE_CHECKPOINT_FILENAME = \"finetune_latest.pt\"" in source
+    assert "UserSecretsClient" in source
+    assert "HF_TOKEN" in source
     assert "--stage align" in source
     assert "--checkpoint \"$ALIGN_VERIFY_PROFILE/checkpoints/align_latest.pt\"" in source
     assert "--stage finetune" in source
     assert "--checkpoint \"$PROFILE/checkpoints/finetune_latest.pt\"" in source
+    assert "resume_verify_finetune_tmp" in source
+    assert "--checkpoint \"$FINETUNE_VERIFY_PROFILE/checkpoints/finetune_latest.pt\"" in source
     assert "align_resume_checkpoint_verify.json" in source
     assert "finetune_resume_checkpoint_verify.json" in source
     assert "sha256sum" in source
