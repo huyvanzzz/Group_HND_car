@@ -30,7 +30,7 @@ training:
   weight_decay: 0.05
   scheduler_gamma: 0.9
   align_epochs: 6
-  finetune_epochs: 6
+  finetune_epochs: 10
   gpa_hidden_size: 128
   max_grad_norm: 1.0
   num_workers: 2
