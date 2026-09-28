@@ -36,6 +36,8 @@ def test_full_train_notebook_has_no_smoke_limits_by_default():
     assert "RUN_FULL_2GPU = False" not in source
     assert "--max-samples" not in source
     assert "align_best.pt" in source
+    assert "verify-align-checkpoint" in source
+    assert "align_checkpoint_verify.json" in source
     assert "best_model.pt" in source
 
 
@@ -106,6 +108,8 @@ def test_di_adapter_full_notebook_runs_full_epochs_without_smoke_limits():
     assert "--max-samples" not in source
     assert "finetune_latest.pt" in source
     assert "align_best.pt" in source
+    assert "verify-align-checkpoint" in source
+    assert "align_checkpoint_verify.json" in source
     assert "train_progress.jsonl" in source
     assert "eval_progress.jsonl" in source
     assert "benchmark_progress.jsonl" in source

@@ -16,6 +16,7 @@ from .pipeline import (
     evaluate_checkpoint,
     prepare_features as prepare_features_command,
     train_stage,
+    verify_align_checkpoint,
 )
 from .progress_logging import default_progress_jsonl
 
@@ -94,6 +95,25 @@ def diagnose_train(args: argparse.Namespace) -> None:
         cfg,
         args.stage,
         resume=args.resume,
+        debug=args.debug,
+        debug_samples=args.debug_samples,
+        debug_jsonl=args.debug_jsonl,
+        debug_numerics=args.debug_numerics,
+        disable_progress=args.no_progress,
+    )
+    if is_main_process():
+        print(json.dumps(report, indent=2))
+
+
+def verify_align(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    debug = make_debug(args, cfg)
+    debug.log("CONFIG", config_debug_payload(cfg))
+    report = verify_align_checkpoint(
+        cfg,
+        args.checkpoint,
+        split=args.split,
+        index=args.index,
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
@@ -242,6 +262,14 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose_cmd.add_argument("--resume")
     add_debug_args(diagnose_cmd)
     diagnose_cmd.set_defaults(func=diagnose_train)
+
+    verify_cmd = sub.add_parser("verify-align-checkpoint")
+    verify_cmd.add_argument("--config", required=True)
+    verify_cmd.add_argument("--checkpoint", required=True)
+    verify_cmd.add_argument("--split", default="train", choices=["train", "val", "test"])
+    verify_cmd.add_argument("--index", type=int, default=0)
+    add_debug_args(verify_cmd)
+    verify_cmd.set_defaults(func=verify_align)
 
     debug_cmd = sub.add_parser("debug-sample")
     debug_cmd.add_argument("--config", required=True)

@@ -25,6 +25,13 @@ from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, 
 from .modeling.multimodal import set_trainable_for_stage
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
+from .verification import (
+    optimizer_storage_duplicate_report,
+    parameter_count_report,
+    t5_tied_weight_report,
+    trainable_module_names,
+    trainable_parameter_finite_report,
+)
 
 
 class _SingleProcessAccelerator:
@@ -579,6 +586,33 @@ def _optimizer_param_groups(model: torch.nn.Module, cfg: ExperimentConfig) -> li
     return groups
 
 
+def _module_has_parameters(module: torch.nn.Module) -> bool:
+    return any(True for _ in module.parameters())
+
+
+def _expected_finetune_modules(cfg: ExperimentConfig, model: torch.nn.Module) -> list[str]:
+    expected = {"text_model", "gpa", "modal_embeddings"}
+    if _module_has_parameters(getattr(model, "projector")):
+        expected.add("projector")
+    if getattr(model, "row_embeddings", None) is not None and _module_has_parameters(getattr(model, "row_embeddings")):
+        expected.add("row_embeddings")
+    if getattr(model, "col_embeddings", None) is not None and _module_has_parameters(getattr(model, "col_embeddings")):
+        expected.add("col_embeddings")
+    if getattr(model, "visual_adapter", None) is not None and _module_has_parameters(getattr(model, "visual_adapter")):
+        expected.add("visual_adapter")
+    if _uses_end_to_end_vision(cfg) and _module_has_parameters(getattr(model, "vision_encoder")):
+        expected.add("vision_encoder")
+    return sorted(expected)
+
+
+def _strict_load_model_from_checkpoint(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
+    payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    missing, unexpected = model.load_state_dict(payload["model"], strict=True)
+    if missing or unexpected:
+        raise RuntimeError(f"Strict checkpoint load failed: missing={list(missing)}, unexpected={list(unexpected)}")
+    return dict(payload.get("metadata", {}))
+
+
 def _module_grad_norm(module: torch.nn.Module) -> float | None:
     total = 0.0
     seen = False
@@ -1113,6 +1147,151 @@ def diagnose_train(
         "durations": durations,
     }
     _heartbeat(dbg, started_at, "diagnose_done")
+    return report
+
+
+def verify_align_checkpoint(
+    cfg: ExperimentConfig,
+    checkpoint: str,
+    split: str = "train",
+    index: int = 0,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    debug_numerics: bool = False,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    started_at = time.perf_counter()
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
+    if index < 0:
+        raise ValueError("--index must be >= 0")
+
+    _heartbeat(dbg, started_at, "verify_align_start", checkpoint=str(checkpoint_path), split=split, index=index)
+    metadata = read_checkpoint_metadata(checkpoint_path, map_location="cpu")
+    checkpoint_stage = metadata.get("stage")
+    if checkpoint_stage != "align":
+        raise ValueError(f"metadata.stage must be align, got {checkpoint_stage!r}")
+
+    device = resolve_device(cfg)
+    _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
+    model, tokenizer, transform = _build_train_model(cfg)
+    _heartbeat(dbg, started_at, "build_vlm_model_done")
+
+    model.to(device)
+    load_metadata = _strict_load_model_from_checkpoint(checkpoint_path, model, map_location=device)
+    _heartbeat(dbg, started_at, "checkpoint_strict_load_done", metadata=load_metadata)
+
+    set_trainable_for_stage(_module_dict_for_freezing(model), cfg, "finetune")
+    actual_trainable = trainable_module_names(model)
+    expected_trainable = _expected_finetune_modules(cfg, model)
+    missing_trainable = sorted(set(expected_trainable) - set(actual_trainable))
+    unexpected_trainable = sorted(set(actual_trainable) - set(expected_trainable))
+    trainable_policy_ok = not missing_trainable and not unexpected_trainable
+
+    t5_report = t5_tied_weight_report(model.text_model)
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer_report = optimizer_storage_duplicate_report(optimizer)
+
+    if not t5_report["ok"]:
+        raise RuntimeError(f"T5 tied weights are not sharing storage: {t5_report}")
+    if not optimizer_report["ok"]:
+        raise RuntimeError(f"Optimizer has duplicate parameter storage groups: {optimizer_report}")
+    if not trainable_policy_ok:
+        raise RuntimeError(
+            "Finetune trainable policy mismatch: "
+            f"expected={expected_trainable}, actual={actual_trainable}, "
+            f"missing={missing_trainable}, unexpected={unexpected_trainable}"
+        )
+
+    dataset, collator = _make_dataset_and_collator(cfg, split, tokenizer, max_samples=index + 1, transform=transform)
+    if len(dataset) <= index:
+        raise IndexError(f"Dataset split {split!r} has {len(dataset)} samples after filtering; cannot read index {index}")
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=0,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    batch = None
+    for row_idx, row in enumerate(progress(loader, desc="verify-align-checkpoint", total=len(loader), disable=disable_progress)):
+        if row_idx == index:
+            batch = row
+            break
+    if batch is None:
+        raise IndexError(f"Could not fetch sample index {index} from split {split!r}")
+    batch = _move_training_batch(batch, device, cfg)
+    dbg.log("BATCH", {"stage": "verify_align_checkpoint", **_debug_batch_payload(batch, cfg, device)})
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    output = model(**_batch_model_inputs(batch, cfg))
+    raw_loss = output.loss
+    loss_finite = bool(torch.isfinite(raw_loss.detach()).item())
+    numerics = None
+    if debug_numerics and hasattr(model, "forward_debug"):
+        with torch.no_grad():
+            numerics = model.forward_debug(**_batch_model_inputs(batch, cfg))
+        dbg.log("NUMERICS", {"stage": "verify_align_forward", **numerics})
+    if not loss_finite:
+        raise FloatingPointError(f"Finetune forward loss is not finite: {raw_loss.detach().cpu().item()}")
+
+    raw_loss.backward()
+    if cfg.training.max_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    post_step_t5_report = t5_tied_weight_report(model.text_model)
+    finite_report = trainable_parameter_finite_report(model)
+    if not post_step_t5_report["ok"]:
+        raise RuntimeError(f"T5 tied weights broke after one optimizer step: {post_step_t5_report}")
+    if not finite_report["ok"]:
+        raise FloatingPointError(f"Non-finite trainable params after one optimizer step: {finite_report}")
+
+    report = {
+        "ok": True,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_exists": True,
+        "checkpoint_stage": checkpoint_stage,
+        "checkpoint_metadata": metadata,
+        "load_strict": True,
+        "device": str(device),
+        "vision_training": cfg.training.vision_training,
+        "adapter": cfg.model.adapter.name,
+        "parameter_counts": {
+            "model": parameter_count_report(model),
+            "text_model": parameter_count_report(model.text_model),
+        },
+        "trainable_policy_ok": trainable_policy_ok,
+        "expected_trainable_modules": expected_trainable,
+        "actual_trainable_modules": actual_trainable,
+        "missing_trainable_modules": missing_trainable,
+        "unexpected_trainable_modules": unexpected_trainable,
+        "t5_tying": t5_report,
+        "t5_shared_data_ptr_ok": bool(t5_report["ok"]),
+        "optimizer": optimizer_report,
+        "optimizer_duplicate_storage_groups": int(optimizer_report["duplicate_storage_groups"]),
+        "split": split,
+        "index": index,
+        "dataset": dataset.summary(),
+        "batch": _batch_debug_summary(batch, device),
+        "finetune_forward_loss": float(raw_loss.detach().cpu().item()),
+        "finetune_forward_loss_finite": loss_finite,
+        "one_step_finetune_probe_ok": True,
+        "post_step_t5_tying": post_step_t5_report,
+        "post_step_trainable_finite": finite_report,
+        "numerics": numerics,
+        "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+    }
+    output_path = Path(cfg.project.output_dir) / "debug" / "align_checkpoint_verify.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    dbg.log("VERIFY", {"stage": "align_checkpoint_verify_done", "output": str(output_path), "ok": True})
     return report
 
 
