@@ -114,3 +114,20 @@ def test_di_adapter_full_notebook_runs_full_epochs_without_smoke_limits():
     assert "eval_progress.jsonl" in source
     assert "benchmark_progress.jsonl" in source
     assert "--batch-size 16" in source
+
+
+def test_resume_verify_notebook_checks_same_stage_resume_cases():
+    source = _notebook_source("notebooks/kaggle_verify_resume_checkpoints.ipynb")
+
+    assert "verify-resume-checkpoint" in source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu.yaml" in source
+    assert "CACHE_HF_REPO_ID" in source
+    assert "FINETUNE_CHECKPOINT_HF_REPO_ID" in source
+    assert "FINETUNE_CHECKPOINT_FILENAME = \"finetune_latest.pt\"" in source
+    assert "--stage align" in source
+    assert "--checkpoint \"$ALIGN_VERIFY_PROFILE/checkpoints/align_latest.pt\"" in source
+    assert "--stage finetune" in source
+    assert "--checkpoint \"$PROFILE/checkpoints/finetune_latest.pt\"" in source
+    assert "align_resume_checkpoint_verify.json" in source
+    assert "finetune_resume_checkpoint_verify.json" in source
+    assert "sha256sum" in source

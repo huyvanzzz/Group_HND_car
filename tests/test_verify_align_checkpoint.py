@@ -75,6 +75,20 @@ def test_verify_align_checkpoint_cli_is_available():
     assert "--index" in result.stdout
 
 
+def test_verify_resume_checkpoint_cli_is_available():
+    result = subprocess.run(
+        [sys.executable, "-m", "efficient_vlm_ad", "verify-resume-checkpoint", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--config" in result.stdout
+    assert "--checkpoint" in result.stdout
+    assert "--stage" in result.stdout
+    assert "--debug-numerics" in result.stdout
+
+
 def test_verify_align_checkpoint_passes_for_smoke_align_checkpoint(tmp_path):
     cfg = _write_fake_config(tmp_path)
     output_dir = tmp_path / "outputs"
@@ -109,6 +123,93 @@ def test_verify_align_checkpoint_passes_for_smoke_align_checkpoint(tmp_path):
     assert payload["optimizer_duplicate_storage_groups"] == 0
     assert payload["one_step_finetune_probe_ok"] is True
     assert (output_dir / "debug" / "align_checkpoint_verify.json").exists()
+
+
+def test_verify_resume_checkpoint_passes_for_align_and_finetune_latest(tmp_path):
+    cfg = _write_fake_config(tmp_path)
+    output_dir = tmp_path / "outputs"
+
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "smoke"], check=True)
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg), "--subset", "smoke"], check=True)
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "train", "--config", str(cfg), "--stage", "align", "--no-progress"], check=True)
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "efficient_vlm_ad",
+            "train",
+            "--config",
+            str(cfg),
+            "--stage",
+            "finetune",
+            "--resume",
+            str(output_dir / "checkpoints" / "align_best.pt"),
+            "--no-progress",
+        ],
+        check=True,
+    )
+
+    for stage in ("align", "finetune"):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "efficient_vlm_ad",
+                "verify-resume-checkpoint",
+                "--config",
+                str(cfg),
+                "--stage",
+                stage,
+                "--checkpoint",
+                str(output_dir / "checkpoints" / f"{stage}_latest.pt"),
+                "--debug",
+                "--debug-numerics",
+                "--no-progress",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        payload = json.loads(result.stdout[result.stdout.rfind("\n{") + 1 :])
+        assert payload["ok"] is True
+        assert payload["checkpoint_stage"] == stage
+        assert payload["t5_shared_data_ptr_ok"] is True
+        assert payload["optimizer_state_loaded"] is True
+        assert payload["scheduler_state_loaded"] is True
+        assert payload["optimizer_duplicate_storage_groups"] == 0
+        assert payload["resume_forward_loss_finite"] is True
+        assert payload["one_step_resume_probe_ok"] is True
+        assert (output_dir / "debug" / f"{stage}_resume_checkpoint_verify.json").exists()
+
+
+def test_verify_resume_checkpoint_rejects_stage_mismatch(tmp_path):
+    cfg = _write_fake_config(tmp_path)
+    output_dir = tmp_path / "outputs"
+
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "smoke"], check=True)
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg), "--subset", "smoke"], check=True)
+    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "train", "--config", str(cfg), "--stage", "align", "--no-progress"], check=True)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "efficient_vlm_ad",
+            "verify-resume-checkpoint",
+            "--config",
+            str(cfg),
+            "--stage",
+            "finetune",
+            "--checkpoint",
+            str(output_dir / "checkpoints" / "align_latest.pt"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "metadata.stage must match --stage" in result.stderr or "metadata.stage must match --stage" in result.stdout
 
 
 def test_verify_align_checkpoint_rejects_non_align_checkpoint(tmp_path):

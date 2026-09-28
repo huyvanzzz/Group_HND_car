@@ -594,7 +594,13 @@ def _module_has_parameters(module: torch.nn.Module) -> bool:
 
 
 def _expected_finetune_modules(cfg: ExperimentConfig, model: torch.nn.Module) -> list[str]:
-    expected = {"text_model", "gpa", "modal_embeddings"}
+    return _expected_trainable_modules(cfg, model, "finetune")
+
+
+def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, stage: str) -> list[str]:
+    expected = {"gpa", "modal_embeddings"}
+    if stage == "finetune":
+        expected.add("text_model")
     if _module_has_parameters(getattr(model, "projector")):
         expected.add("projector")
     if getattr(model, "row_embeddings", None) is not None and _module_has_parameters(getattr(model, "row_embeddings")):
@@ -1318,6 +1324,180 @@ def verify_align_checkpoint(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     dbg.log("VERIFY", {"stage": "align_checkpoint_verify_done", "output": str(output_path), "ok": True})
+    return report
+
+
+def verify_resume_checkpoint(
+    cfg: ExperimentConfig,
+    checkpoint: str,
+    stage: str,
+    split: str = "train",
+    index: int = 0,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    debug_numerics: bool = False,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
+    if stage not in {"align", "finetune"}:
+        raise ValueError("--stage must be align or finetune")
+    if index < 0:
+        raise ValueError("--index must be >= 0")
+
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    started_at = time.perf_counter()
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
+
+    _heartbeat(dbg, started_at, "verify_resume_start", checkpoint=str(checkpoint_path), train_stage=stage, split=split, index=index)
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    metadata = dict(payload.get("metadata", {}))
+    checkpoint_stage = metadata.get("stage")
+    if checkpoint_stage != stage:
+        raise ValueError(f"metadata.stage must match --stage, got metadata.stage={checkpoint_stage!r}, --stage={stage!r}")
+
+    device = resolve_device(cfg)
+    _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
+    model, tokenizer, transform = _build_train_model(cfg)
+    _heartbeat(dbg, started_at, "build_vlm_model_done")
+
+    model.to(device)
+    set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    missing, unexpected = model.load_state_dict(payload["model"], strict=True)
+    if missing or unexpected:
+        raise RuntimeError(f"Strict checkpoint load failed: missing={list(missing)}, unexpected={list(unexpected)}")
+    retie_report = retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    metadata = dict(payload.get("metadata", {}))
+    _heartbeat(dbg, started_at, "checkpoint_strict_load_done", metadata=metadata)
+
+    actual_trainable = trainable_module_names(model)
+    expected_trainable = _expected_trainable_modules(cfg, model, stage)
+    missing_trainable = sorted(set(expected_trainable) - set(actual_trainable))
+    unexpected_trainable = sorted(set(actual_trainable) - set(expected_trainable))
+    trainable_policy_ok = not missing_trainable and not unexpected_trainable
+    if not trainable_policy_ok:
+        raise RuntimeError(
+            "Resume trainable policy mismatch: "
+            f"expected={expected_trainable}, actual={actual_trainable}, "
+            f"missing={missing_trainable}, unexpected={unexpected_trainable}"
+        )
+
+    t5_report = t5_tied_weight_report(model.text_model)
+    if not t5_report["ok"]:
+        raise RuntimeError(f"T5 tied weights are not sharing storage: {t5_report}")
+
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
+    optimizer.load_state_dict(payload["optimizer"])
+    scheduler_state_loaded = payload.get("scheduler") is not None
+    if scheduler_state_loaded:
+        scheduler.load_state_dict(payload["scheduler"])
+    rng_state_loaded = "rng_state" in payload
+    if rng_state_loaded:
+        _restore_rng_state(payload["rng_state"])
+
+    optimizer_report = optimizer_storage_duplicate_report(optimizer)
+    if not optimizer_report["ok"]:
+        raise RuntimeError(f"Optimizer has duplicate parameter storage groups: {optimizer_report}")
+
+    dataset, collator = _make_dataset_and_collator(cfg, split, tokenizer, max_samples=index + 1, transform=transform)
+    if len(dataset) <= index:
+        raise IndexError(f"Dataset split {split!r} has {len(dataset)} samples after filtering; cannot read index {index}")
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=0,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    batch = None
+    for row_idx, row in enumerate(progress(loader, desc="verify-resume-checkpoint", total=len(loader), disable=disable_progress)):
+        if row_idx == index:
+            batch = row
+            break
+    if batch is None:
+        raise IndexError(f"Could not fetch sample index {index} from split {split!r}")
+    batch = _move_training_batch(batch, device, cfg)
+    dbg.log("BATCH", {"stage": "verify_resume_checkpoint", **_debug_batch_payload(batch, cfg, device)})
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    output = model(**_batch_model_inputs(batch, cfg))
+    raw_loss = output.loss
+    loss_finite = bool(torch.isfinite(raw_loss.detach()).item())
+    numerics = None
+    if debug_numerics and hasattr(model, "forward_debug"):
+        with torch.no_grad():
+            numerics = model.forward_debug(**_batch_model_inputs(batch, cfg))
+        dbg.log("NUMERICS", {"stage": "verify_resume_forward", **numerics})
+    if not loss_finite:
+        raise FloatingPointError(f"Resume forward loss is not finite: {raw_loss.detach().cpu().item()}")
+
+    raw_loss.backward()
+    if cfg.training.max_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    post_step_t5_report = t5_tied_weight_report(model.text_model)
+    finite_report = trainable_parameter_finite_report(model)
+    if not post_step_t5_report["ok"]:
+        raise RuntimeError(f"T5 tied weights broke after one optimizer step: {post_step_t5_report}")
+    if not finite_report["ok"]:
+        raise FloatingPointError(f"Non-finite trainable params after one optimizer step: {finite_report}")
+
+    report = {
+        "ok": True,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_exists": True,
+        "checkpoint_stage": checkpoint_stage,
+        "checkpoint_metadata": metadata,
+        "load_strict": True,
+        "device": str(device),
+        "vision_training": cfg.training.vision_training,
+        "adapter": cfg.model.adapter.name,
+        "parameter_counts": {
+            "model": parameter_count_report(model),
+            "text_model": parameter_count_report(model.text_model),
+        },
+        "trainable_policy_ok": trainable_policy_ok,
+        "expected_trainable_modules": expected_trainable,
+        "actual_trainable_modules": actual_trainable,
+        "missing_trainable_modules": missing_trainable,
+        "unexpected_trainable_modules": unexpected_trainable,
+        "t5_tying": t5_report,
+        "t5_shared_data_ptr_ok": bool(t5_report["ok"]),
+        "retie": retie_report,
+        "retie_applied": bool(retie_report["retie_applied"]),
+        "t5_shared_data_ptr_ok_after_retie": bool(retie_report["after"]["ok"]),
+        "optimizer": optimizer_report,
+        "optimizer_state_loaded": True,
+        "scheduler_state_loaded": scheduler_state_loaded,
+        "rng_state_loaded": rng_state_loaded,
+        "optimizer_duplicate_storage_groups": int(optimizer_report["duplicate_storage_groups"]),
+        "split": split,
+        "index": index,
+        "dataset": dataset.summary(),
+        "batch": _batch_debug_summary(batch, device),
+        "resume_forward_loss": float(raw_loss.detach().cpu().item()),
+        "resume_forward_loss_finite": loss_finite,
+        "one_step_resume_probe_ok": True,
+        "post_step_t5_tying": post_step_t5_report,
+        "post_step_trainable_finite": finite_report,
+        "numerics": numerics,
+        "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+    }
+    output_path = Path(cfg.project.output_dir) / "debug" / f"{stage}_resume_checkpoint_verify.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    dbg.log("VERIFY", {"stage": f"{stage}_resume_checkpoint_verify_done", "output": str(output_path), "ok": True})
     return report
 
 

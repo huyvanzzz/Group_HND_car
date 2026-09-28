@@ -27,7 +27,7 @@ def test_loads_kaggle_2gpu_profiles():
     assert cfg.training.effective_batch_size == 32
     assert cfg.training.effective_batch_size_for_processes(2) == 64
     assert cfg.training.align_epochs == 6
-    assert cfg.training.finetune_epochs == 6
+    assert cfg.training.finetune_epochs == 10
     assert cfg.training.align_max_steps is None
     assert cfg.training.finetune_max_steps is None
     assert cfg.training.progress_log_every_steps == 50
@@ -67,7 +67,7 @@ def test_loads_kaggle_di_adapter_profiles():
     assert cfg.training.gradient_accumulation_steps == 2
     assert cfg.training.effective_batch_size_for_processes(2) == 64
     assert cfg.training.align_epochs == 8
-    assert cfg.training.finetune_epochs == 8
+    assert cfg.training.finetune_epochs == 10
     assert cfg.runtime.precision == "fp32"
     assert cfg.generation.max_new_tokens == 512
     assert cfg.generation.num_beams == 3

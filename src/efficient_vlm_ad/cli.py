@@ -17,6 +17,7 @@ from .pipeline import (
     prepare_features as prepare_features_command,
     train_stage,
     verify_align_checkpoint,
+    verify_resume_checkpoint,
 )
 from .progress_logging import default_progress_jsonl
 
@@ -112,6 +113,26 @@ def verify_align(args: argparse.Namespace) -> None:
     report = verify_align_checkpoint(
         cfg,
         args.checkpoint,
+        split=args.split,
+        index=args.index,
+        debug=args.debug,
+        debug_samples=args.debug_samples,
+        debug_jsonl=args.debug_jsonl,
+        debug_numerics=args.debug_numerics,
+        disable_progress=args.no_progress,
+    )
+    if is_main_process():
+        print(json.dumps(report, indent=2))
+
+
+def verify_resume(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    debug = make_debug(args, cfg)
+    debug.log("CONFIG", config_debug_payload(cfg))
+    report = verify_resume_checkpoint(
+        cfg,
+        args.checkpoint,
+        args.stage,
         split=args.split,
         index=args.index,
         debug=args.debug,
@@ -270,6 +291,15 @@ def build_parser() -> argparse.ArgumentParser:
     verify_cmd.add_argument("--index", type=int, default=0)
     add_debug_args(verify_cmd)
     verify_cmd.set_defaults(func=verify_align)
+
+    resume_verify_cmd = sub.add_parser("verify-resume-checkpoint")
+    resume_verify_cmd.add_argument("--config", required=True)
+    resume_verify_cmd.add_argument("--stage", required=True, choices=["align", "finetune"])
+    resume_verify_cmd.add_argument("--checkpoint", required=True)
+    resume_verify_cmd.add_argument("--split", default="train", choices=["train", "val", "test"])
+    resume_verify_cmd.add_argument("--index", type=int, default=0)
+    add_debug_args(resume_verify_cmd)
+    resume_verify_cmd.set_defaults(func=verify_resume)
 
     debug_cmd = sub.add_parser("debug-sample")
     debug_cmd.add_argument("--config", required=True)
