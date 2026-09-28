@@ -185,3 +185,22 @@ def test_t5_tying_report_fails_when_tied_data_ptrs_differ():
     assert report["applicable"] is True
     assert report["shared_data_ptr_ok"] is False
     assert report["ok"] is False
+
+
+def test_parameter_count_report_labels_duplicate_tied_weights_clearly():
+    from efficient_vlm_ad.verification import parameter_count_report
+
+    class TiedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shared = torch.nn.Embedding(4, 2)
+            self.head = torch.nn.Linear(2, 4, bias=False)
+            self.head.weight = self.shared.weight
+
+    report = parameter_count_report(TiedModel())
+
+    assert report["display_params"] == 8
+    assert report["parameter_count_basis"] == "unique_storage"
+    assert report["named_parameter_params"] == 8
+    assert report["named_parameter_params_with_duplicates"] == 16
+    assert report["checkpoint_state_dict_params"] == 16

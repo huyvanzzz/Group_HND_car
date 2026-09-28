@@ -9,12 +9,28 @@ import torch
 def parameter_count_report(model: torch.nn.Module) -> dict[str, int]:
     params_default = list(model.named_parameters())
     params_with_duplicates = list(model.named_parameters(remove_duplicate=False))
+    unique_storage_params = 0
+    seen_storage: set[int] = set()
+    for _, param in params_with_duplicates:
+        ptr = param.data_ptr()
+        if ptr in seen_storage:
+            continue
+        seen_storage.add(ptr)
+        unique_storage_params += param.numel()
+    named_parameter_params = sum(param.numel() for _, param in params_default)
+    named_parameter_params_with_duplicates = sum(param.numel() for _, param in params_with_duplicates)
+    checkpoint_state_dict_params = sum(tensor.numel() for tensor in model.state_dict().values())
     return {
-        "named_parameters_default": sum(param.numel() for _, param in params_default),
-        "named_parameters_remove_duplicate_false": sum(param.numel() for _, param in params_with_duplicates),
+        "display_params": unique_storage_params,
+        "parameter_count_basis": "unique_storage",
+        "named_parameter_params": named_parameter_params,
+        "named_parameter_params_with_duplicates": named_parameter_params_with_duplicates,
+        "checkpoint_state_dict_params": checkpoint_state_dict_params,
+        "named_parameters_default": named_parameter_params,
+        "named_parameters_remove_duplicate_false": named_parameter_params_with_duplicates,
         "unique_parameter_objects": len({id(param) for _, param in params_with_duplicates}),
         "unique_parameter_storage_ptrs": len({param.data_ptr() for _, param in params_with_duplicates}),
-        "state_dict_numel_sum": sum(tensor.numel() for tensor in model.state_dict().values()),
+        "state_dict_numel_sum": checkpoint_state_dict_params,
     }
 
 
