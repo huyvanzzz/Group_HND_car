@@ -86,11 +86,15 @@ def path_status(paths: list[str | Path]) -> list[dict[str, Any]]:
 def model_param_summary(model: torch.nn.Module) -> dict[str, Any]:
     total = 0
     trainable = 0
+    duplicate_named_total = 0
+    state_dict_total = sum(tensor.numel() for tensor in model.state_dict().values())
     unique_storage_total = 0
     unique_storage_trainable = 0
     seen_storage: set[int] = set()
     seen_trainable_storage: set[int] = set()
     trainable_modules: set[str] = set()
+    for _, param in model.named_parameters(remove_duplicate=False):
+        duplicate_named_total += param.numel()
     for name, param in model.named_parameters():
         count = param.numel()
         total += count
@@ -105,6 +109,13 @@ def model_param_summary(model: torch.nn.Module) -> dict[str, Any]:
                 unique_storage_trainable += count
             trainable_modules.add(name.split(".")[0])
     return {
+        "display_params": unique_storage_total,
+        "display_trainable_params": unique_storage_trainable,
+        "parameter_count_basis": "unique_storage",
+        "named_parameter_params": total,
+        "named_parameter_trainable_params": trainable,
+        "named_parameter_params_with_duplicates": duplicate_named_total,
+        "checkpoint_state_dict_params": state_dict_total,
         "total_params": total,
         "trainable_params": trainable,
         "frozen_params": total - trainable,
