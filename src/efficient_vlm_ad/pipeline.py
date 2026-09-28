@@ -1,0 +1,1696 @@
+from __future__ import annotations
+
+import json
+import platform
+import shutil
+import time
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+
+from .benchmarking import summarize_latencies
+from .cache import FeatureCacheManifest, create_memmap, validate_manifest
+from .checkpointing import _restore_rng_state, load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from .config import ExperimentConfig
+from .data import format_prompt, normalize_camera_paths
+from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats
+from .evaluation import caption_metrics, metric_display_values, write_predictions
+from .hf_data import DatasetRecord, load_prepared_records
+from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, build_vlm_model
+from .modeling.multimodal import set_trainable_for_stage
+from .progress import progress, progress_bar
+from .progress_logging import MinimalProgressWriter, ProgressEventWriter
+from .verification import (
+    assert_tied_weights_ok,
+    dedupe_optimizer_param_groups,
+    optimizer_storage_duplicate_report,
+    parameter_count_report,
+    retie_text_model_weights,
+    t5_tied_weight_report,
+    trainable_module_names,
+    trainable_parameter_finite_report,
+)
+
+
+class _SingleProcessAccelerator:
+    device: torch.device
+    num_processes = 1
+    process_index = 0
+    local_process_index = 0
+    distributed_type = "NO"
+    mixed_precision = "no"
+    is_main_process = True
+    sync_gradients = True
+
+    def __init__(self, device: torch.device, mixed_precision: str = "no") -> None:
+        self.device = device
+        self.mixed_precision = mixed_precision
+
+    def prepare(self, *objects):
+        return objects
+
+    def backward(self, loss: torch.Tensor) -> None:
+        loss.backward()
+
+    def autocast(self):
+        dtype = torch.float16 if self.mixed_precision == "fp16" else torch.bfloat16
+        enabled = self.device.type == "cuda" and self.mixed_precision in {"fp16", "bf16"}
+        return torch.autocast(device_type=self.device.type, dtype=dtype, enabled=enabled)
+
+    def accumulate(self, _model):
+        return nullcontext()
+
+    def unwrap_model(self, model):
+        return model
+
+    def wait_for_everyone(self) -> None:
+        return None
+
+    def clip_grad_norm_(self, parameters, max_norm: float) -> None:
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+
+def _accelerate_precision(cfg: ExperimentConfig) -> str:
+    if cfg.runtime.precision == "fp16":
+        return "fp16"
+    if cfg.runtime.precision == "bf16":
+        return "bf16"
+    if cfg.runtime.precision == "auto" and torch.cuda.is_available():
+        return "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    return "no"
+
+
+def _build_accelerator(cfg: ExperimentConfig):
+    mixed_precision = _accelerate_precision(cfg)
+    try:
+        from accelerate import Accelerator, DistributedDataParallelKwargs
+    except Exception:
+        return _SingleProcessAccelerator(resolve_device(cfg), mixed_precision=mixed_precision)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    return Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
+        kwargs_handlers=[ddp_kwargs],
+    )
+
+
+def _distributed_debug_payload(accelerator, cfg: ExperimentConfig) -> dict[str, Any]:
+    return {
+        "num_processes": int(getattr(accelerator, "num_processes", 1)),
+        "process_index": int(getattr(accelerator, "process_index", 0)),
+        "local_process_index": int(getattr(accelerator, "local_process_index", 0)),
+        "distributed_type": str(getattr(accelerator, "distributed_type", "NO")),
+        "mixed_precision": str(getattr(accelerator, "mixed_precision", "no")),
+        "per_process_batch_size": cfg.training.batch_size,
+        "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
+        "effective_batch_size": cfg.training.effective_batch_size_for_processes(
+            int(getattr(accelerator, "num_processes", 1))
+        ),
+    }
+
+
+def _optimizer_lr(optimizer) -> float | None:
+    param_groups = getattr(optimizer, "param_groups", None)
+    if param_groups is None and hasattr(optimizer, "optimizer"):
+        param_groups = getattr(optimizer.optimizer, "param_groups", None)
+    if not param_groups:
+        return None
+    return float(param_groups[0]["lr"])
+
+
+def _heartbeat(dbg: DebugPrinter, started_at: float, stage: str, **payload: Any) -> None:
+    dbg.log(
+        "HEARTBEAT",
+        {
+            "stage": stage,
+            "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+            **payload,
+        },
+    )
+
+
+def _remaining_seconds(elapsed_seconds: float, current: int, total: int) -> float:
+    if current <= 0 or total <= current:
+        return 0.0
+    samples_per_second = current / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    return (total - current) / samples_per_second if samples_per_second > 0 else 0.0
+
+
+def _write_minimal_progress(writer: MinimalProgressWriter, *, stage: str, current: int, total: int, start: float) -> None:
+    elapsed = time.perf_counter() - start
+    writer.write(
+        stage=stage,
+        current=current,
+        total=total,
+        elapsed_seconds=elapsed,
+        estimated_remaining_seconds=_remaining_seconds(elapsed, current, total),
+    )
+
+
+def _cuda_memory_payload(device: torch.device) -> dict[str, int | None]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {"cuda_memory_allocated": None, "cuda_memory_peak": None}
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return {
+        "cuda_memory_allocated": int(torch.cuda.memory_allocated(index)),
+        "cuda_memory_peak": int(torch.cuda.max_memory_allocated(index)),
+    }
+
+
+def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    for key in ("input_ids", "attention_mask", "visual_features", "labels"):
+        if key in batch:
+            batch[key] = batch[key].to(device)
+    return batch
+
+
+def _stage_epochs(cfg: ExperimentConfig, stage: str) -> int:
+    return cfg.training.align_epochs if stage == "align" else cfg.training.finetune_epochs
+
+
+def _stage_step_limit(cfg: ExperimentConfig, stage: str, max_steps: int | None) -> int | None:
+    configured_stage_steps = cfg.training.align_max_steps if stage == "align" else cfg.training.finetune_max_steps
+    return max_steps or configured_stage_steps or cfg.training.max_steps
+
+
+def _uses_end_to_end_vision(cfg: ExperimentConfig) -> bool:
+    return cfg.training.vision_training == "end_to_end"
+
+
+def resolve_device(cfg: ExperimentConfig) -> torch.device:
+    if cfg.runtime.device != "auto":
+        return torch.device(cfg.runtime.device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def resolve_precision(cfg: ExperimentConfig) -> torch.dtype:
+    if cfg.runtime.precision == "bf16":
+        return torch.bfloat16
+    if cfg.runtime.precision == "fp16":
+        return torch.float16
+    if cfg.runtime.precision == "auto" and torch.cuda.is_available():
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.float32
+
+
+def _read_prepared_manifest(cfg: ExperimentConfig) -> dict[str, Any]:
+    path = Path(cfg.project.output_dir) / "prepared_data" / "manifest.json"
+    if not path.exists():
+        raise FileNotFoundError("Run prepare-data before this command")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_image(path: Path, image_size: int, transform=None) -> torch.Tensor:
+    image = Image.open(path).convert("RGB")
+    if transform is not None:
+        return transform(image)
+    image = image.resize((image_size, image_size))
+    arr = np.asarray(image).astype("float32") / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1)
+
+
+def _record_key(record: DatasetRecord) -> str:
+    return "|".join(record.camera_paths[camera] for camera in sorted(record.camera_paths))
+
+
+def _debug_printer(cfg: ExperimentConfig, debug: bool = False, debug_samples: int = 3, debug_jsonl: str | None = None) -> DebugPrinter:
+    return DebugPrinter(debug, debug_samples, debug_jsonl or default_debug_jsonl(cfg.project.output_dir))
+
+
+def prepare_features(
+    cfg: ExperimentConfig,
+    subset: str = "full",
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    manifest = _read_prepared_manifest(cfg)
+    root = Path(manifest["root"])
+    records: list[DatasetRecord] = []
+    split_counts: dict[str, int] = {}
+    per_split_limit = int(cfg.training.max_steps or 64) if subset != "full" else None
+    for split in ("train", "val", "test"):
+        split_records = load_prepared_records(cfg, split)
+        if per_split_limit is not None:
+            split_records = split_records[:per_split_limit]
+        split_counts[split] = len(split_records)
+        records.extend(split_records)
+
+    unique: dict[str, DatasetRecord] = {}
+    for record in records:
+        unique.setdefault(_record_key(record), record)
+
+    device = resolve_device(cfg)
+    vision, transform = build_vision_encoder(cfg)
+    vision.to(device)
+    vision.eval()
+    dbg.log(
+        "FEATURE",
+        {
+            "device": str(device),
+            "precision": str(resolve_precision(cfg)),
+            "vision": cfg.model.vision.name,
+            "feature_shape": [len(unique), 6, cfg.model.vision.seq_len, cfg.model.vision.output_dim],
+            "split_counts": split_counts,
+        },
+    )
+
+    shape = (len(unique), 6, cfg.model.vision.seq_len, cfg.model.vision.output_dim)
+    cache_dir = Path(cfg.cache.dir)
+    mmap = create_memmap(cache_dir / "features.float16.memmap", shape=shape, dtype=np.float16)
+    index: dict[str, int] = {}
+
+    with torch.no_grad():
+        for idx, (key, record) in progress(
+            enumerate(unique.items()),
+            desc="prepare-features",
+            total=len(unique),
+            disable=disable_progress,
+        ):
+            camera_paths = normalize_camera_paths(root, record.camera_paths, cfg.data.view_order)
+            images = torch.stack([_load_image(path, cfg.model.vision.image_size, transform) for path in camera_paths])
+            if idx < dbg.samples:
+                dbg.log("IMAGE", {"sample_id": record.sample_id, "paths": path_status(camera_paths), "tensor": tensor_stats("images", images)})
+            features = vision(images.unsqueeze(0).to(device)).detach().cpu().numpy().astype(np.float16)
+            if idx < dbg.samples:
+                dbg.log("FEATURE", {"sample_id": record.sample_id, "tensor": tensor_stats("features", torch.from_numpy(features))})
+            mmap[idx] = features[0]
+            index[key] = idx
+    mmap.flush()
+
+    (cache_dir / "index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")
+    cache_manifest = FeatureCacheManifest(
+        dataset_revision=str(manifest.get("root")),
+        model_id=cfg.model.vision.model_id,
+        model_revision=cfg.model.vision.revision,
+        preprocessing=f"{cfg.model.vision.name}_{cfg.model.vision.image_size}",
+        dtype="float16",
+        image_size=cfg.model.vision.image_size,
+        view_order=cfg.data.view_order,
+        shape=list(shape),
+    )
+    cache_manifest.write(cache_dir / "manifest.json")
+    report = {"feature_count": len(unique), "shape": list(shape), "cache_dir": str(cache_dir)}
+    dbg.log("FEATURE", report)
+    return report
+
+
+class CachedVLMDataset(Dataset):
+    def __init__(self, cfg: ExperimentConfig, split: str, max_samples: int | None = None) -> None:
+        self.cfg = cfg
+        self.records = load_prepared_records(cfg, split)
+        if max_samples is not None:
+            self.records = self.records[:max_samples]
+        manifest = validate_manifest(
+            Path(cfg.cache.dir) / "manifest.json",
+            {
+                "model_id": cfg.model.vision.model_id,
+                "image_size": cfg.model.vision.image_size,
+                "view_order": cfg.data.view_order,
+            },
+        )
+        self.features = np.memmap(
+            Path(cfg.cache.dir) / "features.float16.memmap",
+            mode="r",
+            dtype=np.float16,
+            shape=tuple(manifest.shape),
+        )
+        self.index = json.loads((Path(cfg.cache.dir) / "index.json").read_text(encoding="utf-8"))
+        prepared_count = len(self.records)
+        self.records = [
+            record
+            for record in progress(
+                self.records,
+                desc=f"filter-cache-{split}",
+                total=len(self.records),
+                disable=len(self.records) < 1000,
+            )
+            if _record_key(record) in self.index
+        ]
+        self.prepared_count = prepared_count
+        self.filtered_count = prepared_count - len(self.records)
+        self.cache_count = len(self.index)
+        if not self.records:
+            raise ValueError(
+                f"No {split} records have cached visual features. "
+                "Run prepare-features for this split/subset before training or evaluation."
+            )
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        record = self.records[idx]
+        feature_idx = self.index[_record_key(record)]
+        return {
+            "question": record.question,
+            "answer": record.answer,
+            "visual_features": torch.from_numpy(np.array(self.features[feature_idx], dtype=np.float32)),
+            "sample_id": record.sample_id,
+            "eval_id": record.eval_id,
+        }
+
+    def summary(self) -> dict[str, int]:
+        return {
+            "prepared_records": self.prepared_count,
+            "cached_records": len(self.records),
+            "filtered_missing_features": self.filtered_count,
+            "feature_index_count": self.cache_count,
+        }
+
+
+class CachedBatchCollator:
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        encoded = self.tokenizer([format_prompt(item["question"]) for item in batch], padding=True, return_tensors="pt")
+        labels = self.tokenizer([item["answer"] for item in batch], padding=True, return_tensors="pt")["input_ids"].clone()
+        labels[labels == getattr(self.tokenizer, "pad_token_id", 0)] = -100
+        return {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "visual_features": torch.stack([item["visual_features"] for item in batch]),
+            "labels": labels,
+            "answers": [item["answer"] for item in batch],
+            "eval_ids": [item["eval_id"] for item in batch],
+        }
+
+
+class ImageVLMDataset(Dataset):
+    def __init__(self, cfg: ExperimentConfig, split: str, max_samples: int | None = None, transform=None) -> None:
+        self.cfg = cfg
+        self.split = split
+        self.transform = transform
+        self.records = load_prepared_records(cfg, split)
+        if max_samples is not None:
+            self.records = self.records[:max_samples]
+        manifest = _read_prepared_manifest(cfg)
+        self.root = Path(manifest["root"])
+        if not self.records:
+            raise ValueError(f"No {split} records are available. Run prepare-data before training or evaluation.")
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        record = self.records[idx]
+        camera_paths = normalize_camera_paths(self.root, record.camera_paths, self.cfg.data.view_order)
+        images = torch.stack([_load_image(path, self.cfg.model.vision.image_size, self.transform) for path in camera_paths])
+        return {
+            "question": record.question,
+            "answer": record.answer,
+            "images": images,
+            "sample_id": record.sample_id,
+            "eval_id": record.eval_id,
+        }
+
+    def summary(self) -> dict[str, int]:
+        return {"prepared_records": len(self.records), "image_records": len(self.records)}
+
+
+class ImageBatchCollator:
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        encoded = self.tokenizer([format_prompt(item["question"]) for item in batch], padding=True, return_tensors="pt")
+        labels = self.tokenizer([item["answer"] for item in batch], padding=True, return_tensors="pt")["input_ids"].clone()
+        labels[labels == getattr(self.tokenizer, "pad_token_id", 0)] = -100
+        return {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "images": torch.stack([item["images"] for item in batch]),
+            "labels": labels,
+            "answers": [item["answer"] for item in batch],
+            "eval_ids": [item["eval_id"] for item in batch],
+        }
+
+
+def validate_stage_loss(
+    cfg: ExperimentConfig,
+    model: torch.nn.Module,
+    tokenizer,
+    *,
+    stage: str,
+    epoch: int,
+    device: torch.device,
+    debug: DebugPrinter | None = None,
+    disable_progress: bool = False,
+    transform=None,
+) -> float:
+    dataset, collator = _make_dataset_and_collator(cfg, "val", tokenizer, transform=transform)
+    if debug:
+        debug.log("FEATURE", {"split": "val", **dataset.summary()})
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=cfg.training.num_workers,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    total_batches = 0
+    with torch.no_grad():
+        for batch in progress(
+            loader,
+            desc=f"validate-{stage} epoch {epoch}",
+            total=len(loader),
+            disable=disable_progress,
+        ):
+            batch = _move_training_batch(batch, device, cfg)
+            output = model(**_batch_model_inputs(batch, cfg))
+            total_loss += float(output.loss.detach().cpu().item())
+            total_batches += 1
+    if was_training:
+        model.train()
+    if total_batches == 0:
+        raise ValueError("Validation dataloader was empty")
+    return total_loss / total_batches
+
+
+def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
+    modules = {
+        "vision": getattr(model, "vision_encoder", torch.nn.Identity()),
+        "text": model.text_model,
+        "gpa": model.gpa,
+        "projector": model.projector,
+        "spatial_pos": torch.nn.ModuleList([m for m in [model.row_embeddings, model.col_embeddings] if m]),
+        "modal_embeddings": model.modal_embeddings,
+    }
+    if getattr(model, "visual_adapter", None) is not None:
+        modules["visual_adapter"] = model.visual_adapter
+    return torch.nn.ModuleDict(modules)
+
+
+def _build_train_model(cfg: ExperimentConfig):
+    if _uses_end_to_end_vision(cfg):
+        vision, transform = build_vision_encoder(cfg)
+        model, tokenizer = build_end_to_end_vlm_model(cfg, vision)
+        return model, tokenizer, transform
+    model, tokenizer = build_vlm_model(cfg)
+    return model, tokenizer, None
+
+
+def _make_dataset_and_collator(cfg: ExperimentConfig, split: str, tokenizer, *, max_samples: int | None = None, transform=None):
+    if _uses_end_to_end_vision(cfg):
+        dataset = ImageVLMDataset(cfg, split, max_samples=max_samples, transform=transform)
+        return dataset, ImageBatchCollator(tokenizer)
+    dataset = CachedVLMDataset(cfg, split, max_samples=max_samples)
+    return dataset, CachedBatchCollator(tokenizer)
+
+
+def _move_training_batch(batch: dict[str, Any], device: torch.device, cfg: ExperimentConfig) -> dict[str, Any]:
+    keys = ("input_ids", "attention_mask", "images", "labels") if _uses_end_to_end_vision(cfg) else ("input_ids", "attention_mask", "visual_features", "labels")
+    for key in keys:
+        if key in batch:
+            batch[key] = batch[key].to(device)
+    return batch
+
+
+def _batch_model_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[str, torch.Tensor]:
+    inputs = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+        "labels": batch["labels"],
+    }
+    if _uses_end_to_end_vision(cfg):
+        inputs["images"] = batch["images"]
+    else:
+        inputs["visual_features"] = batch["visual_features"]
+    return inputs
+
+
+def _generation_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[str, torch.Tensor]:
+    inputs = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+    }
+    if _uses_end_to_end_vision(cfg):
+        inputs["images"] = batch["images"]
+    else:
+        inputs["visual_features"] = batch["visual_features"]
+    return inputs
+
+
+def _generate_batch(model, batch: dict[str, Any], cfg: ExperimentConfig) -> torch.Tensor:
+    kwargs = {
+        **_generation_inputs(batch, cfg),
+        "max_new_tokens": cfg.generation.max_new_tokens,
+        "num_beams": cfg.generation.num_beams,
+        "early_stopping": cfg.generation.early_stopping,
+        "length_penalty": cfg.generation.length_penalty,
+    }
+    if _uses_end_to_end_vision(cfg):
+        return model.generate_from_images(**kwargs)
+    return model.generate_from_features(**kwargs)
+
+
+def _debug_batch_payload(batch: dict[str, Any], cfg: ExperimentConfig, device: torch.device) -> dict[str, Any]:
+    payload = {
+        "stage": "after_accelerator_prepare",
+        "target_device": str(device),
+        "input_ids": tensor_stats("input_ids", batch["input_ids"]),
+        "attention_mask": tensor_stats("attention_mask", batch["attention_mask"]),
+        "labels": tensor_stats("labels", batch["labels"].float()),
+        "label_ignore_count": int((batch["labels"] == -100).sum().item()),
+    }
+    if _uses_end_to_end_vision(cfg):
+        payload["images"] = tensor_stats("images", batch["images"])
+    else:
+        payload["visual_features"] = tensor_stats("visual_features", batch["visual_features"])
+    return payload
+
+
+def _optimizer_param_groups(model: torch.nn.Module, cfg: ExperimentConfig) -> list[dict[str, Any]]:
+    if not _uses_end_to_end_vision(cfg):
+        return dedupe_optimizer_param_groups([{"params": [p for p in model.parameters() if p.requires_grad], "lr": cfg.training.learning_rate}])
+    groups: list[dict[str, Any]] = []
+    vision_params = [p for p in getattr(model, "vision_encoder").parameters() if p.requires_grad]
+    text_params = [p for p in model.text_model.parameters() if p.requires_grad]
+    excluded = {id(p) for p in [*vision_params, *text_params]}
+    head_params = [p for p in model.parameters() if p.requires_grad and id(p) not in excluded]
+    if vision_params:
+        groups.append({"params": vision_params, "lr": cfg.training.vision_learning_rate or cfg.training.learning_rate})
+    if text_params:
+        groups.append({"params": text_params, "lr": cfg.training.text_learning_rate or cfg.training.learning_rate})
+    if head_params:
+        groups.append({"params": head_params, "lr": cfg.training.head_learning_rate or cfg.training.learning_rate})
+    return dedupe_optimizer_param_groups(groups)
+
+
+def _module_has_parameters(module: torch.nn.Module) -> bool:
+    return any(True for _ in module.parameters())
+
+
+def _expected_finetune_modules(cfg: ExperimentConfig, model: torch.nn.Module) -> list[str]:
+    return _expected_trainable_modules(cfg, model, "finetune")
+
+
+def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, stage: str) -> list[str]:
+    expected = {"gpa", "modal_embeddings"}
+    if stage == "finetune":
+        expected.add("text_model")
+    if _module_has_parameters(getattr(model, "projector")):
+        expected.add("projector")
+    if getattr(model, "row_embeddings", None) is not None and _module_has_parameters(getattr(model, "row_embeddings")):
+        expected.add("row_embeddings")
+    if getattr(model, "col_embeddings", None) is not None and _module_has_parameters(getattr(model, "col_embeddings")):
+        expected.add("col_embeddings")
+    if getattr(model, "visual_adapter", None) is not None and _module_has_parameters(getattr(model, "visual_adapter")):
+        expected.add("visual_adapter")
+    if _uses_end_to_end_vision(cfg) and _module_has_parameters(getattr(model, "vision_encoder")):
+        expected.add("vision_encoder")
+    return sorted(expected)
+
+
+def _strict_load_model_from_checkpoint(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
+    payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    missing, unexpected = model.load_state_dict(payload["model"], strict=True)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    if missing or unexpected:
+        raise RuntimeError(f"Strict checkpoint load failed: missing={list(missing)}, unexpected={list(unexpected)}")
+    return dict(payload.get("metadata", {}))
+
+
+def _module_grad_norm(module: torch.nn.Module) -> float | None:
+    total = 0.0
+    seen = False
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        seen = True
+        total += float(param.grad.detach().float().norm(2).item() ** 2)
+    return total**0.5 if seen else None
+
+
+def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
+    payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    result = model.load_state_dict(payload["model"], strict=False)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    unexpected = list(result.unexpected_keys)
+    missing_not_vision = [key for key in result.missing_keys if not key.startswith("vision_encoder.")]
+    if unexpected or missing_not_vision:
+        raise RuntimeError(
+            "Checkpoint is not compatible with the end-to-end model: "
+            f"missing_non_vision={missing_not_vision}, unexpected={unexpected}"
+        )
+    return dict(payload.get("metadata", {}))
+
+
+def train_stage(
+    cfg: ExperimentConfig,
+    stage: str,
+    resume: str | None = None,
+    max_steps: int | None = None,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    debug_numerics: bool = False,
+    disable_progress: bool = False,
+    progress_log_every_steps: int | None = None,
+) -> Path:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    started_at = time.perf_counter()
+    _heartbeat(dbg, started_at, "train_stage_start", train_stage=stage, resume=bool(resume), max_steps=max_steps)
+    _heartbeat(dbg, started_at, "build_accelerator_start")
+    accelerator = _build_accelerator(cfg)
+    device = accelerator.device
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "build_accelerator_done", device=str(device), distributed=_distributed_debug_payload(accelerator, cfg))
+        _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
+    model, tokenizer, transform = _build_train_model(cfg)
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "build_vlm_model_done")
+        _heartbeat(dbg, started_at, "model_to_device_start", device=str(device))
+    model.to(device)
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "model_to_device_done", device=str(device))
+    set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    if accelerator.is_main_process:
+        dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
+        dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
+
+    start_step = 0
+    start_epoch = 0
+    best_val_loss = float("inf")
+    best_epoch = 0
+    resume_training_payload: dict[str, Any] | None = None
+    if resume:
+        resume_path = Path(resume)
+        if accelerator.is_main_process:
+            dbg.log(
+                "CHECKPOINT",
+                {
+                    "resume": resume,
+                    "exists": resume_path.exists(),
+                    "size_bytes": resume_path.stat().st_size if resume_path.exists() else None,
+                },
+            )
+            _heartbeat(dbg, started_at, "checkpoint_metadata_start", path=resume)
+        metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        if accelerator.is_main_process:
+            _heartbeat(dbg, started_at, "checkpoint_metadata_done", metadata=metadata)
+            _heartbeat(dbg, started_at, "checkpoint_load_start", path=resume, same_stage=metadata.get("stage") == stage)
+        if metadata.get("stage") == stage:
+            resume_training_payload = torch.load(resume_path, map_location=device, weights_only=False)
+            model.load_state_dict(resume_training_payload["model"])
+            retie_text_model_weights(model)
+            assert_tied_weights_ok(model)
+            metadata = dict(resume_training_payload.get("metadata", {}))
+            start_step = int(metadata.get("global_step", 0))
+            start_epoch = int(metadata.get("completed_epochs", metadata.get("epoch", 0)))
+            best_val_loss = float(metadata.get("best_val_loss", best_val_loss))
+            best_epoch = int(metadata.get("best_epoch", best_epoch))
+        else:
+            if _uses_end_to_end_vision(cfg):
+                metadata = _load_model_weights_allowing_new_vision(resume, model=model, map_location=device)
+            else:
+                metadata = load_checkpoint(resume, model=model, map_location=device)
+        if accelerator.is_main_process:
+            _heartbeat(dbg, started_at, "checkpoint_load_done", metadata=metadata)
+
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
+    if resume_training_payload is not None:
+        try:
+            optimizer.load_state_dict(resume_training_payload["optimizer"])
+            if resume_training_payload.get("scheduler") is not None:
+                scheduler.load_state_dict(resume_training_payload["scheduler"])
+            _restore_rng_state(resume_training_payload["rng_state"])
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not restore optimizer/scheduler state after retie/dedupe. "
+                "Use a checkpoint from the previous stage, or retrain/resave this stage with the fixed checkpoint code."
+            ) from exc
+
+    split = "train"
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "dataset_start", split=split)
+    dataset, collator = _make_dataset_and_collator(cfg, split, tokenizer, transform=transform)
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "dataset_done", split=split, **dataset.summary())
+        dbg.log("FEATURE", {"split": split, **dataset.summary()})
+        _heartbeat(dbg, started_at, "dataloader_start", split=split, batch_size=cfg.training.batch_size, num_workers=cfg.training.num_workers)
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=cfg.training.num_workers,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "dataloader_done", split=split, batches=len(loader))
+        _heartbeat(dbg, started_at, "accelerator_prepare_start")
+    model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    if accelerator.is_main_process:
+        _heartbeat(dbg, started_at, "accelerator_prepare_done")
+    step_limit = _stage_step_limit(cfg, stage, max_steps)
+    total_epochs = 1 if step_limit is not None else _stage_epochs(cfg, stage)
+    global_step = start_step
+    model.train()
+    latest_ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_latest.pt"
+    best_ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_best.pt"
+    optimizer.zero_grad(set_to_none=True)
+    progress_interval = max(1, int(progress_log_every_steps or cfg.training.progress_log_every_steps))
+    progress_writer = ProgressEventWriter(cfg.project.output_dir, enabled=bool(accelerator.is_main_process))
+
+    for epoch in range(start_epoch, total_epochs):
+        epoch_number = epoch + 1
+        epoch_loss = 0.0
+        epoch_batches = 0
+        epoch_started_at = time.perf_counter()
+        loader_iter = iter(loader)
+        bar_source = range(step_limit) if step_limit is not None else loader
+        bar_total = step_limit if step_limit is not None else len(loader)
+        if accelerator.is_main_process:
+            _heartbeat(dbg, started_at, "train_tqdm_start", epoch=epoch_number, total=bar_total)
+            progress_writer.write(
+                "epoch_start",
+                stage=stage,
+                epoch=epoch_number,
+                total_epochs=total_epochs,
+                global_step=global_step,
+                total_steps_epoch=bar_total,
+                learning_rate=_optimizer_lr(optimizer),
+            )
+        bar = progress_bar(
+            bar_source,
+            desc=f"train-{stage} epoch {epoch_number}/{total_epochs}",
+            total=bar_total,
+            disable=disable_progress or not accelerator.is_main_process,
+        )
+        for item in bar:
+            if step_limit is not None:
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    loader_iter = iter(loader)
+                    batch = next(loader_iter)
+            else:
+                batch = item
+            if debug and accelerator.is_main_process and global_step == start_step:
+                dbg.log("BATCH", _debug_batch_payload(batch, cfg, device))
+            if isinstance(accelerator, _SingleProcessAccelerator):
+                batch = _move_training_batch(batch, device, cfg)
+            with accelerator.autocast():
+                output = model(**_batch_model_inputs(batch, cfg))
+                raw_loss = output.loss
+                loss = raw_loss / cfg.training.gradient_accumulation_steps
+            if not torch.isfinite(raw_loss.detach()).item():
+                if accelerator.is_main_process:
+                    progress_writer.write(
+                        "train_step",
+                        stage=stage,
+                        epoch=epoch_number,
+                        global_step=global_step,
+                        step_in_epoch=epoch_batches,
+                        total_steps_epoch=bar_total,
+                        loss=float(raw_loss.detach().cpu().item()),
+                        lr=_optimizer_lr(optimizer),
+                        finite_loss=False,
+                        elapsed_seconds=round(time.perf_counter() - epoch_started_at, 3),
+                        steps_per_second=0.0,
+                        estimated_epoch_remaining_seconds=None,
+                        **_cuda_memory_payload(device),
+                    )
+                    numerics = {}
+                    debug_model = accelerator.unwrap_model(model)
+                    if debug_numerics and hasattr(debug_model, "forward_debug"):
+                        with torch.no_grad():
+                            numerics = debug_model.forward_debug(
+                                **_batch_model_inputs(batch, cfg),
+                            )
+                    dbg.log(
+                        "NUMERICS",
+                        {
+                            "stage": "non_finite_loss",
+                            "step": global_step,
+                            "epoch": epoch_number,
+                            "loss": float(raw_loss.detach().cpu().item()),
+                            **numerics,
+                        },
+                    )
+                raise FloatingPointError(f"Non-finite loss at step {global_step}: {raw_loss.detach().cpu().item()}")
+            accelerator.backward(loss)
+            loss_value = float(raw_loss.detach().cpu().item())
+            epoch_loss += loss_value
+            epoch_batches += 1
+            if debug and accelerator.is_main_process and global_step < start_step + dbg.samples:
+                train_payload = {
+                    "step": global_step,
+                    "epoch": epoch_number,
+                    "loss": loss_value,
+                    "finite_loss": bool(torch.isfinite(raw_loss.detach()).item()),
+                    "lr": _optimizer_lr(optimizer),
+                }
+                debug_unwrapped = accelerator.unwrap_model(model)
+                if _uses_end_to_end_vision(cfg) and hasattr(debug_unwrapped, "vision_encoder"):
+                    train_payload["vision_grad_norm"] = _module_grad_norm(debug_unwrapped.vision_encoder)
+                dbg.log(
+                    "TRAIN",
+                    train_payload,
+                )
+            if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
+                if cfg.training.max_grad_norm is not None:
+                    accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            if accelerator.is_main_process and (
+                epoch_batches == 1 or epoch_batches % progress_interval == 0 or epoch_batches == bar_total
+            ):
+                elapsed = max(time.perf_counter() - epoch_started_at, 1e-9)
+                steps_per_second = epoch_batches / elapsed
+                remaining_steps = max(0, int(bar_total) - epoch_batches)
+                progress_writer.write(
+                    "train_step",
+                    stage=stage,
+                    epoch=epoch_number,
+                    global_step=global_step,
+                    step_in_epoch=epoch_batches,
+                    total_steps_epoch=bar_total,
+                    loss=loss_value,
+                    lr=_optimizer_lr(optimizer),
+                    finite_loss=True,
+                    elapsed_seconds=round(elapsed, 3),
+                    steps_per_second=round(steps_per_second, 6),
+                    estimated_epoch_remaining_seconds=round(remaining_steps / steps_per_second, 3) if steps_per_second > 0 else None,
+                    **_cuda_memory_payload(device),
+                )
+            if accelerator.is_main_process and hasattr(bar, "set_postfix"):
+                bar.set_postfix(loss=f"{loss_value:.4f}", lr=_optimizer_lr(optimizer), global_step=global_step)
+        if epoch_batches == 0:
+            raise ValueError("Training dataloader was empty")
+        if global_step % cfg.training.gradient_accumulation_steps != 0:
+            if cfg.training.max_grad_norm is not None:
+                accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        scheduler.step()
+        epoch_train_loss = epoch_loss / epoch_batches
+        accelerator.wait_for_everyone()
+        val_loss = None
+        if accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
+            progress_writer.write(
+                "validation_start",
+                stage=stage,
+                epoch=epoch_number,
+                global_step=global_step,
+                train_loss=epoch_train_loss,
+            )
+            val_loss = validate_stage_loss(
+                cfg,
+                unwrapped,
+                tokenizer,
+                stage=stage,
+                epoch=epoch_number,
+                device=device,
+                debug=dbg if debug else None,
+                disable_progress=disable_progress,
+                transform=transform,
+            )
+            progress_writer.write(
+                "validation_end",
+                stage=stage,
+                epoch=epoch_number,
+                global_step=global_step,
+                train_loss=epoch_train_loss,
+                val_loss=val_loss,
+                **_cuda_memory_payload(device),
+            )
+            if not np.isfinite(epoch_train_loss) or not np.isfinite(val_loss):
+                dbg.log(
+                    "NUMERICS",
+                    {
+                        "stage": "non_finite_epoch_loss",
+                        "epoch": epoch_number,
+                        "train_loss": epoch_train_loss,
+                        "val_loss": val_loss,
+                    },
+                )
+                raise FloatingPointError(f"Non-finite epoch loss at epoch {epoch_number}: train={epoch_train_loss}, val={val_loss}")
+            is_best = val_loss < best_val_loss
+            if is_best:
+                best_val_loss = val_loss
+                best_epoch = epoch_number
+            metadata = {
+                "stage": stage,
+                "epoch": epoch_number,
+                "completed_epochs": epoch_number,
+                "global_step": global_step,
+                "profile": cfg.model.profile,
+                "train_loss": epoch_train_loss,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+                "best_epoch": best_epoch,
+                "learning_rate": _optimizer_lr(optimizer),
+                "vision_training": cfg.training.vision_training,
+                "learning_rates": {
+                    "base": cfg.training.learning_rate,
+                    "vision": cfg.training.vision_learning_rate,
+                    "text": cfg.training.text_learning_rate,
+                    "head": cfg.training.head_learning_rate,
+                },
+                "effective_batch_size": cfg.training.effective_batch_size_for_processes(
+                    int(getattr(accelerator, "num_processes", 1))
+                ),
+                "distributed": _distributed_debug_payload(accelerator, cfg),
+                "generation": {
+                    "max_new_tokens": cfg.generation.max_new_tokens,
+                    "num_beams": cfg.generation.num_beams,
+                    "early_stopping": cfg.generation.early_stopping,
+                    "length_penalty": cfg.generation.length_penalty,
+                },
+            }
+            save_checkpoint(
+                latest_ckpt,
+                model=unwrapped,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=None,
+                metadata=metadata,
+            )
+            dbg.log(
+                "CHECKPOINT",
+                {
+                    "saved": str(latest_ckpt),
+                    "stage": stage,
+                    "epoch": epoch_number,
+                    "global_step": global_step,
+                    "train_loss": epoch_train_loss,
+                    "val_loss": val_loss,
+                },
+            )
+            progress_writer.write(
+                "checkpoint_saved",
+                stage=stage,
+                checkpoint_kind="latest",
+                path=str(latest_ckpt),
+                epoch=epoch_number,
+                global_step=global_step,
+                train_loss=epoch_train_loss,
+                val_loss=val_loss,
+                best_val_loss=best_val_loss,
+            )
+            if is_best:
+                save_checkpoint(
+                    best_ckpt,
+                    model=unwrapped,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=None,
+                    metadata=metadata,
+                )
+                dbg.log("CHECKPOINT", {"saved": str(best_ckpt), "stage": stage, "best_val_loss": best_val_loss})
+                progress_writer.write(
+                    "checkpoint_saved",
+                    stage=stage,
+                    checkpoint_kind="best",
+                    path=str(best_ckpt),
+                    epoch=epoch_number,
+                    global_step=global_step,
+                    train_loss=epoch_train_loss,
+                    val_loss=val_loss,
+                    best_val_loss=best_val_loss,
+                )
+                if stage == "finetune":
+                    shutil.copy2(best_ckpt, Path(cfg.project.output_dir) / "checkpoints" / "best_model.pt")
+            progress_writer.write(
+                "epoch_end",
+                stage=stage,
+                epoch=epoch_number,
+                total_epochs=total_epochs,
+                global_step=global_step,
+                train_loss=epoch_train_loss,
+                val_loss=val_loss,
+                best_val_loss=best_val_loss,
+                best_epoch=best_epoch,
+                elapsed_seconds=round(time.perf_counter() - epoch_started_at, 3),
+                **_cuda_memory_payload(device),
+            )
+        accelerator.wait_for_everyone()
+
+    return latest_ckpt
+
+
+def _batch_debug_summary(batch: dict[str, Any], device: torch.device | None = None) -> dict[str, Any]:
+    keys = ("input_ids", "attention_mask", "visual_features", "images", "labels")
+    summary = {key: tensor_stats(key, batch[key].float() if key == "labels" else batch[key]) for key in keys if key in batch}
+    if device is not None:
+        summary["target_device"] = str(device)
+    if "labels" in batch:
+        summary["label_ignore_count"] = int((batch["labels"] == -100).sum().item())
+    return summary
+
+
+def diagnose_train(
+    cfg: ExperimentConfig,
+    stage: str,
+    resume: str | None = None,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    debug_numerics: bool = False,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    started_at = time.perf_counter()
+    durations: dict[str, float] = {}
+
+    def mark(name: str, begin: float) -> None:
+        durations[name] = round(time.perf_counter() - begin, 3)
+        _heartbeat(dbg, started_at, f"{name}_done", duration_seconds=durations[name])
+
+    _heartbeat(dbg, started_at, "diagnose_start", train_stage=stage, resume=bool(resume))
+    begin = time.perf_counter()
+    accelerator = _build_accelerator(cfg)
+    device = accelerator.device
+    mark("build_accelerator", begin)
+    if accelerator.is_main_process:
+        dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
+
+    begin = time.perf_counter()
+    _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
+    model, tokenizer, transform = _build_train_model(cfg)
+    mark("build_vlm_model", begin)
+
+    begin = time.perf_counter()
+    model.to(device)
+    set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    mark("model_to_device", begin)
+    if accelerator.is_main_process:
+        dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
+
+    checkpoint_metadata = None
+    if resume:
+        resume_path = Path(resume)
+        begin = time.perf_counter()
+        checkpoint_metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        mark("checkpoint_metadata", begin)
+        if accelerator.is_main_process:
+            dbg.log(
+                "CHECKPOINT",
+                {
+                    "resume": resume,
+                    "exists": resume_path.exists(),
+                    "size_bytes": resume_path.stat().st_size if resume_path.exists() else None,
+                    "metadata": checkpoint_metadata,
+                },
+            )
+
+    begin = time.perf_counter()
+    dataset, collator = _make_dataset_and_collator(cfg, "train", tokenizer, transform=transform)
+    mark("dataset", begin)
+    dataset_summary = dataset.summary()
+    if accelerator.is_main_process:
+        dbg.log("FEATURE", {"split": "train", **dataset_summary})
+
+    begin = time.perf_counter()
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=cfg.training.num_workers,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    mark("dataloader", begin)
+
+    begin = time.perf_counter()
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
+    model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    mark("accelerator_prepare", begin)
+
+    begin = time.perf_counter()
+    batch = next(iter(loader))
+    if isinstance(accelerator, _SingleProcessAccelerator):
+        batch = _move_training_batch(batch, device, cfg)
+    mark("first_batch", begin)
+    batch_summary = _batch_debug_summary(batch, device)
+    if accelerator.is_main_process:
+        dbg.log("BATCH", {"stage": "diagnose_first_batch", **batch_summary})
+    numerics = None
+    debug_model = accelerator.unwrap_model(model)
+    if debug_numerics and accelerator.is_main_process and hasattr(debug_model, "forward_debug"):
+        with torch.no_grad(), accelerator.autocast():
+            numerics = debug_model.forward_debug(
+                **_batch_model_inputs(batch, cfg),
+            )
+        dbg.log("NUMERICS", {"stage": "diagnose_forward", **numerics})
+
+    report = {
+        "stage": stage,
+        "device": str(device),
+        "cuda": torch.cuda.is_available(),
+        "gpu_count": torch.cuda.device_count(),
+        "peak_cuda_memory": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
+        "distributed": _distributed_debug_payload(accelerator, cfg),
+        "checkpoint_metadata": checkpoint_metadata,
+        "dataset": dataset_summary,
+        "feature_cache_shape": list(dataset.features.shape) if hasattr(dataset, "features") else None,
+        "batch": batch_summary,
+        "numerics": numerics,
+        "durations": durations,
+    }
+    _heartbeat(dbg, started_at, "diagnose_done")
+    return report
+
+
+def verify_align_checkpoint(
+    cfg: ExperimentConfig,
+    checkpoint: str,
+    split: str = "train",
+    index: int = 0,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    debug_numerics: bool = False,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    started_at = time.perf_counter()
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
+    if index < 0:
+        raise ValueError("--index must be >= 0")
+
+    _heartbeat(dbg, started_at, "verify_align_start", checkpoint=str(checkpoint_path), split=split, index=index)
+    metadata = read_checkpoint_metadata(checkpoint_path, map_location="cpu")
+    checkpoint_stage = metadata.get("stage")
+    if checkpoint_stage != "align":
+        raise ValueError(f"metadata.stage must be align, got {checkpoint_stage!r}")
+
+    device = resolve_device(cfg)
+    _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
+    model, tokenizer, transform = _build_train_model(cfg)
+    _heartbeat(dbg, started_at, "build_vlm_model_done")
+
+    model.to(device)
+    load_metadata = _strict_load_model_from_checkpoint(checkpoint_path, model, map_location=device)
+    retie_report = retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    _heartbeat(dbg, started_at, "checkpoint_strict_load_done", metadata=load_metadata)
+
+    set_trainable_for_stage(_module_dict_for_freezing(model), cfg, "finetune")
+    actual_trainable = trainable_module_names(model)
+    expected_trainable = _expected_finetune_modules(cfg, model)
+    missing_trainable = sorted(set(expected_trainable) - set(actual_trainable))
+    unexpected_trainable = sorted(set(actual_trainable) - set(expected_trainable))
+    trainable_policy_ok = not missing_trainable and not unexpected_trainable
+
+    t5_report = t5_tied_weight_report(model.text_model)
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer_report = optimizer_storage_duplicate_report(optimizer)
+
+    if not t5_report["ok"]:
+        raise RuntimeError(f"T5 tied weights are not sharing storage: {t5_report}")
+    if not optimizer_report["ok"]:
+        raise RuntimeError(f"Optimizer has duplicate parameter storage groups: {optimizer_report}")
+    if not trainable_policy_ok:
+        raise RuntimeError(
+            "Finetune trainable policy mismatch: "
+            f"expected={expected_trainable}, actual={actual_trainable}, "
+            f"missing={missing_trainable}, unexpected={unexpected_trainable}"
+        )
+
+    dataset, collator = _make_dataset_and_collator(cfg, split, tokenizer, max_samples=index + 1, transform=transform)
+    if len(dataset) <= index:
+        raise IndexError(f"Dataset split {split!r} has {len(dataset)} samples after filtering; cannot read index {index}")
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=0,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    batch = None
+    for row_idx, row in enumerate(progress(loader, desc="verify-align-checkpoint", total=len(loader), disable=disable_progress)):
+        if row_idx == index:
+            batch = row
+            break
+    if batch is None:
+        raise IndexError(f"Could not fetch sample index {index} from split {split!r}")
+    batch = _move_training_batch(batch, device, cfg)
+    dbg.log("BATCH", {"stage": "verify_align_checkpoint", **_debug_batch_payload(batch, cfg, device)})
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    output = model(**_batch_model_inputs(batch, cfg))
+    raw_loss = output.loss
+    loss_finite = bool(torch.isfinite(raw_loss.detach()).item())
+    numerics = None
+    if debug_numerics and hasattr(model, "forward_debug"):
+        with torch.no_grad():
+            numerics = model.forward_debug(**_batch_model_inputs(batch, cfg))
+        dbg.log("NUMERICS", {"stage": "verify_align_forward", **numerics})
+    if not loss_finite:
+        raise FloatingPointError(f"Finetune forward loss is not finite: {raw_loss.detach().cpu().item()}")
+
+    raw_loss.backward()
+    if cfg.training.max_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    post_step_t5_report = t5_tied_weight_report(model.text_model)
+    finite_report = trainable_parameter_finite_report(model)
+    if not post_step_t5_report["ok"]:
+        raise RuntimeError(f"T5 tied weights broke after one optimizer step: {post_step_t5_report}")
+    if not finite_report["ok"]:
+        raise FloatingPointError(f"Non-finite trainable params after one optimizer step: {finite_report}")
+
+    report = {
+        "ok": True,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_exists": True,
+        "checkpoint_stage": checkpoint_stage,
+        "checkpoint_metadata": metadata,
+        "load_strict": True,
+        "device": str(device),
+        "vision_training": cfg.training.vision_training,
+        "adapter": cfg.model.adapter.name,
+        "parameter_counts": {
+            "model": parameter_count_report(model),
+            "text_model": parameter_count_report(model.text_model),
+        },
+        "trainable_policy_ok": trainable_policy_ok,
+        "expected_trainable_modules": expected_trainable,
+        "actual_trainable_modules": actual_trainable,
+        "missing_trainable_modules": missing_trainable,
+        "unexpected_trainable_modules": unexpected_trainable,
+        "t5_tying": t5_report,
+        "t5_shared_data_ptr_ok": bool(t5_report["ok"]),
+        "retie": retie_report,
+        "retie_applied": bool(retie_report["retie_applied"]),
+        "t5_shared_data_ptr_ok_after_retie": bool(retie_report["after"]["ok"]),
+        "optimizer": optimizer_report,
+        "optimizer_duplicate_storage_groups": int(optimizer_report["duplicate_storage_groups"]),
+        "split": split,
+        "index": index,
+        "dataset": dataset.summary(),
+        "batch": _batch_debug_summary(batch, device),
+        "finetune_forward_loss": float(raw_loss.detach().cpu().item()),
+        "finetune_forward_loss_finite": loss_finite,
+        "one_step_finetune_probe_ok": True,
+        "post_step_t5_tying": post_step_t5_report,
+        "post_step_trainable_finite": finite_report,
+        "numerics": numerics,
+        "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+    }
+    output_path = Path(cfg.project.output_dir) / "debug" / "align_checkpoint_verify.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    dbg.log("VERIFY", {"stage": "align_checkpoint_verify_done", "output": str(output_path), "ok": True})
+    return report
+
+
+def verify_resume_checkpoint(
+    cfg: ExperimentConfig,
+    checkpoint: str,
+    stage: str,
+    split: str = "train",
+    index: int = 0,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    debug_numerics: bool = False,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
+    if stage not in {"align", "finetune"}:
+        raise ValueError("--stage must be align or finetune")
+    if index < 0:
+        raise ValueError("--index must be >= 0")
+
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    started_at = time.perf_counter()
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
+
+    _heartbeat(dbg, started_at, "verify_resume_start", checkpoint=str(checkpoint_path), train_stage=stage, split=split, index=index)
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    metadata = dict(payload.get("metadata", {}))
+    checkpoint_stage = metadata.get("stage")
+    if checkpoint_stage != stage:
+        raise ValueError(f"metadata.stage must match --stage, got metadata.stage={checkpoint_stage!r}, --stage={stage!r}")
+
+    device = resolve_device(cfg)
+    _heartbeat(dbg, started_at, "build_vlm_model_start", text_model=cfg.model.text.model_id)
+    model, tokenizer, transform = _build_train_model(cfg)
+    _heartbeat(dbg, started_at, "build_vlm_model_done")
+
+    model.to(device)
+    set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    missing, unexpected = model.load_state_dict(payload["model"], strict=True)
+    if missing or unexpected:
+        raise RuntimeError(f"Strict checkpoint load failed: missing={list(missing)}, unexpected={list(unexpected)}")
+    retie_report = retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    metadata = dict(payload.get("metadata", {}))
+    _heartbeat(dbg, started_at, "checkpoint_strict_load_done", metadata=metadata)
+
+    actual_trainable = trainable_module_names(model)
+    expected_trainable = _expected_trainable_modules(cfg, model, stage)
+    missing_trainable = sorted(set(expected_trainable) - set(actual_trainable))
+    unexpected_trainable = sorted(set(actual_trainable) - set(expected_trainable))
+    trainable_policy_ok = not missing_trainable and not unexpected_trainable
+    if not trainable_policy_ok:
+        raise RuntimeError(
+            "Resume trainable policy mismatch: "
+            f"expected={expected_trainable}, actual={actual_trainable}, "
+            f"missing={missing_trainable}, unexpected={unexpected_trainable}"
+        )
+
+    t5_report = t5_tied_weight_report(model.text_model)
+    if not t5_report["ok"]:
+        raise RuntimeError(f"T5 tied weights are not sharing storage: {t5_report}")
+
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
+    optimizer.load_state_dict(payload["optimizer"])
+    scheduler_state_loaded = payload.get("scheduler") is not None
+    if scheduler_state_loaded:
+        scheduler.load_state_dict(payload["scheduler"])
+    rng_state_loaded = "rng_state" in payload
+    if rng_state_loaded:
+        _restore_rng_state(payload["rng_state"])
+
+    optimizer_report = optimizer_storage_duplicate_report(optimizer)
+    if not optimizer_report["ok"]:
+        raise RuntimeError(f"Optimizer has duplicate parameter storage groups: {optimizer_report}")
+
+    dataset, collator = _make_dataset_and_collator(cfg, split, tokenizer, max_samples=index + 1, transform=transform)
+    if len(dataset) <= index:
+        raise IndexError(f"Dataset split {split!r} has {len(dataset)} samples after filtering; cannot read index {index}")
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=0,
+        pin_memory=cfg.training.pin_memory and device.type == "cuda",
+    )
+    batch = None
+    for row_idx, row in enumerate(progress(loader, desc="verify-resume-checkpoint", total=len(loader), disable=disable_progress)):
+        if row_idx == index:
+            batch = row
+            break
+    if batch is None:
+        raise IndexError(f"Could not fetch sample index {index} from split {split!r}")
+    batch = _move_training_batch(batch, device, cfg)
+    dbg.log("BATCH", {"stage": "verify_resume_checkpoint", **_debug_batch_payload(batch, cfg, device)})
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    output = model(**_batch_model_inputs(batch, cfg))
+    raw_loss = output.loss
+    loss_finite = bool(torch.isfinite(raw_loss.detach()).item())
+    numerics = None
+    if debug_numerics and hasattr(model, "forward_debug"):
+        with torch.no_grad():
+            numerics = model.forward_debug(**_batch_model_inputs(batch, cfg))
+        dbg.log("NUMERICS", {"stage": "verify_resume_forward", **numerics})
+    if not loss_finite:
+        raise FloatingPointError(f"Resume forward loss is not finite: {raw_loss.detach().cpu().item()}")
+
+    raw_loss.backward()
+    if cfg.training.max_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    post_step_t5_report = t5_tied_weight_report(model.text_model)
+    finite_report = trainable_parameter_finite_report(model)
+    if not post_step_t5_report["ok"]:
+        raise RuntimeError(f"T5 tied weights broke after one optimizer step: {post_step_t5_report}")
+    if not finite_report["ok"]:
+        raise FloatingPointError(f"Non-finite trainable params after one optimizer step: {finite_report}")
+
+    report = {
+        "ok": True,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_exists": True,
+        "checkpoint_stage": checkpoint_stage,
+        "checkpoint_metadata": metadata,
+        "load_strict": True,
+        "device": str(device),
+        "vision_training": cfg.training.vision_training,
+        "adapter": cfg.model.adapter.name,
+        "parameter_counts": {
+            "model": parameter_count_report(model),
+            "text_model": parameter_count_report(model.text_model),
+        },
+        "trainable_policy_ok": trainable_policy_ok,
+        "expected_trainable_modules": expected_trainable,
+        "actual_trainable_modules": actual_trainable,
+        "missing_trainable_modules": missing_trainable,
+        "unexpected_trainable_modules": unexpected_trainable,
+        "t5_tying": t5_report,
+        "t5_shared_data_ptr_ok": bool(t5_report["ok"]),
+        "retie": retie_report,
+        "retie_applied": bool(retie_report["retie_applied"]),
+        "t5_shared_data_ptr_ok_after_retie": bool(retie_report["after"]["ok"]),
+        "optimizer": optimizer_report,
+        "optimizer_state_loaded": True,
+        "scheduler_state_loaded": scheduler_state_loaded,
+        "rng_state_loaded": rng_state_loaded,
+        "optimizer_duplicate_storage_groups": int(optimizer_report["duplicate_storage_groups"]),
+        "split": split,
+        "index": index,
+        "dataset": dataset.summary(),
+        "batch": _batch_debug_summary(batch, device),
+        "resume_forward_loss": float(raw_loss.detach().cpu().item()),
+        "resume_forward_loss_finite": loss_finite,
+        "one_step_resume_probe_ok": True,
+        "post_step_t5_tying": post_step_t5_report,
+        "post_step_trainable_finite": finite_report,
+        "numerics": numerics,
+        "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+    }
+    output_path = Path(cfg.project.output_dir) / "debug" / f"{stage}_resume_checkpoint_verify.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    dbg.log("VERIFY", {"stage": f"{stage}_resume_checkpoint_verify_done", "output": str(output_path), "ok": True})
+    return report
+
+
+def evaluate_checkpoint(
+    cfg: ExperimentConfig,
+    checkpoint: str,
+    max_samples: int | None = None,
+    batch_size: int | None = None,
+    progress_log_every_samples: int | None = None,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    disable_progress: bool = False,
+) -> dict[str, float]:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    device = resolve_device(cfg)
+    model, tokenizer, transform = _build_train_model(cfg)
+    model.to(device)
+    metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
+    dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
+    model.eval()
+    dataset, collator = _make_dataset_and_collator(cfg, "test", tokenizer, max_samples=max_samples, transform=transform)
+    dbg.log("FEATURE", {"split": "test", **dataset.summary()})
+    eval_batch_size = batch_size or cfg.evaluation.eval_batch_size
+    log_every = max(1, progress_log_every_samples or cfg.evaluation.eval_progress_log_every_samples)
+    loader = DataLoader(dataset, batch_size=eval_batch_size, shuffle=False, collate_fn=collator)
+    rows: list[dict[str, Any]] = []
+    progress_writer = MinimalProgressWriter(cfg.project.output_dir, "eval_progress.jsonl")
+    progress_started = time.perf_counter()
+    total_samples = len(dataset)
+    processed = 0
+    next_log_at = log_every
+    _write_minimal_progress(progress_writer, stage="evaluate", current=0, total=total_samples, start=progress_started)
+    with torch.no_grad():
+        for idx, batch in progress(enumerate(loader), desc="evaluate", total=len(loader), disable=disable_progress):
+            for key in ("input_ids", "attention_mask", "visual_features", "images"):
+                if key in batch:
+                    batch[key] = batch[key].to(device)
+            ids = _generate_batch(model, batch, cfg)
+            preds = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            for offset, pred in enumerate(preds):
+                sample_index = processed + offset
+                if sample_index < dbg.samples:
+                    dbg.log(
+                        "EVAL",
+                        {
+                            "eval_id": batch["eval_ids"][offset],
+                            "compute_device": str(device),
+                            "generated_tokens": tensor_stats("generated_tokens", ids[offset : offset + 1]),
+                            "prediction": safe_preview(pred),
+                            "reference": safe_preview(batch["answers"][offset]),
+                        },
+                    )
+                rows.append({"eval_id": batch["eval_ids"][offset], "prediction": pred, "reference": batch["answers"][offset]})
+            processed += len(preds)
+            if processed >= next_log_at or processed == total_samples:
+                _write_minimal_progress(progress_writer, stage="evaluate", current=processed, total=total_samples, start=progress_started)
+                while next_log_at <= processed:
+                    next_log_at += log_every
+    output_dir = Path(cfg.project.output_dir)
+    write_predictions(output_dir / "predictions.jsonl", rows)
+    metrics = caption_metrics(rows)
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    (output_dir / "metrics_display.json").write_text(json.dumps(metric_display_values(metrics), indent=2), encoding="utf-8")
+    dbg.log("EVAL", {"prediction_count": len(rows), "metrics": metrics, "metrics_display": metric_display_values(metrics)})
+    return metrics
+
+
+def benchmark_checkpoint(
+    cfg: ExperimentConfig,
+    checkpoint: str,
+    max_samples: int | None = None,
+    progress_log_every_samples: int | None = None,
+    debug: bool = False,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+    disable_progress: bool = False,
+) -> dict[str, Any]:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    device = resolve_device(cfg)
+    model, tokenizer, transform = _build_train_model(cfg)
+    model.to(device)
+    metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
+    dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
+    model.eval()
+    if max_samples is None:
+        max_samples = cfg.evaluation.benchmark_max_samples
+    dataset, collator = _make_dataset_and_collator(cfg, "test", tokenizer, max_samples=max_samples, transform=transform)
+    dbg.log("FEATURE", {"split": "test", **dataset.summary()})
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collator)
+    e2e, gen, token_counts = [], [], []
+    progress_writer = MinimalProgressWriter(cfg.project.output_dir, "benchmark_progress.jsonl")
+    progress_started = time.perf_counter()
+    total_samples = len(dataset)
+    log_every = max(1, progress_log_every_samples or cfg.evaluation.benchmark_progress_log_every_samples)
+    _write_minimal_progress(progress_writer, stage="benchmark", current=0, total=total_samples, start=progress_started)
+    with torch.no_grad():
+        for idx, batch in progress(enumerate(loader), desc="benchmark", total=len(loader), disable=disable_progress):
+            start = time.perf_counter()
+            for key in ("input_ids", "attention_mask", "visual_features", "images"):
+                if key in batch:
+                    batch[key] = batch[key].to(device)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            gen_start = time.perf_counter()
+            ids = _generate_batch(model, batch, cfg)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            gen.append(time.perf_counter() - gen_start)
+            tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            e2e.append(time.perf_counter() - start)
+            token_counts.append(int((ids != getattr(tokenizer, "pad_token_id", 0)).sum().item()))
+            if idx < dbg.samples:
+                dbg.log("BENCHMARK", {"sample": idx, "e2e_seconds": e2e[-1], "generation_seconds": gen[-1], "output_tokens": token_counts[-1]})
+            current = idx + 1
+            if current % log_every == 0 or current == total_samples:
+                _write_minimal_progress(progress_writer, stage="benchmark", current=current, total=total_samples, start=progress_started)
+    summary = summarize_latencies(e2e_seconds=e2e, generation_seconds=gen, output_tokens=token_counts)
+    summary.update({"device": str(device), "python": platform.python_version(), "torch": torch.__version__})
+    if torch.cuda.is_available():
+        summary.update({"gpu": torch.cuda.get_device_name(0), "peak_cuda_memory": torch.cuda.max_memory_allocated()})
+    output = Path(cfg.project.output_dir) / "benchmark.json"
+    output.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    dbg.log("BENCHMARK", summary)
+    return summary
+
+
+def debug_sample(
+    cfg: ExperimentConfig,
+    split: str,
+    index: int,
+    debug: bool = True,
+    debug_samples: int = 3,
+    debug_jsonl: str | None = None,
+) -> dict[str, Any]:
+    dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
+    manifest = _read_prepared_manifest(cfg)
+    root = Path(manifest["root"])
+    records = load_prepared_records(cfg, split)
+    record = records[index]
+    dbg.log(
+        "SAMPLE",
+        {
+            "split": split,
+            "index": index,
+            "sample_id": record.sample_id,
+            "eval_id": record.eval_id,
+            "question": safe_preview(record.question),
+            "answer": safe_preview(record.answer),
+            "camera_order": cfg.data.view_order,
+        },
+    )
+    camera_paths = normalize_camera_paths(root, record.camera_paths, cfg.data.view_order)
+    dbg.log("SAMPLE", {"paths": path_status(camera_paths)})
+
+    device = resolve_device(cfg)
+    vision, transform = build_vision_encoder(cfg)
+    vision.to(device)
+    vision.eval()
+    images = torch.stack([_load_image(path, cfg.model.vision.image_size, transform) for path in camera_paths])
+    dbg.log("IMAGE", {"tensor": tensor_stats("images", images)})
+    with torch.no_grad():
+        features = vision(images.unsqueeze(0).to(device)).detach().cpu()
+    dbg.log("FEATURE", {"tensor": tensor_stats("features", features)})
+
+    if _uses_end_to_end_vision(cfg):
+        model, tokenizer = build_end_to_end_vlm_model(cfg, vision)
+    else:
+        model, tokenizer = build_vlm_model(cfg)
+    model.to(device)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    encoded = tokenizer([format_prompt(record.question)], padding=True, return_tensors="pt")
+    labels = tokenizer([record.answer], padding=True, return_tensors="pt")["input_ids"]
+    dbg.log("BATCH", {"input_ids": tensor_stats("input_ids", encoded["input_ids"]), "labels": tensor_stats("labels", labels.float())})
+    dbg.log("MODEL", {"params": model_param_summary(model)})
+    with torch.no_grad():
+        if _uses_end_to_end_vision(cfg):
+            output = model(
+                input_ids=encoded["input_ids"].to(device),
+                attention_mask=encoded["attention_mask"].to(device),
+                images=images.unsqueeze(0).to(device),
+                labels=labels.to(device),
+            )
+        else:
+            output = model.forward_from_features(
+                input_ids=encoded["input_ids"].to(device),
+                attention_mask=encoded["attention_mask"].to(device),
+                visual_features=features.to(device),
+                labels=labels.to(device),
+            )
+    report = {"split": split, "index": index, "loss": float(output.loss.detach().cpu().item())}
+    dbg.log("MODEL", report)
+    return report

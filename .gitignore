@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+*.egg-info/
+outputs/
+/data/
+/multi_frame_results/
+/wandb/
+.venv/
+.tmp/
+.pip-cache/
