@@ -3,7 +3,30 @@ import random
 import numpy as np
 import torch
 
-from efficient_vlm_ad.checkpointing import _restore_rng_state, load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from efficient_vlm_ad.checkpointing import _restore_rng_state, _rng_state, load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from efficient_vlm_ad.verification import dedupe_optimizer_param_groups, t5_tied_weight_report
+
+
+class RetieableT5(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shared = torch.nn.Embedding(4, 2)
+        self.encoder = torch.nn.Module()
+        self.encoder.embed_tokens = torch.nn.Embedding(4, 2)
+        self.decoder = torch.nn.Module()
+        self.decoder.embed_tokens = torch.nn.Embedding(4, 2)
+        self.lm_head = torch.nn.Linear(2, 4, bias=False)
+
+    def tie_weights(self):
+        self.encoder.embed_tokens.weight = self.shared.weight
+        self.decoder.embed_tokens.weight = self.shared.weight
+        self.lm_head.weight = self.shared.weight
+
+
+class WrapperWithTextModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.text_model = RetieableT5()
 
 
 def test_checkpoint_round_trips_training_state(tmp_path):
@@ -65,6 +88,56 @@ def test_read_checkpoint_metadata_does_not_require_model(tmp_path):
     metadata = read_checkpoint_metadata(path)
 
     assert metadata == {"stage": "align", "epoch": 3, "global_step": 11}
+
+
+def test_load_checkpoint_retie_text_model_after_loading_duplicate_tied_keys(tmp_path):
+    model = WrapperWithTextModel()
+    payload = {
+        "model": {
+            "text_model.shared.weight": torch.ones(4, 2),
+            "text_model.encoder.embed_tokens.weight": torch.full((4, 2), 2.0),
+            "text_model.decoder.embed_tokens.weight": torch.full((4, 2), 3.0),
+            "text_model.lm_head.weight": torch.full((4, 2), 4.0),
+        },
+        "optimizer": None,
+        "scheduler": None,
+        "scaler": None,
+        "rng_state": _rng_state(),
+        "metadata": {"stage": "align"},
+    }
+    path = tmp_path / "duplicate_tied.pt"
+    torch.save(payload, path)
+
+    metadata = load_checkpoint(path, model=model)
+    report = t5_tied_weight_report(model.text_model)
+
+    assert metadata["stage"] == "align"
+    assert report["shared_data_ptr_ok"] is True
+    assert torch.allclose(model.text_model.encoder.embed_tokens.weight, model.text_model.shared.weight)
+
+
+def test_save_checkpoint_retie_text_model_before_serializing(tmp_path):
+    model = WrapperWithTextModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+    path = tmp_path / "retied_before_save.pt"
+
+    assert t5_tied_weight_report(model.text_model)["shared_data_ptr_ok"] is False
+    save_checkpoint(path, model=model, optimizer=optimizer, scheduler=scheduler, scaler=None, metadata={"stage": "align"})
+
+    assert t5_tied_weight_report(model.text_model)["shared_data_ptr_ok"] is True
+
+
+def test_dedupe_optimizer_param_groups_removes_shared_storage_aliases():
+    shared = torch.nn.Parameter(torch.ones(2))
+    alias = torch.nn.Parameter(shared.data)
+    groups = [{"params": [shared, alias], "lr": 1e-4, "weight_decay": 0.01}]
+
+    deduped = dedupe_optimizer_param_groups(groups)
+
+    assert len(deduped) == 1
+    assert deduped[0]["params"] == [shared]
+    assert deduped[0]["lr"] == 1e-4
 
 
 def test_restore_rng_state_accepts_non_byte_torch_state():

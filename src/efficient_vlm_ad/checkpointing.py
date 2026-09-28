@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from .verification import assert_tied_weights_ok, retie_text_model_weights
+
 
 def _rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {
@@ -40,6 +42,8 @@ def save_checkpoint(
 ) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
     payload = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -62,6 +66,10 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     model.load_state_dict(payload["model"])
+    retie_report = retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
+    if optimizer is not None and retie_report["changed_parameter_objects"]:
+        raise RuntimeError("Checkpoint load retied text model weights; create the optimizer after loading model weights.")
     if optimizer is not None:
         optimizer.load_state_dict(payload["optimizer"])
     if scheduler is not None and payload.get("scheduler") is not None:

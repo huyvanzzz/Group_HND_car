@@ -86,17 +86,30 @@ def path_status(paths: list[str | Path]) -> list[dict[str, Any]]:
 def model_param_summary(model: torch.nn.Module) -> dict[str, Any]:
     total = 0
     trainable = 0
+    unique_storage_total = 0
+    unique_storage_trainable = 0
+    seen_storage: set[int] = set()
+    seen_trainable_storage: set[int] = set()
     trainable_modules: set[str] = set()
     for name, param in model.named_parameters():
         count = param.numel()
         total += count
+        ptr = param.data_ptr()
+        if ptr not in seen_storage:
+            seen_storage.add(ptr)
+            unique_storage_total += count
         if param.requires_grad:
             trainable += count
+            if ptr not in seen_trainable_storage:
+                seen_trainable_storage.add(ptr)
+                unique_storage_trainable += count
             trainable_modules.add(name.split(".")[0])
     return {
         "total_params": total,
         "trainable_params": trainable,
         "frozen_params": total - trainable,
+        "unique_storage_params": unique_storage_total,
+        "unique_storage_trainable_params": unique_storage_trainable,
         "trainable_percent": (100.0 * trainable / total) if total else 0.0,
         "trainable_modules": sorted(trainable_modules),
     }

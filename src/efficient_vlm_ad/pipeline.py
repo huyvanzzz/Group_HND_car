@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .benchmarking import summarize_latencies
 from .cache import FeatureCacheManifest, create_memmap, validate_manifest
-from .checkpointing import load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from .checkpointing import _restore_rng_state, load_checkpoint, read_checkpoint_metadata, save_checkpoint
 from .config import ExperimentConfig
 from .data import format_prompt, normalize_camera_paths
 from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats
@@ -26,8 +26,11 @@ from .modeling.multimodal import set_trainable_for_stage
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
 from .verification import (
+    assert_tied_weights_ok,
+    dedupe_optimizer_param_groups,
     optimizer_storage_duplicate_report,
     parameter_count_report,
+    retie_text_model_weights,
     t5_tied_weight_report,
     trainable_module_names,
     trainable_parameter_finite_report,
@@ -571,7 +574,7 @@ def _debug_batch_payload(batch: dict[str, Any], cfg: ExperimentConfig, device: t
 
 def _optimizer_param_groups(model: torch.nn.Module, cfg: ExperimentConfig) -> list[dict[str, Any]]:
     if not _uses_end_to_end_vision(cfg):
-        return [{"params": [p for p in model.parameters() if p.requires_grad], "lr": cfg.training.learning_rate}]
+        return dedupe_optimizer_param_groups([{"params": [p for p in model.parameters() if p.requires_grad], "lr": cfg.training.learning_rate}])
     groups: list[dict[str, Any]] = []
     vision_params = [p for p in getattr(model, "vision_encoder").parameters() if p.requires_grad]
     text_params = [p for p in model.text_model.parameters() if p.requires_grad]
@@ -583,7 +586,7 @@ def _optimizer_param_groups(model: torch.nn.Module, cfg: ExperimentConfig) -> li
         groups.append({"params": text_params, "lr": cfg.training.text_learning_rate or cfg.training.learning_rate})
     if head_params:
         groups.append({"params": head_params, "lr": cfg.training.head_learning_rate or cfg.training.learning_rate})
-    return groups
+    return dedupe_optimizer_param_groups(groups)
 
 
 def _module_has_parameters(module: torch.nn.Module) -> bool:
@@ -608,6 +611,8 @@ def _expected_finetune_modules(cfg: ExperimentConfig, model: torch.nn.Module) ->
 def _strict_load_model_from_checkpoint(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     missing, unexpected = model.load_state_dict(payload["model"], strict=True)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
     if missing or unexpected:
         raise RuntimeError(f"Strict checkpoint load failed: missing={list(missing)}, unexpected={list(unexpected)}")
     return dict(payload.get("metadata", {}))
@@ -627,6 +632,8 @@ def _module_grad_norm(module: torch.nn.Module) -> float | None:
 def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     result = model.load_state_dict(payload["model"], strict=False)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
     unexpected = list(result.unexpected_keys)
     missing_not_vision = [key for key in result.missing_keys if not key.startswith("vision_encoder.")]
     if unexpected or missing_not_vision:
@@ -666,17 +673,17 @@ def train_stage(
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "model_to_device_done", device=str(device))
     set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
     if accelerator.is_main_process:
         dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
         dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
-
-    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
 
     start_step = 0
     start_epoch = 0
     best_val_loss = float("inf")
     best_epoch = 0
+    resume_training_payload: dict[str, Any] | None = None
     if resume:
         resume_path = Path(resume)
         if accelerator.is_main_process:
@@ -694,13 +701,11 @@ def train_stage(
             _heartbeat(dbg, started_at, "checkpoint_metadata_done", metadata=metadata)
             _heartbeat(dbg, started_at, "checkpoint_load_start", path=resume, same_stage=metadata.get("stage") == stage)
         if metadata.get("stage") == stage:
-            metadata = load_checkpoint(
-                resume,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                map_location=device,
-            )
+            resume_training_payload = torch.load(resume_path, map_location=device, weights_only=False)
+            model.load_state_dict(resume_training_payload["model"])
+            retie_text_model_weights(model)
+            assert_tied_weights_ok(model)
+            metadata = dict(resume_training_payload.get("metadata", {}))
             start_step = int(metadata.get("global_step", 0))
             start_epoch = int(metadata.get("completed_epochs", metadata.get("epoch", 0)))
             best_val_loss = float(metadata.get("best_val_loss", best_val_loss))
@@ -712,6 +717,20 @@ def train_stage(
                 metadata = load_checkpoint(resume, model=model, map_location=device)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_load_done", metadata=metadata)
+
+    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
+    if resume_training_payload is not None:
+        try:
+            optimizer.load_state_dict(resume_training_payload["optimizer"])
+            if resume_training_payload.get("scheduler") is not None:
+                scheduler.load_state_dict(resume_training_payload["scheduler"])
+            _restore_rng_state(resume_training_payload["rng_state"])
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not restore optimizer/scheduler state after retie/dedupe. "
+                "Use a checkpoint from the previous stage, or retrain/resave this stage with the fixed checkpoint code."
+            ) from exc
 
     split = "train"
     if accelerator.is_main_process:
@@ -1070,6 +1089,8 @@ def diagnose_train(
     begin = time.perf_counter()
     model.to(device)
     set_trainable_for_stage(_module_dict_for_freezing(model), cfg, stage)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
     mark("model_to_device", begin)
     if accelerator.is_main_process:
         dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
@@ -1182,6 +1203,8 @@ def verify_align_checkpoint(
 
     model.to(device)
     load_metadata = _strict_load_model_from_checkpoint(checkpoint_path, model, map_location=device)
+    retie_report = retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
     _heartbeat(dbg, started_at, "checkpoint_strict_load_done", metadata=load_metadata)
 
     set_trainable_for_stage(_module_dict_for_freezing(model), cfg, "finetune")
@@ -1274,6 +1297,9 @@ def verify_align_checkpoint(
         "unexpected_trainable_modules": unexpected_trainable,
         "t5_tying": t5_report,
         "t5_shared_data_ptr_ok": bool(t5_report["ok"]),
+        "retie": retie_report,
+        "retie_applied": bool(retie_report["retie_applied"]),
+        "t5_shared_data_ptr_ok_after_retie": bool(retie_report["after"]["ok"]),
         "optimizer": optimizer_report,
         "optimizer_duplicate_storage_groups": int(optimizer_report["duplicate_storage_groups"]),
         "split": split,
@@ -1464,6 +1490,8 @@ def debug_sample(
     else:
         model, tokenizer = build_vlm_model(cfg)
     model.to(device)
+    retie_text_model_weights(model)
+    assert_tied_weights_ok(model)
     encoded = tokenizer([format_prompt(record.question)], padding=True, return_tensors="pt")
     labels = tokenizer([record.answer], padding=True, return_tensors="pt")["input_ids"]
     dbg.log("BATCH", {"input_ids": tensor_stats("input_ids", encoded["input_ids"]), "labels": tensor_stats("labels", labels.float())})

@@ -51,6 +51,10 @@ def trainable_parameter_finite_report(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+def _text_model_from(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "text_model", model)
+
+
 def t5_tied_weight_report(text_model: torch.nn.Module) -> dict[str, Any]:
     required = {
         "shared": getattr(text_model, "shared", None),
@@ -93,6 +97,59 @@ def t5_tied_weight_report(text_model: torch.nn.Module) -> dict[str, Any]:
         "shared_object_ok": shared_object_ok,
         "ok": shared_data_ptr_ok,
     }
+
+
+def retie_text_model_weights(model: torch.nn.Module) -> dict[str, Any]:
+    text_model = _text_model_from(model)
+    before = t5_tied_weight_report(text_model)
+    before_param_ids = {
+        "shared": id(getattr(getattr(text_model, "shared", None), "weight", None)),
+        "encoder": id(getattr(getattr(getattr(text_model, "encoder", None), "embed_tokens", None), "weight", None)),
+        "decoder": id(getattr(getattr(getattr(text_model, "decoder", None), "embed_tokens", None), "weight", None)),
+        "lm_head": id(getattr(getattr(text_model, "lm_head", None), "weight", None)),
+    }
+    applied = False
+    if hasattr(text_model, "tie_weights"):
+        text_model.tie_weights()
+        applied = True
+    after = t5_tied_weight_report(text_model)
+    after_param_ids = {
+        "shared": id(getattr(getattr(text_model, "shared", None), "weight", None)),
+        "encoder": id(getattr(getattr(getattr(text_model, "encoder", None), "embed_tokens", None), "weight", None)),
+        "decoder": id(getattr(getattr(getattr(text_model, "decoder", None), "embed_tokens", None), "weight", None)),
+        "lm_head": id(getattr(getattr(text_model, "lm_head", None), "weight", None)),
+    }
+    return {
+        "retie_applied": applied,
+        "before": before,
+        "after": after,
+        "changed_parameter_objects": before_param_ids != after_param_ids,
+    }
+
+
+def assert_tied_weights_ok(model: torch.nn.Module) -> dict[str, Any]:
+    report = t5_tied_weight_report(_text_model_from(model))
+    if not report["ok"]:
+        raise RuntimeError(f"T5 tied weights are not sharing storage: {report}")
+    return report
+
+
+def dedupe_optimizer_param_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen_ptrs: set[int] = set()
+    deduped_groups: list[dict[str, Any]] = []
+    for group in groups:
+        params = []
+        for param in group["params"]:
+            ptr = param.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            params.append(param)
+        if params:
+            deduped = {key: value for key, value in group.items() if key != "params"}
+            deduped["params"] = params
+            deduped_groups.append(deduped)
+    return deduped_groups
 
 
 def trainable_module_names(model: torch.nn.Module) -> list[str]:

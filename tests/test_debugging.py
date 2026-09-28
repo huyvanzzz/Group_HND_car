@@ -111,6 +111,8 @@ def test_model_param_summary_counts_trainable_params():
     assert summary["total_params"] == 9
     assert summary["trainable_params"] == 6
     assert summary["frozen_params"] == 3
+    assert summary["unique_storage_params"] == 9
+    assert summary["unique_storage_trainable_params"] == 6
 
 
 def test_cli_accepts_debug_flags():
