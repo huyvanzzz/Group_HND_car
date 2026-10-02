@@ -80,6 +80,26 @@ def test_loads_kaggle_di_adapter_profiles():
     assert safe_cfg.training.finetune_epochs == 8
 
 
+def test_loads_kaggle_router_profile():
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router.yaml")
+
+    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router"
+    assert cfg.model.fusion.name == "question_guided_router"
+    assert cfg.model.fusion.top_k == 49
+    assert cfg.model.fusion.diversity_weight == 0.001
+    assert cfg.model.fusion.tau_start == 2.0
+    assert cfg.model.fusion.tau_min == 0.5
+    assert cfg.training.vision_training == "feature_cache"
+    assert cfg.training.batch_size == 16
+    assert cfg.training.gradient_accumulation_steps == 2
+    assert cfg.training.effective_batch_size_for_processes(2) == 64
+    assert cfg.training.align_epochs == 8
+    assert cfg.training.finetune_epochs == 8
+    assert cfg.runtime.precision == "fp32"
+    assert cfg.generation.max_new_tokens == 512
+    assert cfg.generation.num_beams == 3
+
+
 def test_loads_kaggle_end_to_end_profile():
     cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_end2end.yaml")
     safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_end2end_safe.yaml")

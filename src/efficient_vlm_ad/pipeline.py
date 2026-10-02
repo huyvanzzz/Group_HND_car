@@ -23,6 +23,7 @@ from .evaluation import caption_metrics, metric_display_values, write_prediction
 from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
+from .modeling.router import QuestionGuidedTokenRouter, router_debug_payload
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
 from .verification import (
@@ -490,6 +491,8 @@ def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
     }
     if getattr(model, "visual_adapter", None) is not None:
         modules["visual_adapter"] = model.visual_adapter
+    if getattr(model, "visual_fusion", None) is not None:
+        modules["visual_fusion"] = model.visual_fusion
     return torch.nn.ModuleDict(modules)
 
 
@@ -529,6 +532,40 @@ def _batch_model_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[st
     else:
         inputs["visual_features"] = batch["visual_features"]
     return inputs
+
+
+def _router_module(model: torch.nn.Module) -> QuestionGuidedTokenRouter | None:
+    fusion = getattr(model, "visual_fusion", None)
+    return fusion if isinstance(fusion, QuestionGuidedTokenRouter) else None
+
+
+def _target_optimizer_steps(*, batches_per_epoch: int, total_epochs: int, gradient_accumulation_steps: int, step_limit: int | None) -> int:
+    accum = max(1, int(gradient_accumulation_steps))
+    if step_limit is not None:
+        return max(1, int(np.ceil(int(step_limit) / accum)))
+    steps_per_epoch = int(np.ceil(int(batches_per_epoch) / accum))
+    return max(1, steps_per_epoch * int(total_epochs))
+
+
+def _configure_router_tau(model: torch.nn.Module, *, target_steps: int, reset: bool) -> None:
+    router = _router_module(model)
+    if router is not None:
+        router.configure_tau(target_steps, reset=reset)
+
+
+def _step_router_tau(model: torch.nn.Module) -> None:
+    router = _router_module(model)
+    if router is not None:
+        router.step_tau()
+
+
+def _router_train_payload(model: torch.nn.Module) -> dict[str, Any]:
+    router = _router_module(model)
+    if router is None:
+        return {}
+    payload = router_debug_payload(router)
+    payload["scorer_grad_norm"] = _module_grad_norm(router.scorer)
+    return {"router": payload}
 
 
 def _generation_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[str, torch.Tensor]:
@@ -598,7 +635,9 @@ def _expected_finetune_modules(cfg: ExperimentConfig, model: torch.nn.Module) ->
 
 
 def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, stage: str) -> list[str]:
-    expected = {"gpa", "modal_embeddings"}
+    expected = {"modal_embeddings"}
+    if getattr(model, "visual_fusion", None) is None:
+        expected.add("gpa")
     if stage == "finetune":
         expected.add("text_model")
     if _module_has_parameters(getattr(model, "projector")):
@@ -609,6 +648,8 @@ def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, s
         expected.add("col_embeddings")
     if getattr(model, "visual_adapter", None) is not None and _module_has_parameters(getattr(model, "visual_adapter")):
         expected.add("visual_adapter")
+    if getattr(model, "visual_fusion", None) is not None and _module_has_parameters(getattr(model, "visual_fusion")):
+        expected.add("visual_fusion")
     if _uses_end_to_end_vision(cfg) and _module_has_parameters(getattr(model, "vision_encoder")):
         expected.add("vision_encoder")
     return sorted(expected)
@@ -757,11 +798,22 @@ def train_stage(
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "dataloader_done", split=split, batches=len(loader))
         _heartbeat(dbg, started_at, "accelerator_prepare_start")
+    step_limit = _stage_step_limit(cfg, stage, max_steps)
+    total_epochs = 1 if step_limit is not None else _stage_epochs(cfg, stage)
+    target_router_steps = _target_optimizer_steps(
+        batches_per_epoch=len(loader),
+        total_epochs=total_epochs,
+        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
+        step_limit=step_limit,
+    )
+    _configure_router_tau(
+        model,
+        target_steps=target_router_steps,
+        reset=resume_training_payload is None,
+    )
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "accelerator_prepare_done")
-    step_limit = _stage_step_limit(cfg, stage, max_steps)
-    total_epochs = 1 if step_limit is not None else _stage_epochs(cfg, stage)
     global_step = start_step
     model.train()
     latest_ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_latest.pt"
@@ -809,7 +861,7 @@ def train_stage(
             if isinstance(accelerator, _SingleProcessAccelerator):
                 batch = _move_training_batch(batch, device, cfg)
             with accelerator.autocast():
-                output = model(**_batch_model_inputs(batch, cfg))
+                output = model(**_batch_model_inputs(batch, cfg), target_optimizer_steps=target_router_steps)
                 raw_loss = output.loss
                 loss = raw_loss / cfg.training.gradient_accumulation_steps
             if not torch.isfinite(raw_loss.detach()).item():
@@ -835,6 +887,7 @@ def train_stage(
                         with torch.no_grad():
                             numerics = debug_model.forward_debug(
                                 **_batch_model_inputs(batch, cfg),
+                                target_optimizer_steps=target_router_steps,
                             )
                     dbg.log(
                         "NUMERICS",
@@ -862,6 +915,7 @@ def train_stage(
                 debug_unwrapped = accelerator.unwrap_model(model)
                 if _uses_end_to_end_vision(cfg) and hasattr(debug_unwrapped, "vision_encoder"):
                     train_payload["vision_grad_norm"] = _module_grad_norm(debug_unwrapped.vision_encoder)
+                train_payload.update(_router_train_payload(debug_unwrapped))
                 dbg.log(
                     "TRAIN",
                     train_payload,
@@ -870,6 +924,7 @@ def train_stage(
                 if cfg.training.max_grad_norm is not None:
                     accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
                 optimizer.step()
+                _step_router_tau(accelerator.unwrap_model(model))
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
             if accelerator.is_main_process and (
@@ -891,6 +946,7 @@ def train_stage(
                     elapsed_seconds=round(elapsed, 3),
                     steps_per_second=round(steps_per_second, 6),
                     estimated_epoch_remaining_seconds=round(remaining_steps / steps_per_second, 3) if steps_per_second > 0 else None,
+                    **_router_train_payload(accelerator.unwrap_model(model)),
                     **_cuda_memory_payload(device),
                 )
             if accelerator.is_main_process and hasattr(bar, "set_postfix"):
@@ -901,6 +957,7 @@ def train_stage(
             if cfg.training.max_grad_norm is not None:
                 accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
             optimizer.step()
+            _step_router_tau(accelerator.unwrap_model(model))
             optimizer.zero_grad(set_to_none=True)
 
         scheduler.step()
@@ -980,6 +1037,16 @@ def train_stage(
                     "length_penalty": cfg.generation.length_penalty,
                 },
             }
+            router = _router_module(unwrapped)
+            if router is not None:
+                metadata["router_tau"] = {
+                    "tau": router.current_tau(),
+                    "tau_step": int(router.tau_step.item()),
+                    "tau_start": float(router.tau_start.item()),
+                    "tau_min": float(router.tau_min.item()),
+                    "tau_decay": float(router.tau_decay.item()),
+                    "target_optimizer_steps": int(router.target_optimizer_steps.item()),
+                }
             save_checkpoint(
                 latest_ckpt,
                 model=unwrapped,

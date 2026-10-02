@@ -1,10 +1,11 @@
 import torch
 
-from efficient_vlm_ad.config import AdapterConfig, CacheConfig, DataConfig, ExperimentConfig, GenerationConfig, ModelConfig, ProjectConfig, RuntimeConfig, TextConfig, TrainingConfig, VisionConfig, load_config
+from efficient_vlm_ad.config import AdapterConfig, CacheConfig, DataConfig, ExperimentConfig, FusionConfig, GenerationConfig, ModelConfig, ProjectConfig, RuntimeConfig, TextConfig, TrainingConfig, VisionConfig, load_config
 from efficient_vlm_ad.modeling.adapters import DynamicInstructionAdapter
 from efficient_vlm_ad.modeling.gpa import GatedPoolingAttention
 from efficient_vlm_ad.modeling.factory import FakeVisionEncoder, build_end_to_end_vlm_model, build_vlm_model
 from efficient_vlm_ad.modeling.multimodal import MultiModalProjector, set_trainable_for_stage
+from efficient_vlm_ad.modeling.router import QuestionGuidedTokenRouter, compute_tau_decay
 
 
 def test_gpa_preserves_token_grid_and_returns_view_weights():
@@ -104,6 +105,27 @@ def test_stage_freeze_policy_trains_visual_adapter_when_present():
     assert all(p.requires_grad for p in modules["visual_adapter"].parameters())
 
 
+def test_stage_policy_trains_router_instead_of_gpa_when_present():
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router.yaml")
+    modules = torch.nn.ModuleDict(
+        {
+            "vision": torch.nn.Linear(2, 2),
+            "text": torch.nn.Linear(2, 2),
+            "gpa": torch.nn.Linear(2, 2),
+            "projector": torch.nn.Linear(2, 2),
+            "spatial_pos": torch.nn.Embedding(7, 2),
+            "modal_embeddings": torch.nn.Embedding(2, 2),
+            "visual_fusion": torch.nn.Linear(2, 2),
+        }
+    )
+
+    set_trainable_for_stage(modules, cfg, "align")
+
+    assert not any(p.requires_grad for p in modules["gpa"].parameters())
+    assert all(p.requires_grad for p in modules["visual_fusion"].parameters())
+    assert not any(p.requires_grad for p in modules["text"].parameters())
+
+
 def test_dynamic_instruction_adapter_preserves_visual_shape_and_masks_text_padding():
     torch.manual_seed(0)
     adapter = DynamicInstructionAdapter(vision_dim=8, text_dim=6, num_heads=2, dropout=0.0, residual_scale=1.0)
@@ -119,6 +141,117 @@ def test_dynamic_instruction_adapter_preserves_visual_shape_and_masks_text_paddi
     assert out.shape == visual.shape
     assert torch.isfinite(out).all()
     assert torch.allclose(out, out_with_changed_padding, atol=1e-5)
+
+
+def test_router_uses_fp32_relaxed_khot_ste_and_native_gather():
+    torch.manual_seed(0)
+    router = QuestionGuidedTokenRouter(
+        vision_dim=8,
+        text_dim=6,
+        seq_len=4,
+        num_views=6,
+        top_k=5,
+        tau_start=2.0,
+        tau_min=0.5,
+        diversity_weight=0.001,
+    )
+    visual = torch.randn(2, 6, 4, 8, dtype=torch.float16).requires_grad_(True)
+    text = torch.randn(2, 7, 6)
+    attention_mask = torch.tensor([[1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0]])
+
+    selected, report = router(
+        visual,
+        text,
+        attention_mask,
+        training=True,
+        target_optimizer_steps=12,
+        return_debug=True,
+    )
+    loss = selected.float().pow(2).mean() + report["diversity_loss_weighted"]
+    loss.backward()
+
+    assert selected.shape == (2, 5, 8)
+    assert selected.dtype == visual.dtype
+    assert report["ste_mask"].dtype == visual.dtype
+    assert report["soft_khot"].dtype == torch.float32
+    assert torch.allclose(report["hard_khot"].sum(dim=1), torch.full((2,), 5.0))
+    assert torch.allclose(report["soft_khot"].sum(dim=1), torch.full((2,), 5.0), atol=1e-4)
+    assert report["selected_indices"].shape == (2, 5)
+    assert report["camera_histogram"].shape == (2, 6)
+    assert torch.all(report["camera_histogram"].sum(dim=1) == 5)
+    assert router.scorer.weight.grad is not None
+    assert router.scorer.weight.grad.abs().sum() > 0
+    assert report["scores"].grad is not None
+    non_selected_grad = report["scores"].grad[report["hard_khot"] == 0]
+    assert non_selected_grad.abs().sum() > 0
+
+
+def test_router_eval_is_deterministic_and_tau_decay_uses_optimizer_steps():
+    router = QuestionGuidedTokenRouter(
+        vision_dim=8,
+        text_dim=6,
+        seq_len=4,
+        num_views=6,
+        top_k=5,
+        tau_start=2.0,
+        tau_min=0.5,
+        diversity_weight=0.001,
+    )
+    visual = torch.randn(1, 6, 4, 8)
+    text = torch.randn(1, 3, 6)
+    attention_mask = torch.ones(1, 3, dtype=torch.long)
+
+    decay = compute_tau_decay(tau_start=2.0, tau_min=0.5, target_optimizer_steps=8)
+    assert abs((2.0 * (decay**8)) - 0.5) < 1e-6
+
+    out1, report1 = router(visual, text, attention_mask, training=False, return_debug=True)
+    out2, report2 = router(visual, text, attention_mask, training=False, return_debug=True)
+
+    assert torch.allclose(out1, out2)
+    assert torch.equal(report1["selected_indices"], report2["selected_indices"])
+    assert report1["tau"] == 2.0
+
+
+def test_router_model_forward_reports_router_numerics():
+    cfg = ExperimentConfig(
+        project=ProjectConfig(output_dir="unused"),
+        data=DataConfig(hf_repo_id="local/fake", view_order=["Front", "Front-Left", "Front-Right", "Back", "Back-Left", "Back-Right"]),
+        model=ModelConfig(
+            profile="debug_router",
+            vision=VisionConfig(name="fake_vision", model_id="fake", output_dim=8, seq_len=4, image_size=16),
+            text=TextConfig(model_id="fake_t5", d_model=8),
+            fusion=FusionConfig(name="question_guided_router", top_k=4, diversity_weight=0.001),
+        ),
+        training=TrainingConfig(batch_size=1, gradient_accumulation_steps=1, gpa_hidden_size=4),
+        cache=CacheConfig(dir="unused"),
+        runtime=RuntimeConfig(precision="fp32"),
+        generation=GenerationConfig(),
+    )
+    model, tokenizer = build_vlm_model(cfg)
+    encoded = tokenizer(["Question: What is visible? Answer:"], padding=True, return_tensors="pt")
+    labels = tokenizer(["A road."], padding=True, return_tensors="pt")["input_ids"]
+    visual_features = torch.randn(1, 6, cfg.model.vision.seq_len, cfg.model.vision.output_dim)
+
+    output = model.forward_from_features(
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        visual_features=visual_features,
+        labels=labels,
+        target_optimizer_steps=10,
+    )
+    report = model.forward_debug(
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        visual_features=visual_features,
+        labels=labels,
+        target_optimizer_steps=10,
+    )
+
+    assert torch.isfinite(output.loss)
+    assert torch.isfinite(output.diversity_loss_raw)
+    assert report["router_selected_tokens"]["finite"] is True
+    assert report["router"]["hard_khot_sum"] == [4.0]
+    assert report["router"]["camera_histogram"][0] and sum(report["router"]["camera_histogram"][0]) == 4
 
 
 def test_end_to_end_model_forward_runs_vision_encoder_and_reports_numerics():

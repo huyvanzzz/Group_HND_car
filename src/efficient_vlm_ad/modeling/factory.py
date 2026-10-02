@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from .adapters import DynamicInstructionAdapter
+from .router import QuestionGuidedTokenRouter
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
 
@@ -171,11 +172,30 @@ def build_visual_adapter(cfg):
     raise ValueError(f"Unknown adapter: {cfg.model.adapter.name}")
 
 
+def build_visual_fusion(cfg):
+    if cfg.model.fusion.name == "gpa":
+        return None
+    if cfg.model.fusion.name == "question_guided_router":
+        return QuestionGuidedTokenRouter(
+            vision_dim=cfg.model.vision.output_dim,
+            text_dim=cfg.model.text.d_model,
+            seq_len=cfg.model.vision.seq_len,
+            num_views=len(cfg.data.view_order),
+            top_k=cfg.model.fusion.top_k,
+            tau_start=cfg.model.fusion.tau_start,
+            tau_min=cfg.model.fusion.tau_min,
+            diversity_weight=cfg.model.fusion.diversity_weight,
+            eps=cfg.model.fusion.eps,
+        )
+    raise ValueError(f"Unknown fusion: {cfg.model.fusion.name}")
+
+
 def build_vlm_model(cfg):
     text_model, tokenizer = build_text_and_tokenizer(cfg)
     model = EfficientVLMForAD(
         text_model=text_model,
         visual_adapter=build_visual_adapter(cfg),
+        visual_fusion=build_visual_fusion(cfg),
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
@@ -190,6 +210,7 @@ def build_end_to_end_vlm_model(cfg, vision_encoder: nn.Module):
         vision_encoder=vision_encoder,
         text_model=text_model,
         visual_adapter=build_visual_adapter(cfg),
+        visual_fusion=build_visual_fusion(cfg),
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,

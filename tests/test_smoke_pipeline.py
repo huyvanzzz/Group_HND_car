@@ -7,6 +7,8 @@ from pathlib import Path
 from PIL import Image
 import torch
 
+from efficient_vlm_ad.pipeline import _target_optimizer_steps
+
 
 def _make_fake_data(root: Path, rows_per_split: int = 1):
     images = root / "images"
@@ -24,6 +26,11 @@ def _make_fake_data(root: Path, rows_per_split: int = 1):
         split_path = root / "data" / "multi_frame" / f"multi_frame_{split}.json"
         split_path.parent.mkdir(parents=True, exist_ok=True)
         split_path.write_text(json.dumps(rows), encoding="utf-8")
+
+
+def test_target_optimizer_steps_matches_epoch_end_accumulation_flush():
+    assert _target_optimizer_steps(batches_per_epoch=5, total_epochs=2, gradient_accumulation_steps=2, step_limit=None) == 6
+    assert _target_optimizer_steps(batches_per_epoch=5, total_epochs=2, gradient_accumulation_steps=2, step_limit=5) == 3
 
 
 def test_offline_smoke_cli_sequence(tmp_path: Path):
@@ -187,6 +194,83 @@ generation:
 
     index = json.loads((output_dir / "cache" / "index.json").read_text(encoding="utf-8"))
     assert len(index) == 6
+
+
+def test_router_offline_smoke_cli_sequence(tmp_path: Path):
+    data_root = tmp_path / "dataset"
+    _make_fake_data(data_root, rows_per_split=2)
+    output_dir = tmp_path / "outputs"
+    cfg = tmp_path / "router_config.yaml"
+    cfg.write_text(
+        f"""
+project:
+  output_dir: {output_dir.as_posix()}
+data:
+  hf_repo_id: local/fake
+  local_dir: {data_root.as_posix()}
+  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
+  expected_counts: {{train: 2, val: 2, test: 2}}
+model:
+  profile: offline_router
+  vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
+  text: {{model_id: fake_t5, d_model: 8}}
+  fusion:
+    name: question_guided_router
+    top_k: 4
+    diversity_weight: 0.001
+    tau_start: 2.0
+    tau_min: 0.5
+cache:
+  dir: {str(output_dir / "cache").replace(chr(92), "/")}
+runtime:
+  precision: fp32
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 2
+  gpa_hidden_size: 4
+generation:
+  max_new_tokens: 4
+  num_beams: 1
+""",
+        encoding="utf-8",
+    )
+
+    for command in [
+        ["prepare-data", "--config", str(cfg), "--subset", "smoke"],
+        ["prepare-features", "--config", str(cfg), "--subset", "smoke"],
+        ["train", "--config", str(cfg), "--stage", "align", "--max-steps", "2", "--debug", "--debug-samples", "1"],
+        [
+            "train",
+            "--config",
+            str(cfg),
+            "--stage",
+            "finetune",
+            "--resume",
+            str(output_dir / "checkpoints" / "align_best.pt"),
+            "--max-steps",
+            "2",
+            "--debug",
+            "--debug-samples",
+            "1",
+        ],
+    ]:
+        subprocess.run([sys.executable, "-m", "efficient_vlm_ad", *command], check=True)
+
+    align_payload = torch.load(output_dir / "checkpoints" / "align_latest.pt", map_location="cpu", weights_only=False)
+    assert align_payload["metadata"]["router_tau"]["tau_step"] == 2
+    assert align_payload["metadata"]["router_tau"]["target_optimizer_steps"] == 2
+    debug_events = [
+        json.loads(line)
+        for line in (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    train_events = [event["payload"] for event in debug_events if event["section"] == "TRAIN"]
+    assert any("router" in payload for payload in train_events)
+    router_payload = next(payload["router"] for payload in train_events if "router" in payload)
+    assert router_payload["hard_khot_sum"] == [4.0]
+    assert sum(router_payload["camera_histogram"][0]) == 4
+    assert router_payload["scorer_grad_norm"] is not None
 
 
 def test_epoch_training_saves_latest_best_and_final_alias(tmp_path: Path):

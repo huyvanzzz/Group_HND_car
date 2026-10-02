@@ -68,11 +68,22 @@ class AdapterConfig:
 
 
 @dataclass(frozen=True)
+class FusionConfig:
+    name: str = "gpa"
+    top_k: int = 49
+    diversity_weight: float = 0.0
+    tau_start: float = 2.0
+    tau_min: float = 0.5
+    eps: float = 1e-8
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     profile: str
     vision: VisionConfig
     text: TextConfig
     adapter: AdapterConfig = field(default_factory=AdapterConfig)
+    fusion: FusionConfig = field(default_factory=FusionConfig)
 
 
 @dataclass(frozen=True)
@@ -149,6 +160,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     vision_raw = _require(model_raw, "vision")
     text_raw = _require(model_raw, "text")
     adapter_raw = model_raw.get("adapter", {})
+    fusion_raw = model_raw.get("fusion", {})
     train_raw = _require(raw, "training")
     cache_raw = raw.get("cache", {})
     runtime_raw = raw.get("runtime", {})
@@ -163,6 +175,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     adapter_name = str(adapter_raw.get("name", "none"))
     if adapter_name not in {"none", "minidrive_di"}:
         raise ValueError("model.adapter.name must be one of: none, minidrive_di")
+    fusion_name = str(fusion_raw.get("name", "gpa"))
+    if fusion_name not in {"gpa", "question_guided_router"}:
+        raise ValueError("model.fusion.name must be one of: gpa, question_guided_router")
     expected_counts = data_raw.get("expected_counts") or {"train": 341381, "val": 19785, "test": 16817}
 
     return ExperimentConfig(
@@ -194,6 +209,14 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 num_heads=int(adapter_raw.get("num_heads", 8)),
                 dropout=float(adapter_raw.get("dropout", 0.1)),
                 residual_scale=float(adapter_raw.get("residual_scale", 0.1)),
+            ),
+            fusion=FusionConfig(
+                name=fusion_name,
+                top_k=int(fusion_raw.get("top_k", vision_raw.get("seq_len", 49))),
+                diversity_weight=float(fusion_raw.get("diversity_weight", 0.0)),
+                tau_start=float(fusion_raw.get("tau_start", 2.0)),
+                tau_min=float(fusion_raw.get("tau_min", 0.5)),
+                eps=float(fusion_raw.get("eps", 1e-8)),
             ),
         ),
         training=TrainingConfig(
