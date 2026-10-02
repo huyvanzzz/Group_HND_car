@@ -946,7 +946,6 @@ def train_stage(
                     elapsed_seconds=round(elapsed, 3),
                     steps_per_second=round(steps_per_second, 6),
                     estimated_epoch_remaining_seconds=round(remaining_steps / steps_per_second, 3) if steps_per_second > 0 else None,
-                    **_router_train_payload(accelerator.unwrap_model(model)),
                     **_cuda_memory_payload(device),
                 )
             if accelerator.is_main_process and hasattr(bar, "set_postfix"):

@@ -272,6 +272,24 @@ generation:
     assert sum(router_payload["camera_histogram"][0]) == 4
     assert router_payload["scorer_grad_norm"] is not None
 
+    progress_rows = [
+        json.loads(line)
+        for line in (output_dir / "debug" / "train_progress.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    forbidden_progress_keys = {
+        "router",
+        "router_tau",
+        "selected_indices",
+        "camera_histogram",
+        "scorer_grad_norm",
+        "soft_khot_stats",
+        "ste_mask_stats",
+        "diversity_loss_raw",
+        "diversity_loss_weighted",
+    }
+    assert all(forbidden_progress_keys.isdisjoint(row) for row in progress_rows)
+
 
 def test_epoch_training_saves_latest_best_and_final_alias(tmp_path: Path):
     data_root = tmp_path / "dataset"
