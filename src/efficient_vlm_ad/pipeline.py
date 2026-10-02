@@ -18,7 +18,7 @@ from .cache import FeatureCacheManifest, create_memmap, validate_manifest
 from .checkpointing import load_checkpoint, read_checkpoint_metadata, save_checkpoint
 from .config import ExperimentConfig
 from .data import format_prompt, normalize_camera_paths
-from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats
+from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats, unique_named_parameters
 from .evaluation import caption_metrics, metric_display_values, write_predictions
 from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_vision_encoder, build_vlm_model
@@ -414,6 +414,10 @@ def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
     )
 
 
+def _trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
+    return [param for _, param in unique_named_parameters(model) if param.requires_grad]
+
+
 def train_stage(
     cfg: ExperimentConfig,
     stage: str,
@@ -447,7 +451,8 @@ def train_stage(
         dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
         dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
 
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    trainable_params = _trainable_parameters(model)
+    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
 
     start_step = 0
@@ -632,7 +637,7 @@ def train_stage(
                 )
             if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
                 if cfg.training.max_grad_norm is not None:
-                    accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+                    accelerator.clip_grad_norm_(trainable_params, cfg.training.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
@@ -663,7 +668,7 @@ def train_stage(
             raise ValueError("Training dataloader was empty")
         if global_step % cfg.training.gradient_accumulation_steps != 0:
             if cfg.training.max_grad_norm is not None:
-                accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+                accelerator.clip_grad_norm_(trainable_params, cfg.training.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -891,7 +896,7 @@ def diagnose_train(
     mark("dataloader", begin)
 
     begin = time.perf_counter()
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer = torch.optim.AdamW(_trainable_parameters(model), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
     mark("accelerator_prepare", begin)

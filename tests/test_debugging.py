@@ -113,6 +113,22 @@ def test_model_param_summary_counts_trainable_params():
     assert summary["frozen_params"] == 3
 
 
+def test_model_param_summary_deduplicates_shared_weight_storage():
+    class SharedStorageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.left = torch.nn.Linear(2, 2, bias=False)
+            self.right = torch.nn.Linear(2, 2, bias=False)
+            self.right.weight = torch.nn.Parameter(self.left.weight.data)
+            self.extra = torch.nn.Parameter(torch.ones(3))
+
+    summary = model_param_summary(SharedStorageModel())
+
+    assert summary["total_params"] == 7
+    assert summary["trainable_params"] == 7
+    assert summary["frozen_params"] == 0
+
+
 def test_cli_accepts_debug_flags():
     result = subprocess.run(
         [sys.executable, "-m", "efficient_vlm_ad", "inspect-data", "--help"],

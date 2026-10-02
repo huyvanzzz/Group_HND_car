@@ -71,6 +71,7 @@ Gioi han:
 - dynamic top-k co the lam batching phuc tap neu so token moi sample khac nhau
 - score chi dua tren text summary, khong phai attention noi bo cua T5
 - can policy ro rang cho padding/mask neu token count bien doi
+- phai lua chon k
 
 ### Huong 3: T5-internal MVPruner-style pruning
 

@@ -83,11 +83,37 @@ def path_status(paths: list[str | Path]) -> list[dict[str, Any]]:
     return rows
 
 
+def _parameter_key(param: torch.nn.Parameter) -> tuple[int, int, tuple[int, ...], tuple[int, ...]]:
+    tensor = param.detach()
+    if tensor.numel() == 0:
+        return (id(param), 0, tuple(tensor.shape), tuple(tensor.stride()))
+    try:
+        storage_ptr = int(tensor.untyped_storage().data_ptr())
+    except AttributeError:  # pragma: no cover - compatibility with older torch
+        storage_ptr = int(tensor.storage().data_ptr())
+    return (
+        storage_ptr,
+        int(tensor.storage_offset()),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+    )
+
+
+def unique_named_parameters(model: torch.nn.Module):
+    seen: set[tuple[int, int, tuple[int, ...], tuple[int, ...]]] = set()
+    for name, param in model.named_parameters():
+        key = _parameter_key(param)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield name, param
+
+
 def model_param_summary(model: torch.nn.Module) -> dict[str, Any]:
     total = 0
     trainable = 0
     trainable_modules: set[str] = set()
-    for name, param in model.named_parameters():
+    for name, param in unique_named_parameters(model):
         count = param.numel()
         total += count
         if param.requires_grad:
