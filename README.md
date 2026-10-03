@@ -31,7 +31,7 @@ On Kaggle, store the Hugging Face token as a secret named `HF_TOKEN`, set `GITHU
 python scripts/kaggle_bootstrap.py
 ```
 
-The bootstrap clones branch `huy`, installs the package editable, reads the Kaggle secret, and runs
+The bootstrap clones branch `duong`, installs the package editable, reads the Kaggle secret, and runs
 the smoke sequence. For a full run, use the Mini config and remove `--subset smoke`,
 `--max-steps`, and `--max-samples`.
 

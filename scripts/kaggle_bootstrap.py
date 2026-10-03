@@ -9,7 +9,7 @@ from pathlib import Path
 
 def main() -> None:
     repo_url = os.environ.get("GITHUB_REPO_URL")
-    branch = os.environ.get("GITHUB_BRANCH", "huy")
+    branch = os.environ.get("GITHUB_BRANCH", "duong")
     target = Path("/kaggle/working/Efficient_VLM_For_Autonomous_Driving")
 
     if repo_url and not target.exists():
