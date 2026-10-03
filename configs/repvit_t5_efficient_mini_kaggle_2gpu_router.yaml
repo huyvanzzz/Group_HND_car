@@ -27,7 +27,7 @@ model:
     name: none
   fusion:
     name: question_guided_router
-    top_k: 49
+    top_k: 98
     diversity_weight: 0.001
     tau_start: 2.0
     tau_min: 0.5
