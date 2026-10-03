@@ -85,6 +85,21 @@ class EfficientVLMForAD(nn.Module):
             (attention_mask.shape[0], self.seq_len), dtype=attention_mask.dtype, device=attention_mask.device
         )
         combined_mask = torch.cat([visual_mask, attention_mask], dim=1)
+        
+        if hasattr(self.text_model, "pruning_block"):
+            encoder_outputs = self.text_model.encoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=combined_mask,
+                return_dict=True
+            )
+            keep_indices = self.text_model.pruning_block.last_keep_indices
+            shortened_mask = torch.gather(combined_mask, 1, keep_indices)
+            return self.text_model(
+                encoder_outputs=encoder_outputs, 
+                attention_mask=shortened_mask, 
+                labels=labels
+            )
+            
         return self.text_model(inputs_embeds=inputs_embeds, attention_mask=combined_mask, labels=labels)
 
     def forward_debug(
@@ -171,6 +186,24 @@ class EfficientVLMForAD(nn.Module):
             (attention_mask.shape[0], self.seq_len), dtype=attention_mask.dtype, device=attention_mask.device
         )
         combined_mask = torch.cat([visual_mask, attention_mask], dim=1)
+        
+        if hasattr(self.text_model, "pruning_block"):
+            encoder_outputs = self.text_model.encoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=combined_mask,
+                return_dict=True
+            )
+            keep_indices = self.text_model.pruning_block.last_keep_indices
+            shortened_mask = torch.gather(combined_mask, 1, keep_indices)
+            return self.text_model.generate(
+                encoder_outputs=encoder_outputs,
+                attention_mask=shortened_mask,
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+                early_stopping=early_stopping,
+                length_penalty=length_penalty,
+            )
+            
         return self.text_model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=combined_mask,
