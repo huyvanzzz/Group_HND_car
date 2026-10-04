@@ -9,7 +9,7 @@ from pathlib import Path
 
 def main() -> None:
     repo_url = os.environ.get("GITHUB_REPO_URL")
-    branch = os.environ.get("GITHUB_BRANCH", "huy")
+    branch = os.environ.get("GITHUB_BRANCH", "nguyet")
     target = Path("/kaggle/working/Efficient_VLM_For_Autonomous_Driving")
 
     if repo_url and not target.exists():
@@ -77,6 +77,10 @@ def main() -> None:
             "outputs/repvit_t5_efficient_tiny_smoke/checkpoints/finetune_latest.pt",
             "--max-samples",
             "32",
+            "--batch-size",
+            os.environ.get("EVAL_BATCH_SIZE", "16"),
+            "--progress-log-every-samples",
+            os.environ.get("EVAL_PROGRESS_LOG_EVERY", "16"),
             *dbg,
         ],
         [
@@ -87,6 +91,8 @@ def main() -> None:
             "outputs/repvit_t5_efficient_tiny_smoke/checkpoints/finetune_latest.pt",
             "--max-samples",
             "32",
+            "--progress-log-every-samples",
+            os.environ.get("BENCHMARK_PROGRESS_LOG_EVERY", "16"),
             *dbg,
         ],
     ]

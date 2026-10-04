@@ -24,7 +24,7 @@ from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
 from .progress import progress, progress_bar
-from .progress_logging import ProgressEventWriter
+from .progress_logging import MinimalProgressWriter, ProgressEventWriter
 
 
 class _SingleProcessAccelerator:
@@ -121,6 +121,24 @@ def _heartbeat(dbg: DebugPrinter, started_at: float, stage: str, **payload: Any)
             "elapsed_seconds": round(time.perf_counter() - started_at, 3),
             **payload,
         },
+    )
+
+
+def _remaining_seconds(elapsed_seconds: float, current: int, total: int) -> float:
+    if current <= 0 or total <= current:
+        return 0.0
+    samples_per_second = current / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    return (total - current) / samples_per_second if samples_per_second > 0 else 0.0
+
+
+def _write_minimal_progress(writer: MinimalProgressWriter, *, stage: str, current: int, total: int, start: float) -> None:
+    elapsed = time.perf_counter() - start
+    writer.write(
+        stage=stage,
+        current=current,
+        total=total,
+        elapsed_seconds=elapsed,
+        estimated_remaining_seconds=_remaining_seconds(elapsed, current, total),
     )
 
 
@@ -970,6 +988,8 @@ def evaluate_checkpoint(
     cfg: ExperimentConfig,
     checkpoint: str,
     max_samples: int | None = None,
+    batch_size: int | None = None,
+    progress_log_every_samples: int | None = None,
     skip_meteor: bool = True,
     debug: bool = False,
     debug_samples: int = 3,
@@ -986,8 +1006,16 @@ def evaluate_checkpoint(
     model.eval()
     dataset = CachedVLMDataset(cfg, "test", max_samples=max_samples)
     dbg.log("FEATURE", {"split": "test", **dataset.summary()})
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
+    eval_batch_size = batch_size or cfg.evaluation.eval_batch_size
+    log_every = max(1, progress_log_every_samples or cfg.evaluation.eval_progress_log_every_samples)
+    loader = DataLoader(dataset, batch_size=eval_batch_size, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
     rows: list[dict[str, Any]] = []
+    progress_writer = MinimalProgressWriter(cfg.project.output_dir, "eval_progress.jsonl")
+    progress_started = time.perf_counter()
+    total_samples = len(dataset)
+    processed = 0
+    next_log_at = log_every
+    _write_minimal_progress(progress_writer, stage="evaluate", current=0, total=total_samples, start=progress_started)
     with torch.no_grad():
         for idx, batch in progress(enumerate(loader), desc="evaluate", total=len(loader), disable=disable_progress):
             for key in ("input_ids", "attention_mask", "visual_features"):
@@ -1001,19 +1029,26 @@ def evaluate_checkpoint(
                 early_stopping=cfg.generation.early_stopping,
                 length_penalty=cfg.generation.length_penalty,
             )
-            pred = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)[0]
-            if idx < dbg.samples:
-                dbg.log(
-                    "EVAL",
-                    {
-                        "eval_id": batch["eval_ids"][0],
-                        "compute_device": str(device),
-                        "generated_tokens": tensor_stats("generated_tokens", ids),
-                        "prediction": safe_preview(pred),
-                        "reference": safe_preview(batch["answers"][0]),
-                    },
-                )
-            rows.append({"eval_id": batch["eval_ids"][0], "prediction": pred, "reference": batch["answers"][0]})
+            preds = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            for offset, pred in enumerate(preds):
+                sample_index = processed + offset
+                if sample_index < dbg.samples:
+                    dbg.log(
+                        "EVAL",
+                        {
+                            "eval_id": batch["eval_ids"][offset],
+                            "compute_device": str(device),
+                            "generated_tokens": tensor_stats("generated_tokens", ids[offset : offset + 1]),
+                            "prediction": safe_preview(pred),
+                            "reference": safe_preview(batch["answers"][offset]),
+                        },
+                    )
+                rows.append({"eval_id": batch["eval_ids"][offset], "prediction": pred, "reference": batch["answers"][offset]})
+            processed += len(preds)
+            if processed >= next_log_at or processed == total_samples:
+                _write_minimal_progress(progress_writer, stage="evaluate", current=processed, total=total_samples, start=progress_started)
+                while next_log_at <= processed:
+                    next_log_at += log_every
     output_dir = Path(cfg.project.output_dir)
     write_predictions(output_dir / "predictions.jsonl", rows)
     metrics = caption_metrics(rows, skip_meteor=skip_meteor)
@@ -1035,6 +1070,7 @@ def benchmark_checkpoint(
     cfg: ExperimentConfig,
     checkpoint: str,
     max_samples: int | None = None,
+    progress_log_every_samples: int | None = None,
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
@@ -1048,10 +1084,17 @@ def benchmark_checkpoint(
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
+    if max_samples is None:
+        max_samples = cfg.evaluation.benchmark_max_samples
     dataset = CachedVLMDataset(cfg, "test", max_samples=max_samples)
     dbg.log("FEATURE", {"split": "test", **dataset.summary()})
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=CachedBatchCollator(tokenizer))
     e2e, gen, token_counts = [], [], []
+    progress_writer = MinimalProgressWriter(cfg.project.output_dir, "benchmark_progress.jsonl")
+    progress_started = time.perf_counter()
+    total_samples = len(dataset)
+    log_every = max(1, progress_log_every_samples or cfg.evaluation.benchmark_progress_log_every_samples)
+    _write_minimal_progress(progress_writer, stage="benchmark", current=0, total=total_samples, start=progress_started)
     with torch.no_grad():
         for idx, batch in progress(enumerate(loader), desc="benchmark", total=len(loader), disable=disable_progress):
             start = time.perf_counter()
@@ -1077,6 +1120,9 @@ def benchmark_checkpoint(
             token_counts.append(int((ids != getattr(tokenizer, "pad_token_id", 0)).sum().item()))
             if idx < dbg.samples:
                 dbg.log("BENCHMARK", {"sample": idx, "e2e_seconds": e2e[-1], "generation_seconds": gen[-1], "output_tokens": token_counts[-1]})
+            current = idx + 1
+            if current % log_every == 0 or current == total_samples:
+                _write_minimal_progress(progress_writer, stage="benchmark", current=current, total=total_samples, start=progress_started)
     summary = summarize_latencies(e2e_seconds=e2e, generation_seconds=gen, output_tokens=token_counts)
     summary.update({"device": str(device), "python": platform.python_version(), "torch": torch.__version__})
     if torch.cuda.is_available():

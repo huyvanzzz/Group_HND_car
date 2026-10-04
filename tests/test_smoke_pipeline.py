@@ -109,6 +109,8 @@ generation:
 
     assert (output_dir / "predictions.jsonl").exists()
     assert (output_dir / "benchmark.json").exists()
+    assert (output_dir / "debug" / "eval_progress.jsonl").exists()
+    assert (output_dir / "debug" / "benchmark_progress.jsonl").exists()
     assert (output_dir / "debug" / "debug_events.jsonl").exists()
     debug_events = [
         json.loads(line)
@@ -133,6 +135,20 @@ generation:
     assert first_train_step["finite_loss"] is True
     assert "elapsed_seconds" in first_train_step
     assert "estimated_epoch_remaining_seconds" in first_train_step
+    eval_progress = [
+        json.loads(line)
+        for line in (output_dir / "debug" / "eval_progress.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    benchmark_progress = [
+        json.loads(line)
+        for line in (output_dir / "debug" / "benchmark_progress.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert eval_progress[-1]["stage"] == "evaluate"
+    assert eval_progress[-1]["current"] == 1
+    assert benchmark_progress[-1]["stage"] == "benchmark"
+    assert benchmark_progress[-1]["current"] == 1
 
 
 def test_smoke_prepare_features_keeps_examples_from_each_split(tmp_path: Path):

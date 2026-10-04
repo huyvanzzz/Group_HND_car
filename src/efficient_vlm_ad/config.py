@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +96,14 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class EvaluationConfig:
+    eval_batch_size: int = 16
+    eval_progress_log_every_samples: int = 256
+    benchmark_max_samples: int = 200
+    benchmark_progress_log_every_samples: int = 20
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     project: ProjectConfig
     data: DataConfig
@@ -104,6 +112,7 @@ class ExperimentConfig:
     cache: CacheConfig
     runtime: RuntimeConfig
     generation: GenerationConfig
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
 
 def _require(mapping: dict[str, Any], key: str) -> Any:
@@ -134,6 +143,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     cache_raw = raw.get("cache", {})
     runtime_raw = raw.get("runtime", {})
     generation_raw = raw.get("generation", {})
+    evaluation_raw = raw.get("evaluation", {})
     precision = str(runtime_raw.get("precision", "auto"))
     if precision not in {"auto", "fp32", "fp16", "bf16"}:
         raise ValueError("runtime.precision must be one of: auto, fp32, fp16, bf16")
@@ -191,5 +201,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
             num_beams=int(generation_raw.get("num_beams", 1)),
             early_stopping=bool(generation_raw.get("early_stopping", False)),
             length_penalty=float(generation_raw.get("length_penalty", 1.0)),
+        ),
+        evaluation=EvaluationConfig(
+            eval_batch_size=int(evaluation_raw.get("eval_batch_size", 16)),
+            eval_progress_log_every_samples=int(evaluation_raw.get("eval_progress_log_every_samples", 256)),
+            benchmark_max_samples=int(evaluation_raw.get("benchmark_max_samples", 200)),
+            benchmark_progress_log_every_samples=int(evaluation_raw.get("benchmark_progress_log_every_samples", 20)),
         ),
     )

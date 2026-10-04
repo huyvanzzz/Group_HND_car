@@ -62,6 +62,10 @@ def test_loads_kaggle_2gpu_profiles():
     assert cfg.generation.num_beams == 3
     assert cfg.generation.early_stopping is True
     assert cfg.generation.length_penalty == 1.0
+    assert cfg.evaluation.eval_batch_size == 16
+    assert cfg.evaluation.eval_progress_log_every_samples == 256
+    assert cfg.evaluation.benchmark_max_samples == 200
+    assert cfg.evaluation.benchmark_progress_log_every_samples == 20
 
     assert safe_cfg.training.batch_size == 8
     assert safe_cfg.runtime.precision == "fp32"
@@ -71,6 +75,8 @@ def test_loads_kaggle_2gpu_profiles():
     assert safe_cfg.training.finetune_epochs == 6
     assert safe_cfg.generation.max_new_tokens == 512
     assert safe_cfg.generation.num_beams == 3
+    assert safe_cfg.evaluation.eval_batch_size == 16
+    assert safe_cfg.evaluation.benchmark_max_samples == 200
 
 
 def test_accelerate_is_declared_dependency():

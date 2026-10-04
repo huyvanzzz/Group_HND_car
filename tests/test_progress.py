@@ -42,6 +42,25 @@ def test_cli_help_exposes_progress_log_every_steps():
     assert "--progress-log-every-steps" in result.stdout
 
 
+def test_cli_help_exposes_eval_benchmark_progress_flags():
+    evaluate_help = subprocess.run(
+        [sys.executable, "-m", "efficient_vlm_ad", "evaluate", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    benchmark_help = subprocess.run(
+        [sys.executable, "-m", "efficient_vlm_ad", "benchmark", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--batch-size" in evaluate_help.stdout
+    assert "--progress-log-every-samples" in evaluate_help.stdout
+    assert "--progress-log-every-samples" in benchmark_help.stdout
+
+
 def test_progress_event_writer_appends_jsonl_and_redacts_token(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
     writer = ProgressEventWriter(tmp_path / "outputs")
