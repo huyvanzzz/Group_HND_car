@@ -126,9 +126,9 @@ class FakeVisionEncoder(nn.Module):
         return base.expand(batch, views, self.seq_len, self.output_dim).contiguous()
 
 class pruningBlock(nn.Module):
-    def __init__(self, keep_k):
+    def __init__(self, fastv_config):
         super().__init__()
-        self.keep_k = keep_k
+        self.fastv_config = fastv_config
 
     def farway_point_sampling(self, hidden_states, k, select_indices=None):
         def compute_distance_matrix(states):
@@ -268,14 +268,15 @@ def build_text_and_tokenizer(cfg):
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
     model = AutoModelForSeq2SeqLM.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
 
-    fastv_config = {
+    if cfg.model.fastv is not None:
+        fastv_config = {
             'fastv_k': cfg.model.fastv.k,
             'fastv_r': list(cfg.model.fastv.r),
             'image_start_index': list(cfg.model.fastv.image_start_index),
             'image_token_length': cfg.model.fastv.image_token_length
         }
     
-    pruning_block = pruning_block(fastv_config)
+    pruning_block = pruningBlock(fastv_config)
     model.encoder.block.insert(fastv_config['fastv_k'], pruning_block)
     
     model.pruning_block = pruning_block
