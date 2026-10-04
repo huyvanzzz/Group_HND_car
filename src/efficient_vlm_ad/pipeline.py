@@ -352,7 +352,7 @@ class CachedBatchCollator:
         }
 
 
-def validate_stage_loss(
+def validate_stage_report(
     cfg: ExperimentConfig,
     model: torch.nn.Module,
     tokenizer,
@@ -362,7 +362,7 @@ def validate_stage_loss(
     device: torch.device,
     debug: DebugPrinter | None = None,
     disable_progress: bool = False,
-) -> float:
+) -> dict[str, Any]:
     dataset = CachedVLMDataset(cfg, "val")
     if debug:
         debug.log("FEATURE", {"split": "val", **dataset.summary()})
@@ -398,7 +398,34 @@ def validate_stage_loss(
         model.train()
     if total_batches == 0:
         raise ValueError("Validation dataloader was empty")
-    return total_loss / total_batches
+    return {
+        "loss": total_loss / total_batches,
+    }
+
+
+def validate_stage_loss(
+    cfg: ExperimentConfig,
+    model: torch.nn.Module,
+    tokenizer,
+    *,
+    stage: str,
+    epoch: int,
+    device: torch.device,
+    debug: DebugPrinter | None = None,
+    disable_progress: bool = False,
+) -> float:
+    return float(
+        validate_stage_report(
+            cfg,
+            model,
+            tokenizer,
+            stage=stage,
+            epoch=epoch,
+            device=device,
+            debug=debug,
+            disable_progress=disable_progress,
+        )["loss"]
+    )
 
 
 def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
@@ -943,6 +970,7 @@ def evaluate_checkpoint(
     cfg: ExperimentConfig,
     checkpoint: str,
     max_samples: int | None = None,
+    skip_meteor: bool = True,
     debug: bool = False,
     debug_samples: int = 3,
     debug_jsonl: str | None = None,
@@ -988,10 +1016,18 @@ def evaluate_checkpoint(
             rows.append({"eval_id": batch["eval_ids"][0], "prediction": pred, "reference": batch["answers"][0]})
     output_dir = Path(cfg.project.output_dir)
     write_predictions(output_dir / "predictions.jsonl", rows)
-    metrics = caption_metrics(rows)
+    metrics = caption_metrics(rows, skip_meteor=skip_meteor)
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     (output_dir / "metrics_display.json").write_text(json.dumps(metric_display_values(metrics), indent=2), encoding="utf-8")
-    dbg.log("EVAL", {"prediction_count": len(rows), "metrics": metrics, "metrics_display": metric_display_values(metrics)})
+    dbg.log(
+        "EVAL",
+        {
+            "prediction_count": len(rows),
+            "skip_meteor": skip_meteor,
+            "metrics": metrics,
+            "metrics_display": metric_display_values(metrics),
+        },
+    )
     return metrics
 
 

@@ -112,6 +112,7 @@ def evaluate(args: argparse.Namespace) -> None:
         cfg,
         args.checkpoint,
         max_samples=args.max_samples,
+        skip_meteor=not args.with_meteor,
         debug=args.debug,
         debug_samples=args.debug_samples,
         debug_jsonl=args.debug_jsonl,
@@ -220,6 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
         if name in {"evaluate", "benchmark"}:
             cmd.add_argument("--checkpoint", required=True)
             cmd.add_argument("--max-samples", type=int)
+        if name == "evaluate":
+            cmd.add_argument("--with-meteor", action="store_true", help="Include METEOR in caption metrics. Disabled by default because it can be slow or hang on Kaggle.")
         cmd.set_defaults(func=func)
 
     train_cmd = sub.add_parser("train")
