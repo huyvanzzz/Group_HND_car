@@ -138,7 +138,22 @@ class EfficientVLMForAD(nn.Module):
         )
         combined_mask = torch.cat([visual_mask, attention_mask], dim=1)
         report["combined_attention_mask"] = _stats("combined_attention_mask", combined_mask)
-        output = self.text_model(inputs_embeds=inputs_embeds, attention_mask=combined_mask, labels=labels)
+        if hasattr(self.text_model, "pruning_block"):
+            encoder_outputs = self.text_model.encoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=combined_mask,
+                return_dict=True
+            )
+            keep_indices = self.text_model.pruning_block.last_keep_indices
+            shortened_mask = torch.gather(combined_mask, 1, keep_indices)
+            
+            output = self.text_model(
+                encoder_outputs=encoder_outputs, 
+                attention_mask=shortened_mask, 
+                labels=labels
+            )
+        else:
+            output = self.text_model(inputs_embeds=inputs_embeds, attention_mask=combined_mask, labels=labels)
         if hasattr(output, "logits"):
             report["logits"] = _stats("logits", output.logits)
         report["loss"] = _stats("loss", output.loss.detach().reshape(1))

@@ -132,7 +132,7 @@ class pruningBlock(nn.Module):
 
     def farway_point_sampling(self, hidden_states, k, select_indices=None):
         def compute_distance_matrix(states):
-            normalized = F.normalize(states, p=2, dim=1)
+            normalized = torch.nn.functional.normalize(states, p=2, dim=1)
             cosine_sim = torch.matmul(normalized, normalized.T)
             distances = 1 - cosine_sim
             distances.fill_diagonal_(float('inf'))
@@ -276,10 +276,10 @@ def build_text_and_tokenizer(cfg):
             'image_token_length': cfg.model.fastv.image_token_length
         }
     
-    pruning_block = pruningBlock(fastv_config)
-    model.encoder.block.insert(fastv_config['fastv_k'], pruning_block)
+        pruning_block = pruningBlock(fastv_config)
+        model.encoder.block.insert(fastv_config['fastv_k'], pruning_block)
     
-    model.pruning_block = pruning_block
+        model.pruning_block = pruning_block
 
     return model, tokenizer
 
