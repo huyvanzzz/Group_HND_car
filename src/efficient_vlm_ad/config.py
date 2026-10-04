@@ -41,6 +41,12 @@ class GenerationConfig:
     early_stopping: bool = False
     length_penalty: float = 1.0
 
+@dataclass(frozen=True)
+class FastVConfig:
+    k: int
+    r: list[float]
+    image_start_index: list[int]
+    image_token_length: int
 
 @dataclass(frozen=True)
 class VisionConfig:
@@ -69,6 +75,7 @@ class AdapterConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    fastv: FastVConfig | None = None
     profile: str
     vision: VisionConfig
     text: TextConfig
