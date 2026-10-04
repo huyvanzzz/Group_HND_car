@@ -75,11 +75,11 @@ class AdapterConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    fastv: FastVConfig | None = None
     profile: str
     vision: VisionConfig
     text: TextConfig
     adapter: AdapterConfig = field(default_factory=AdapterConfig)
+    fastv: FastVConfig | None = None
 
 
 @dataclass(frozen=True)
