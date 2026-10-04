@@ -180,6 +180,7 @@ class pruningBlock(nn.Module):
         hidden_states,
         attention_mask=None,
         position_bias=None,
+        *args,
         **kwargs
     ):
         batch_size, seq_len, d_model = hidden_states.shape
@@ -257,7 +258,7 @@ class pruningBlock(nn.Module):
             )
         if kwargs.get("use_cache", False):
             return (hidden_states, None, position_bias)
-        return (hidden_states, position_bias)
+        return (hidden_states, position_bias, None)
 
 
 def build_text_and_tokenizer(cfg):
