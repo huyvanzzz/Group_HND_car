@@ -242,6 +242,8 @@ class pruningBlock(nn.Module):
                 idx = keep_indices.view(batch_size, 1, 1, new_seq_len)
                 attention_mask = torch.gather(attention_mask, dim=-1, index=idx)
                 
+        self.pruned_attention_mask = attention_mask
+                
         # Prune position bias (Handles T5 relative positions)
         if position_bias is not None:
             num_heads = position_bias.shape[1]
@@ -259,6 +261,23 @@ class pruningBlock(nn.Module):
         if kwargs.get("use_cache", False):
             return (hidden_states, None, position_bias)
         return (hidden_states, position_bias, None)
+
+
+class T5BlockWrapper(nn.Module):
+    def __init__(self, original_block, pruning_module):
+        super().__init__()
+        self.original_block = original_block
+        self.pruning_module = pruning_module
+        
+    def forward(self, *args, **kwargs):
+        if hasattr(self.pruning_module, 'pruned_attention_mask'):
+            if 'attention_mask' in kwargs:
+                kwargs['attention_mask'] = self.pruning_module.pruned_attention_mask
+            elif len(args) > 1:
+                args = list(args)
+                args[1] = self.pruning_module.pruned_attention_mask
+                args = tuple(args)
+        return self.original_block(*args, **kwargs)
 
 
 def build_text_and_tokenizer(cfg):
@@ -281,6 +300,9 @@ def build_text_and_tokenizer(cfg):
         model.encoder.block.insert(fastv_config['fastv_k'], pruning_block)
     
         model.pruning_block = pruning_block
+        
+        for i in range(fastv_config['fastv_k'] + 1, len(model.encoder.block)):
+            model.encoder.block[i] = T5BlockWrapper(model.encoder.block[i], pruning_block)
 
     return model, tokenizer
 
