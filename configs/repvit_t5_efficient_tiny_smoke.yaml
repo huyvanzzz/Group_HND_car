@@ -12,8 +12,8 @@ runtime:
   precision: auto
 model:
   fastv:
-    k: 2
-    r: [0.1]
+    k: 3
+    r: [0.3]
     image_start_index: [0]
     image_token_length: 49
   profile: repvit_t5_efficient_tiny_smoke
