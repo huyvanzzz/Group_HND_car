@@ -155,6 +155,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     model_raw = _require(raw, "model")
     vision_raw = _require(model_raw, "vision")
     text_raw = _require(model_raw, "text")
+    fastv_raw = _require(model_raw, "fastv")
     adapter_raw = model_raw.get("adapter", {})
     train_raw = _require(raw, "training")
     cache_raw = raw.get("cache", {})
@@ -195,6 +196,12 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 model_id=str(_require(text_raw, "model_id")),
                 revision=text_raw.get("revision"),
                 d_model=int(_require(text_raw, "d_model")),
+            ),
+            fastv=FastVConfig(
+                k=int(_require(fastv_raw, "k")),
+                r=[float(x) for x in _require(fastv_raw, "r")],
+                image_start_index=[int(x) for x in _require(fastv_raw, "image_start_index")],
+                image_token_length=int(_require(fastv_raw, "image_token_length")),
             ),
             adapter=AdapterConfig(
                 name=adapter_name,
