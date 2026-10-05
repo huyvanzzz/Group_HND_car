@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
-from .vlm import EfficientVLMForAD
+from .t5_internal_pruning import T5InternalPruningVLMForAD
 
 
 class SimpleTokenizer:
@@ -158,12 +158,15 @@ def build_vision_encoder(cfg):
 
 def build_vlm_model(cfg):
     text_model, tokenizer = build_text_and_tokenizer(cfg)
-    model = EfficientVLMForAD(
+    model = T5InternalPruningVLMForAD(
         text_model=text_model,
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
-        gpa_hidden_size=cfg.training.gpa_hidden_size,
-        gpa_conditioning=cfg.model.gpa_conditioning,
+        keep_ratio=cfg.model.pruning.keep_ratio,
+        min_keep_per_view=cfg.model.pruning.min_keep_per_view,
+        selection_policy=cfg.model.pruning.selection_policy,
+        layer_policy=cfg.model.pruning.layer_policy,
+        layer_index=cfg.model.pruning.layer_index,
     )
     return model, tokenizer

@@ -447,16 +447,16 @@ def validate_stage_loss(
 
 
 def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
-    return torch.nn.ModuleDict(
-        {
-            "vision": torch.nn.Identity(),
-            "text": model.text_model,
-            "gpa": model.gpa,
-            "projector": model.projector,
-            "spatial_pos": torch.nn.ModuleList([m for m in [model.row_embeddings, model.col_embeddings] if m]),
-            "modal_embeddings": model.modal_embeddings,
-        }
-    )
+    modules = {
+        "vision": torch.nn.Identity(),
+        "text": model.text_model,
+        "projector": model.projector,
+        "spatial_pos": torch.nn.ModuleList([m for m in [model.row_embeddings, model.col_embeddings] if m]),
+        "modal_embeddings": model.modal_embeddings,
+    }
+    if hasattr(model, "view_embeddings"):
+        modules["view_embeddings"] = model.view_embeddings
+    return torch.nn.ModuleDict(modules)
 
 
 def _trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:

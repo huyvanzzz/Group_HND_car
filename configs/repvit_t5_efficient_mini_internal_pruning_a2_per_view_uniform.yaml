@@ -1,18 +1,24 @@
 project:
-  output_dir: outputs/repvit_t5_efficient_mini_question_gpa_kaggle_2gpu_safe
+  output_dir: outputs/repvit_t5_efficient_mini_internal_pruning_a2_per_view_uniform
 data:
   hf_repo_id: minhdang0901/drivelm-nuscenes-v1-0
   revision: main
   view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
   expected_counts: {train: 341381, val: 19785, test: 16817}
 cache:
-  dir: outputs/repvit_t5_efficient_mini_question_gpa_kaggle_2gpu_safe/cache
+  dir: outputs/repvit_t5_efficient_mini_internal_pruning_cache/cache
 runtime:
   device: auto
-  precision: fp32
+  precision: auto
 model:
-  profile: repvit_t5_efficient_mini_question_gpa_kaggle_2gpu_safe
-  gpa_conditioning: question_gate
+  profile: repvit_t5_efficient_mini_internal_pruning_a2_per_view_uniform
+  architecture: t5_internal_pruning
+  pruning:
+    enabled: true
+    layer_policy: middle
+    keep_ratio: 0.5
+    min_keep_per_view: 2
+    selection_policy: per_view_uniform
   vision:
     name: repvit_m1_5
     model_id: timm/repvit_m1_5.dist_450e_in1k
@@ -25,23 +31,18 @@ model:
     revision: af3816c2dbd386f7786f7757c536f0314084ff8b
     d_model: 384
 training:
-  batch_size: 8
-  gradient_accumulation_steps: 4
+  batch_size: 4
+  gradient_accumulation_steps: 1
   learning_rate: 0.0001
   weight_decay: 0.05
   scheduler_gamma: 0.9
   align_epochs: 8
   finetune_epochs: 10
-  gpa_hidden_size: 128
-  max_grad_norm: 1.0
-  num_workers: 2
-  pin_memory: true
-  progress_log_every_steps: 50
+  val_every_steps: 1000
+  save_every_steps: 1000
 generation:
-  max_new_tokens: 512
-  num_beams: 3
-  early_stopping: true
-  length_penalty: 1.0
+  max_new_tokens: 64
+  num_beams: 1
 evaluation:
   eval_batch_size: 16
   eval_progress_log_every_samples: 256

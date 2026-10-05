@@ -6,83 +6,32 @@ import pytest
 from efficient_vlm_ad.config import CAMERA_ORDER, load_config
 
 
-def test_loads_repvit_mini_profile():
-    cfg = load_config("configs/repvit_t5_efficient_mini.yaml")
-
-    assert cfg.model.vision.name == "repvit_m1_5"
-    assert cfg.model.text.model_id == "google/t5-efficient-mini"
-    assert cfg.model.text.d_model == 384
-    assert cfg.model.gpa_conditioning == "none"
-    assert cfg.data.view_order == CAMERA_ORDER
-    assert cfg.training.effective_batch_size == 4
-
-
-def test_loads_question_gated_gpa_profile():
-    cfg = load_config("configs/repvit_t5_efficient_mini_question_gpa.yaml")
-
-    assert cfg.model.profile == "repvit_t5_efficient_mini_question_gpa"
-    assert cfg.model.gpa_conditioning == "question_gate"
-    assert cfg.cache.dir == "outputs/repvit_t5_efficient_mini_question_gpa/cache"
-
-
-def test_loads_question_gated_gpa_kaggle_profiles():
-    cfg = load_config("configs/repvit_t5_efficient_mini_question_gpa_kaggle_2gpu.yaml")
-    safe_cfg = load_config("configs/repvit_t5_efficient_mini_question_gpa_kaggle_2gpu_safe.yaml")
-
-    assert cfg.model.gpa_conditioning == "question_gate"
-    assert cfg.training.batch_size == 16
-    assert cfg.training.gradient_accumulation_steps == 2
-    assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert cfg.cache.dir == "outputs/repvit_t5_efficient_mini_question_gpa_kaggle_2gpu/cache"
-
-    assert safe_cfg.model.gpa_conditioning == "question_gate"
-    assert safe_cfg.training.batch_size == 8
-    assert safe_cfg.training.gradient_accumulation_steps == 4
-    assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
-    assert safe_cfg.cache.dir == "outputs/repvit_t5_efficient_mini_question_gpa_kaggle_2gpu_safe/cache"
-
-
-def test_loads_kaggle_2gpu_profiles():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
-    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_safe.yaml")
-
-    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu"
-    assert cfg.runtime.precision == "fp32"
-    assert cfg.training.batch_size == 16
-    assert cfg.training.gradient_accumulation_steps == 2
-    assert cfg.training.effective_batch_size == 32
-    assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert cfg.training.align_epochs == 6
-    assert cfg.training.finetune_epochs == 6
-    assert cfg.training.align_max_steps is None
-    assert cfg.training.finetune_max_steps is None
-    assert cfg.training.progress_log_every_steps == 50
-    assert cfg.training.max_grad_norm == 1.0
-    assert cfg.generation.max_new_tokens == 512
-    assert cfg.generation.num_beams == 3
-    assert cfg.generation.early_stopping is True
-    assert cfg.generation.length_penalty == 1.0
-    assert cfg.evaluation.eval_batch_size == 16
-    assert cfg.evaluation.eval_progress_log_every_samples == 256
-    assert cfg.evaluation.benchmark_max_samples == 200
-    assert cfg.evaluation.benchmark_progress_log_every_samples == 20
-
-    assert safe_cfg.training.batch_size == 8
-    assert safe_cfg.runtime.precision == "fp32"
-    assert safe_cfg.training.gradient_accumulation_steps == 4
-    assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
-    assert safe_cfg.training.align_epochs == 6
-    assert safe_cfg.training.finetune_epochs == 6
-    assert safe_cfg.generation.max_new_tokens == 512
-    assert safe_cfg.generation.num_beams == 3
-    assert safe_cfg.evaluation.eval_batch_size == 16
-    assert safe_cfg.evaluation.benchmark_max_samples == 200
-
-
 def test_accelerate_is_declared_dependency():
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert "accelerate" in pyproject["project"]["dependencies"]
+
+
+def test_loads_t5_internal_pruning_ablation_configs():
+    a1 = load_config("configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml")
+    a2 = load_config("configs/repvit_t5_efficient_mini_internal_pruning_a2_per_view_uniform.yaml")
+    a3 = load_config("configs/repvit_t5_efficient_mini_internal_pruning_a3_ira.yaml")
+
+    assert {a1.model.pruning.selection_policy, a2.model.pruning.selection_policy, a3.model.pruning.selection_policy} == {
+        "global_topk",
+        "per_view_uniform",
+        "ira",
+    }
+    for cfg in (a1, a2, a3):
+        assert cfg.model.architecture == "t5_internal_pruning"
+        assert cfg.model.pruning.enabled is True
+        assert cfg.model.pruning.layer_policy == "middle"
+        assert cfg.model.pruning.layer_index is None
+        assert cfg.model.pruning.keep_ratio == 0.5
+        assert cfg.model.pruning.min_keep_per_view == 2
+        assert cfg.cache.dir == "outputs/repvit_t5_efficient_mini_internal_pruning_cache/cache"
+        assert cfg.data.view_order == CAMERA_ORDER
+        assert cfg.training.effective_batch_size == 4
 
 
 def test_rejects_non_canonical_view_order(tmp_path: Path):
@@ -96,6 +45,7 @@ data:
   view_order: [Front, Back]
 model:
   profile: bad
+  architecture: t5_internal_pruning
   vision:
     name: repvit_m1_5
     model_id: timm/repvit_m1_5.dist_450e_in1k
@@ -116,8 +66,8 @@ training:
         load_config(config_path)
 
 
-def test_rejects_unknown_gpa_conditioning(tmp_path: Path):
-    config_path = tmp_path / "bad_gpa.yaml"
+def test_rejects_non_pruning_architecture(tmp_path: Path):
+    config_path = tmp_path / "bad_architecture.yaml"
     config_path.write_text(
         """
 project:
@@ -127,7 +77,7 @@ data:
   view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
 model:
   profile: bad
-  gpa_conditioning: concat
+  architecture: legacy_baseline
   vision:
     name: repvit_m1_5
     model_id: timm/repvit_m1_5.dist_450e_in1k
@@ -144,5 +94,39 @@ training:
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="gpa_conditioning"):
+    with pytest.raises(ValueError, match="t5_internal_pruning"):
+        load_config(config_path)
+
+
+def test_rejects_unknown_pruning_selection_policy(tmp_path: Path):
+    config_path = tmp_path / "bad_policy.yaml"
+    config_path.write_text(
+        """
+project:
+  output_dir: outputs
+data:
+  hf_repo_id: example/private
+  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
+model:
+  profile: bad
+  architecture: t5_internal_pruning
+  pruning:
+    selection_policy: camera_lottery
+  vision:
+    name: repvit_m1_5
+    model_id: timm/repvit_m1_5.dist_450e_in1k
+    output_dim: 512
+    seq_len: 49
+    image_size: 224
+  text:
+    model_id: google/t5-efficient-mini
+    d_model: 384
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 1
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="selection_policy"):
         load_config(config_path)

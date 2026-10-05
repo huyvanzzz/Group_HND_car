@@ -32,7 +32,7 @@ def set_trainable_for_stage(modules: nn.ModuleDict, cfg, stage: str) -> None:
     _set_module_trainable(modules["vision"], False)
     _set_module_trainable(modules["text"], stage == "finetune")
 
-    for name in ("gpa", "projector", "spatial_pos", "modal_embeddings"):
+    for name in ("projector", "spatial_pos", "modal_embeddings", "view_embeddings"):
         if name in modules:
             _set_module_trainable(modules[name], True)
 

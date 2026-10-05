@@ -9,7 +9,7 @@ from pathlib import Path
 
 def main() -> None:
     repo_url = os.environ.get("GITHUB_REPO_URL")
-    branch = os.environ.get("GITHUB_BRANCH", "nguyet")
+    branch = os.environ.get("GITHUB_BRANCH", "nguyet-t5-internal-mvpruner")
     target = Path("/kaggle/working/Efficient_VLM_For_Autonomous_Driving")
 
     if repo_url and not target.exists():
@@ -49,7 +49,8 @@ def main() -> None:
         print(f"torch env debug failed: {exc}")
     subprocess.call(["nvidia-smi"])
 
-    config = "configs/repvit_t5_efficient_tiny_smoke.yaml"
+    config = "configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml"
+    profile = "outputs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk"
     dbg = ["--debug", "--debug-samples", "3"]
     commands = [
         ["inspect-data", "--config", config, *dbg],
@@ -64,7 +65,7 @@ def main() -> None:
             "--stage",
             "finetune",
             "--resume",
-            "outputs/repvit_t5_efficient_tiny_smoke/checkpoints/align_latest.pt",
+            f"{profile}/checkpoints/align_latest.pt",
             "--max-steps",
             "20",
             *dbg,
@@ -74,7 +75,7 @@ def main() -> None:
             "--config",
             config,
             "--checkpoint",
-            "outputs/repvit_t5_efficient_tiny_smoke/checkpoints/finetune_latest.pt",
+            f"{profile}/checkpoints/finetune_latest.pt",
             "--max-samples",
             "32",
             "--batch-size",
@@ -88,7 +89,7 @@ def main() -> None:
             "--config",
             config,
             "--checkpoint",
-            "outputs/repvit_t5_efficient_tiny_smoke/checkpoints/finetune_latest.pt",
+            f"{profile}/checkpoints/finetune_latest.pt",
             "--max-samples",
             "32",
             "--progress-log-every-samples",
@@ -100,16 +101,16 @@ def main() -> None:
         subprocess.check_call([sys.executable, "-m", "efficient_vlm_ad", *command])
 
     print("\nSmoke run complete.")
-    print("For full training, open notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu.ipynb.")
+    print("For full training, run the A1/A2/A3 configs under configs/.")
     print("Core full-train commands:")
     print(
         "accelerate launch --multi_gpu --num_processes 2 --num_machines 1 --mixed_precision fp16 --dynamo_backend no "
-        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml --stage align"
+        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml --stage align"
     )
     print(
         "accelerate launch --multi_gpu --num_processes 2 --num_machines 1 --mixed_precision fp16 --dynamo_backend no "
-        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml "
-        "--stage finetune --resume outputs/repvit_t5_efficient_mini_kaggle_2gpu/checkpoints/align_best.pt"
+        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml "
+        "--stage finetune --resume outputs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk/checkpoints/align_best.pt"
     )
 
 

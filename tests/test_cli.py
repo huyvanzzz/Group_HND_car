@@ -14,7 +14,7 @@ def test_inspect_data_cli_outputs_safe_metadata():
             "efficient_vlm_ad",
             "inspect-data",
             "--config",
-            "configs/repvit_t5_efficient_tiny_smoke.yaml",
+            "configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml",
         ],
         check=True,
         capture_output=True,

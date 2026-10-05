@@ -1,18 +1,24 @@
 project:
-  output_dir: outputs/repvit_t5_efficient_mini_question_gpa
+  output_dir: outputs/repvit_t5_efficient_mini_internal_pruning_a3_ira
 data:
   hf_repo_id: minhdang0901/drivelm-nuscenes-v1-0
   revision: main
   view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
   expected_counts: {train: 341381, val: 19785, test: 16817}
 cache:
-  dir: outputs/repvit_t5_efficient_mini_question_gpa/cache
+  dir: outputs/repvit_t5_efficient_mini_internal_pruning_cache/cache
 runtime:
   device: auto
   precision: auto
 model:
-  profile: repvit_t5_efficient_mini_question_gpa
-  gpa_conditioning: question_gate
+  profile: repvit_t5_efficient_mini_internal_pruning_a3_ira
+  architecture: t5_internal_pruning
+  pruning:
+    enabled: true
+    layer_policy: middle
+    keep_ratio: 0.5
+    min_keep_per_view: 2
+    selection_policy: ira
   vision:
     name: repvit_m1_5
     model_id: timm/repvit_m1_5.dist_450e_in1k
@@ -30,9 +36,8 @@ training:
   learning_rate: 0.0001
   weight_decay: 0.05
   scheduler_gamma: 0.9
-  align_epochs: 6
-  finetune_epochs: 6
-  gpa_hidden_size: 128
+  align_epochs: 8
+  finetune_epochs: 10
   val_every_steps: 1000
   save_every_steps: 1000
 generation:

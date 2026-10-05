@@ -7,21 +7,21 @@ from efficient_vlm_ad.config import load_config
 
 
 def test_runtime_cache_and_generation_config_loaded():
-    cfg = load_config("configs/repvit_t5_efficient_tiny_smoke.yaml")
+    cfg = load_config("configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml")
 
     assert cfg.cache.dir.endswith("cache")
     assert cfg.runtime.precision == "auto"
     assert cfg.generation.max_new_tokens == 64
-    assert cfg.training.max_steps == 20
+    assert cfg.training.batch_size == 4
     assert cfg.data.expected_counts["train"] == 341381
 
 
 def test_full_generation_config_loaded():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
+    cfg = load_config("configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml")
 
-    assert cfg.generation.max_new_tokens == 512
-    assert cfg.generation.num_beams == 3
-    assert cfg.generation.early_stopping is True
+    assert cfg.generation.max_new_tokens == 64
+    assert cfg.generation.num_beams == 1
+    assert cfg.generation.early_stopping is False
     assert cfg.generation.length_penalty == 1.0
 
 
@@ -69,7 +69,7 @@ def test_accelerator_enables_unused_parameter_detection(monkeypatch):
     fake_accelerate.DistributedDataParallelKwargs = FakeDistributedDataParallelKwargs
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
 
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
+    cfg = load_config("configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml")
     pipeline._build_accelerator(cfg)
 
     assert captured["ddp_kwargs"] == {"find_unused_parameters": True}

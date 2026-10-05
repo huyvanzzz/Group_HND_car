@@ -1,13 +1,11 @@
-from .gpa import GatedPoolingAttention
 from .multimodal import MultiModalProjector, set_trainable_for_stage
+from .t5_internal_pruning import T5InternalPruningVLMForAD
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
-from .vlm import EfficientVLMForAD
 
 __all__ = [
-    "EfficientVLMForAD",
-    "GatedPoolingAttention",
     "LegacyVitPatchExtractor",
     "MultiModalProjector",
     "RepVitFeatureExtractor",
+    "T5InternalPruningVLMForAD",
     "set_trainable_for_stage",
 ]

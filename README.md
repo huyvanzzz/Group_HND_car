@@ -1,39 +1,54 @@
-# Efficient VLM For Autonomous Driving
+# Efficient VLM AD: T5 Internal Pruning Ablations
 
-Refactor workspace for EM-VLM4AD experiments on Kaggle.
+This branch is scoped to the T5-internal MVPruner-style pruning experiments:
 
-The original upstream code is kept unchanged in `em_vlm4ad/` as a reference. New code lives in
-`src/efficient_vlm_ad/` and is designed around config-driven profiles:
+- `configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml`
+- `configs/repvit_t5_efficient_mini_internal_pruning_a2_per_view_uniform.yaml`
+- `configs/repvit_t5_efficient_mini_internal_pruning_a3_ira.yaml`
 
-- `configs/legacy_vit_t5_base.yaml`: faithful ViT-B/32 patch-projection + T5-Base baseline.
-- `configs/repvit_t5_efficient_mini.yaml`: main RepViT-M1.5 + T5-Efficient-Mini profile.
-- `configs/repvit_t5_efficient_tiny_smoke.yaml`: quick smoke/debug profile.
+The GPA baseline is intentionally not kept on this branch. Use branch `nguyet` for the Question-GPA baseline.
 
-## Current Entrypoints
+For Kaggle training, use:
+
+```text
+notebooks/kaggle_train_t5_internal_mvpruner_ablations.ipynb
+```
+
+The notebook can switch between A1/A2/A3 with the `ABLATION` variable and keeps at most two downloadable checkpoint zip files under `/kaggle/working/checkpoint_zips`.
+
+## Entrypoints
 
 ```bash
-python -m efficient_vlm_ad inspect-data --config configs/repvit_t5_efficient_mini.yaml
-python -m efficient_vlm_ad prepare-data --config configs/repvit_t5_efficient_mini.yaml
-python -m efficient_vlm_ad prepare-features --config configs/repvit_t5_efficient_mini.yaml
-python -m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini.yaml --stage align
-python -m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini.yaml --stage finetune --resume CHECKPOINT
-python -m efficient_vlm_ad evaluate --config configs/repvit_t5_efficient_mini.yaml --checkpoint CHECKPOINT
-python -m efficient_vlm_ad benchmark --config configs/repvit_t5_efficient_mini.yaml --checkpoint CHECKPOINT
+python -m efficient_vlm_ad inspect-data --config configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml
+python -m efficient_vlm_ad prepare-data --config configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml
+python -m efficient_vlm_ad prepare-features --config configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml
+
+python -m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml --stage align
+python -m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_internal_pruning_a2_per_view_uniform.yaml --stage align
+python -m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_internal_pruning_a3_ira.yaml --stage align
 ```
+
+Use each experiment's own align checkpoint for finetune:
+
+```bash
+python -m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml --stage finetune --resume outputs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk/checkpoints/align_best.pt
+```
+
+## Notes
+
+All three configs share:
+
+```yaml
+architecture: t5_internal_pruning
+pruning:
+  layer_policy: middle
+  keep_ratio: 0.5
+  min_keep_per_view: 2
+```
+
+Only `selection_policy` changes across A1/A2/A3. See `docs/research/t5-internal-mvpruner-ablation-design.md` for the experiment design.
 
 `HF_TOKEN` must come from the environment. Do not put it in YAML, CLI args, notebooks, or Git.
-
-## Kaggle
-
-On Kaggle, store the Hugging Face token as a secret named `HF_TOKEN`, set `GITHUB_REPO_URL`, and run:
-
-```bash
-python scripts/kaggle_bootstrap.py
-```
-
-The bootstrap clones branch `huy`, installs the package editable, reads the Kaggle secret, and runs
-the smoke sequence. For a full run, use the Mini config and remove `--subset smoke`,
-`--max-steps`, and `--max-samples`.
 
 ## Verification
 

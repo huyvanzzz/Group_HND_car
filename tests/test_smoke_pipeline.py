@@ -52,7 +52,6 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 2
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -176,7 +175,6 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 2
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -218,7 +216,6 @@ training:
   gradient_accumulation_steps: 1
   align_epochs: 2
   finetune_epochs: 2
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -282,7 +279,6 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 1
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -298,7 +294,6 @@ generation:
         def __init__(self):
             super().__init__()
             self.text_model = torch.nn.Linear(1, 1)
-            self.gpa = torch.nn.Linear(1, 1)
             self.projector = torch.nn.Linear(1, 1)
             self.modal_embeddings = torch.nn.Embedding(2, 1)
             self.row_embeddings = None

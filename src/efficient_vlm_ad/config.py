@@ -60,11 +60,22 @@ class TextConfig:
 
 
 @dataclass(frozen=True)
+class PruningConfig:
+    enabled: bool = False
+    layer_policy: str = "middle"
+    layer_index: int | None = None
+    keep_ratio: float = 0.5
+    min_keep_per_view: int = 2
+    selection_policy: str = "global_topk"
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     profile: str
     vision: VisionConfig
     text: TextConfig
-    gpa_conditioning: str = "none"
+    architecture: str = "t5_internal_pruning"
+    pruning: PruningConfig = field(default_factory=PruningConfig)
 
 
 @dataclass(frozen=True)
@@ -76,7 +87,6 @@ class TrainingConfig:
     scheduler_gamma: float = 0.9
     align_epochs: int = 6
     finetune_epochs: int = 6
-    gpa_hidden_size: int = 128
     max_steps: int | None = None
     align_max_steps: int | None = None
     finetune_max_steps: int | None = None
@@ -136,9 +146,27 @@ def load_config(path: str | Path) -> ExperimentConfig:
     model_raw = _require(raw, "model")
     vision_raw = _require(model_raw, "vision")
     text_raw = _require(model_raw, "text")
-    gpa_conditioning = str(model_raw.get("gpa_conditioning", "none"))
-    if gpa_conditioning not in {"none", "question_gate"}:
-        raise ValueError("model.gpa_conditioning must be one of: none, question_gate")
+    architecture = str(model_raw.get("architecture", "t5_internal_pruning"))
+    if architecture != "t5_internal_pruning":
+        raise ValueError("model.architecture must be: t5_internal_pruning")
+    pruning_raw = model_raw.get("pruning") or {}
+    pruning_selection_policy = str(pruning_raw.get("selection_policy", "global_topk"))
+    if pruning_selection_policy not in {"global_topk", "per_view_uniform", "ira"}:
+        raise ValueError("model.pruning.selection_policy must be one of: global_topk, per_view_uniform, ira")
+    pruning_layer_policy = str(pruning_raw.get("layer_policy", "middle"))
+    if pruning_layer_policy not in {"middle", "index"}:
+        raise ValueError("model.pruning.layer_policy must be one of: middle, index")
+    pruning_layer_index = pruning_raw.get("layer_index")
+    if pruning_layer_index is not None:
+        pruning_layer_index = int(pruning_layer_index)
+        if pruning_layer_index < 0:
+            raise ValueError("model.pruning.layer_index must be >= 0")
+    pruning_keep_ratio = float(pruning_raw.get("keep_ratio", 0.5))
+    if not 0.0 < pruning_keep_ratio <= 1.0:
+        raise ValueError("model.pruning.keep_ratio must be in the range (0, 1]")
+    pruning_min_keep_per_view = int(pruning_raw.get("min_keep_per_view", 2))
+    if pruning_min_keep_per_view < 0:
+        raise ValueError("model.pruning.min_keep_per_view must be >= 0")
     train_raw = _require(raw, "training")
     cache_raw = raw.get("cache", {})
     runtime_raw = raw.get("runtime", {})
@@ -173,7 +201,15 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 revision=text_raw.get("revision"),
                 d_model=int(_require(text_raw, "d_model")),
             ),
-            gpa_conditioning=gpa_conditioning,
+            architecture=architecture,
+            pruning=PruningConfig(
+                enabled=bool(pruning_raw.get("enabled", True)),
+                layer_policy=pruning_layer_policy,
+                layer_index=pruning_layer_index,
+                keep_ratio=pruning_keep_ratio,
+                min_keep_per_view=pruning_min_keep_per_view,
+                selection_policy=pruning_selection_policy,
+            ),
         ),
         training=TrainingConfig(
             batch_size=int(_require(train_raw, "batch_size")),
@@ -183,7 +219,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
             scheduler_gamma=float(train_raw.get("scheduler_gamma", 0.9)),
             align_epochs=int(train_raw.get("align_epochs", 6)),
             finetune_epochs=int(train_raw.get("finetune_epochs", 6)),
-            gpa_hidden_size=int(train_raw.get("gpa_hidden_size", 128)),
             max_steps=int(train_raw["max_steps"]) if train_raw.get("max_steps") is not None else None,
             align_max_steps=int(train_raw["align_max_steps"]) if train_raw.get("align_max_steps") is not None else None,
             finetune_max_steps=int(train_raw["finetune_max_steps"]) if train_raw.get("finetune_max_steps") is not None else None,
