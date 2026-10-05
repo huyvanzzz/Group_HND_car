@@ -186,6 +186,55 @@ class T5InternalPruningVLMForAD(nn.Module):
                 position_bias = item
         return position_bias, attention
 
+    def _compute_t5_self_attention(
+        self,
+        block: nn.Module,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_bias: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        self_attention_layer = getattr(block, "layer", [None])[0]
+        self_attention = getattr(self_attention_layer, "SelfAttention", None)
+        layer_norm = getattr(self_attention_layer, "layer_norm", None)
+        if self_attention is None or layer_norm is None:
+            return None
+        if not all(hasattr(self_attention, name) for name in ("q", "k")):
+            return None
+
+        normed_states = layer_norm(hidden_states)
+        batch, sequence_length = normed_states.shape[:2]
+        heads = getattr(self_attention, "n_heads", None)
+        key_dim = getattr(self_attention, "key_value_proj_dim", None)
+        if heads is None or key_dim is None:
+            return None
+
+        def project(module: nn.Module) -> torch.Tensor:
+            projected = module(normed_states)
+            projected = projected.view(batch, sequence_length, heads, key_dim)
+            return projected.transpose(1, 2)
+
+        query_states = project(self_attention.q)
+        key_states = project(self_attention.k)
+        scores = torch.matmul(query_states, key_states.transpose(3, 2))
+
+        if position_bias is None:
+            if hasattr(self_attention, "compute_bias"):
+                position_bias = self_attention.compute_bias(
+                    sequence_length,
+                    sequence_length,
+                    device=hidden_states.device,
+                )
+            else:
+                position_bias = torch.zeros(
+                    (1, heads, sequence_length, sequence_length),
+                    dtype=scores.dtype,
+                    device=hidden_states.device,
+                )
+            position_bias = position_bias + attention_mask
+
+        scores = scores + position_bias.to(dtype=scores.dtype, device=scores.device)
+        return torch.softmax(scores.float(), dim=-1).to(dtype=hidden_states.dtype)
+
     def _select_global_topk(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch = scores.shape[0]
         keep = self._keep_count()
@@ -304,6 +353,7 @@ class T5InternalPruningVLMForAD(nn.Module):
         extended_mask = encoder.get_extended_attention_mask(combined_mask, hidden_states.shape[:2])
         for idx, block in enumerate(blocks):
             capture = idx == pruning_layer
+            block_input = hidden_states
             outputs = block(
                 hidden_states,
                 attention_mask=extended_mask,
@@ -319,6 +369,8 @@ class T5InternalPruningVLMForAD(nn.Module):
                 capture_attention=capture,
             )
             if capture:
+                if attention is None:
+                    attention = self._compute_t5_self_attention(block, block_input, extended_mask, position_bias)
                 if attention is None:
                     raise RuntimeError(
                         "T5 internal pruning requires encoder self-attention weights. "
