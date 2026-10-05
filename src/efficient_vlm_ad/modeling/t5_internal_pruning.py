@@ -165,6 +165,27 @@ class T5InternalPruningVLMForAD(nn.Module):
         )
         return (text_attention * text_mask).sum(dim=(1, 2)) / text_mask.sum(dim=(1, 2)).clamp_min(1.0)
 
+    def _parse_t5_block_outputs(
+        self,
+        outputs: tuple,
+        *,
+        batch_size: int,
+        sequence_length: int,
+        capture_attention: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        position_bias = None
+        attention = None
+        for item in outputs[1:]:
+            if not isinstance(item, torch.Tensor) or item.ndim != 4:
+                continue
+            if item.shape[-2:] != (sequence_length, sequence_length):
+                continue
+            if capture_attention and item.shape[0] == batch_size:
+                attention = item
+            elif position_bias is None:
+                position_bias = item
+        return position_bias, attention
+
     def _select_global_topk(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch = scores.shape[0]
         keep = self._keep_count()
@@ -291,9 +312,13 @@ class T5InternalPruningVLMForAD(nn.Module):
                 output_attentions=capture,
             )
             hidden_states = outputs[0]
-            position_bias = outputs[1]
+            position_bias, attention = self._parse_t5_block_outputs(
+                outputs,
+                batch_size=hidden_states.shape[0],
+                sequence_length=hidden_states.shape[1],
+                capture_attention=capture,
+            )
             if capture:
-                attention = outputs[2]
                 if attention is None:
                     raise RuntimeError(
                         "T5 internal pruning requires encoder self-attention weights. "
