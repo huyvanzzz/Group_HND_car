@@ -31,7 +31,10 @@ def test_loads_t5_internal_pruning_ablation_configs():
         assert cfg.model.pruning.min_keep_per_view == 2
         assert cfg.cache.dir == "outputs/repvit_t5_efficient_mini_internal_pruning_cache/cache"
         assert cfg.data.view_order == CAMERA_ORDER
-        assert cfg.training.effective_batch_size == 4
+        assert cfg.training.batch_size == 16
+        assert cfg.training.gradient_accumulation_steps == 1
+        assert cfg.training.effective_batch_size == 16
+        assert cfg.training.effective_batch_size_for_processes(2) == 32
 
 
 def test_rejects_non_canonical_view_order(tmp_path: Path):

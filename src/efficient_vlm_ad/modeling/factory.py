@@ -131,7 +131,18 @@ def build_text_and_tokenizer(cfg):
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
-    model = AutoModelForSeq2SeqLM.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
+    try:
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            cfg.model.text.model_id,
+            revision=cfg.model.text.revision,
+            attn_implementation="eager",
+        )
+    except TypeError:
+        model = AutoModelForSeq2SeqLM.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
+        if hasattr(model.config, "_attn_implementation"):
+            model.config._attn_implementation = "eager"
+        if hasattr(model.config, "attn_implementation"):
+            model.config.attn_implementation = "eager"
     return model, tokenizer
 
 

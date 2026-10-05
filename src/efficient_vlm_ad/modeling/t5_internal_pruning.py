@@ -294,6 +294,11 @@ class T5InternalPruningVLMForAD(nn.Module):
             position_bias = outputs[1]
             if capture:
                 attention = outputs[2]
+                if attention is None:
+                    raise RuntimeError(
+                        "T5 internal pruning requires encoder self-attention weights. "
+                        "Load the text model with attn_implementation='eager'."
+                    )
                 scores = self._scores_from_attention(attention, attention_mask)
                 hidden_states, combined_mask = self._compact(hidden_states, attention_mask, scores)
                 position_bias = None

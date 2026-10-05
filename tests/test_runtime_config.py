@@ -12,7 +12,7 @@ def test_runtime_cache_and_generation_config_loaded():
     assert cfg.cache.dir.endswith("cache")
     assert cfg.runtime.precision == "auto"
     assert cfg.generation.max_new_tokens == 64
-    assert cfg.training.batch_size == 4
+    assert cfg.training.batch_size == 16
     assert cfg.data.expected_counts["train"] == 341381
 
 
