@@ -31,7 +31,7 @@ model:
     revision: af3816c2dbd386f7786f7757c536f0314084ff8b
     d_model: 384
 training:
-  batch_size: 4
+  batch_size: 16
   gradient_accumulation_steps: 1
   learning_rate: 0.0001
   weight_decay: 0.05
