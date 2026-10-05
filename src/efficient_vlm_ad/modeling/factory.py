@@ -186,6 +186,9 @@ def build_visual_fusion(cfg):
             tau_min=cfg.model.fusion.tau_min,
             diversity_weight=cfg.model.fusion.diversity_weight,
             eps=cfg.model.fusion.eps,
+            score_norm=cfg.model.fusion.score_norm,
+            selected_norm=cfg.model.fusion.selected_norm,
+            norm_eps=cfg.model.fusion.norm_eps,
         )
     raise ValueError(f"Unknown fusion: {cfg.model.fusion.name}")
 

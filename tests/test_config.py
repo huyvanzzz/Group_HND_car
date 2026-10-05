@@ -83,18 +83,21 @@ def test_loads_kaggle_di_adapter_profiles():
 def test_loads_kaggle_router_profile():
     cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router.yaml")
 
-    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router"
+    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router_norm_k49"
     assert cfg.model.fusion.name == "question_guided_router"
     assert cfg.model.fusion.top_k == 49
     assert cfg.model.fusion.diversity_weight == 0.001
     assert cfg.model.fusion.tau_start == 2.0
     assert cfg.model.fusion.tau_min == 0.5
+    assert cfg.model.fusion.score_norm is True
+    assert cfg.model.fusion.selected_norm is True
+    assert cfg.model.fusion.norm_eps == 1.0e-5
     assert cfg.training.vision_training == "feature_cache"
     assert cfg.training.batch_size == 16
     assert cfg.training.gradient_accumulation_steps == 2
     assert cfg.training.effective_batch_size_for_processes(2) == 64
     assert cfg.training.align_epochs == 8
-    assert cfg.training.finetune_epochs == 8
+    assert cfg.training.finetune_epochs == 10
     assert cfg.runtime.precision == "fp32"
     assert cfg.generation.max_new_tokens == 512
     assert cfg.generation.num_beams == 3

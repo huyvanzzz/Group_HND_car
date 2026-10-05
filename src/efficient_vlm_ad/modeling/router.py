@@ -44,6 +44,9 @@ class QuestionGuidedTokenRouter(nn.Module):
         tau_min: float = 0.5,
         diversity_weight: float = 0.001,
         eps: float = 1e-8,
+        score_norm: bool = True,
+        selected_norm: bool = True,
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         if top_k <= 0:
@@ -60,6 +63,8 @@ class QuestionGuidedTokenRouter(nn.Module):
         self.question_pooler = QuestionAttentionPooler(text_dim)
         self.camera_embeddings = nn.Embedding(num_views, vision_dim)
         self.film = nn.Sequential(nn.Linear(text_dim, vision_dim * 2), nn.GELU(), nn.Linear(vision_dim * 2, vision_dim * 2))
+        self.pre_score_norm: nn.Module = nn.LayerNorm(vision_dim, eps=norm_eps) if score_norm else nn.Identity()
+        self.selected_norm: nn.Module = nn.LayerNorm(vision_dim, eps=norm_eps) if selected_norm else nn.Identity()
         self.scorer = nn.Linear(vision_dim, 1)
         self.register_buffer("tau_start", torch.tensor(float(tau_start), dtype=torch.float32))
         self.register_buffer("tau_min", torch.tensor(float(tau_min), dtype=torch.float32))
@@ -151,7 +156,8 @@ class QuestionGuidedTokenRouter(nn.Module):
         question, question_weights = self.question_pooler(text_tokens, attention_mask)
         gamma, beta = self.film(question).chunk(2, dim=-1)
         routed = flat * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-        scores = self.scorer(routed).squeeze(-1)
+        score_tokens = self.pre_score_norm(routed)
+        scores = self.scorer(score_tokens).squeeze(-1)
         if return_debug and scores.requires_grad:
             scores.retain_grad()
         ste_mask, topk_idx, soft_khot, hard_khot = self.relaxed_khot(
@@ -160,7 +166,8 @@ class QuestionGuidedTokenRouter(nn.Module):
             mask_dtype=visual_features.dtype,
         )
         masked_visual = routed * ste_mask.unsqueeze(-1)
-        selected = _batched_gather_tokens(masked_visual, topk_idx).to(dtype=visual_features.dtype)
+        selected_before_norm = _batched_gather_tokens(masked_visual, topk_idx)
+        selected = self.selected_norm(selected_before_norm).to(dtype=visual_features.dtype)
         diversity_raw = self._diversity_loss(selected)
         diversity_weighted = diversity_raw * self.diversity_weight
         camera_ids = topk_idx // self.seq_len
@@ -169,10 +176,14 @@ class QuestionGuidedTokenRouter(nn.Module):
             dim=0,
         ).to(device=topk_idx.device)
         debug = {
+            "routed_tokens_before_norm": routed,
+            "routed_tokens_after_score_norm": score_tokens,
             "scores": scores,
             "ste_mask": ste_mask,
             "soft_khot": soft_khot,
             "hard_khot": hard_khot,
+            "selected_tokens_before_norm": selected_before_norm,
+            "selected_tokens_after_norm": selected,
             "selected_indices": topk_idx,
             "camera_histogram": histogram,
             "question_attention": question_weights,
@@ -194,6 +205,21 @@ def router_debug_payload(router: QuestionGuidedTokenRouter) -> dict[str, Any]:
 
     def _round_list(values: torch.Tensor) -> list:
         return values.detach().cpu().tolist()
+
+    def _stats(values: torch.Tensor) -> dict[str, Any]:
+        tensor = values.detach().float()
+        return {
+            "shape": list(values.shape),
+            "dtype": str(values.dtype),
+            "device": str(values.device),
+            "finite": bool(torch.isfinite(tensor).all().item()),
+            "nan_count": int(torch.isnan(tensor).sum().item()),
+            "inf_count": int(torch.isinf(tensor).sum().item()),
+            "min": float(tensor.min().item()),
+            "max": float(tensor.max().item()),
+            "mean": float(tensor.mean().item()),
+            "std": float(tensor.std(unbiased=False).item()),
+        }
 
     payload: dict[str, Any] = {
         "tau": debug.get("tau"),
@@ -221,6 +247,14 @@ def router_debug_payload(router: QuestionGuidedTokenRouter) -> dict[str, Any]:
             "mean": float(scores.mean().item()),
             "std": float(scores.std(unbiased=False).item()),
         }
+    for name in (
+        "routed_tokens_before_norm",
+        "routed_tokens_after_score_norm",
+        "selected_tokens_before_norm",
+        "selected_tokens_after_norm",
+    ):
+        if name in debug:
+            payload[name] = _stats(debug[name])
     if "soft_khot" in debug:
         soft = debug["soft_khot"].detach().float()
         payload["soft_khot_stats"] = {

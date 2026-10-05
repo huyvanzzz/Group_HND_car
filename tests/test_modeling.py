@@ -186,6 +186,36 @@ def test_router_uses_fp32_relaxed_khot_ste_and_native_gather():
     assert non_selected_grad.abs().sum() > 0
 
 
+def test_router_layer_norm_stabilizes_score_and_selected_tokens():
+    torch.manual_seed(0)
+    router = QuestionGuidedTokenRouter(
+        vision_dim=8,
+        text_dim=6,
+        seq_len=4,
+        num_views=6,
+        top_k=5,
+        score_norm=True,
+        selected_norm=True,
+        norm_eps=1e-5,
+    )
+    visual = torch.randn(2, 6, 4, 8) * 1000
+    text = torch.randn(2, 7, 6) * 100
+    attention_mask = torch.ones(2, 7, dtype=torch.long)
+
+    selected, report = router(visual, text, attention_mask, training=False, return_debug=True)
+
+    assert selected.shape == (2, 5, 8)
+    assert torch.isfinite(selected).all()
+    assert "routed_tokens_before_norm" in report
+    assert "routed_tokens_after_score_norm" in report
+    assert "selected_tokens_before_norm" in report
+    assert "selected_tokens_after_norm" in report
+    per_token_mean = selected.float().mean(dim=-1)
+    per_token_std = selected.float().std(dim=-1, unbiased=False)
+    assert torch.allclose(per_token_mean, torch.zeros_like(per_token_mean), atol=1e-4)
+    assert torch.allclose(per_token_std, torch.ones_like(per_token_std), atol=1e-3)
+
+
 def test_router_eval_is_deterministic_and_tau_decay_uses_optimizer_steps():
     router = QuestionGuidedTokenRouter(
         vision_dim=8,
@@ -250,6 +280,10 @@ def test_router_model_forward_reports_router_numerics():
     assert torch.isfinite(output.loss)
     assert torch.isfinite(output.diversity_loss_raw)
     assert report["router_selected_tokens"]["finite"] is True
+    assert report["router"]["routed_tokens_before_norm"]["finite"] is True
+    assert report["router"]["routed_tokens_after_score_norm"]["finite"] is True
+    assert report["router"]["selected_tokens_before_norm"]["finite"] is True
+    assert report["router"]["selected_tokens_after_norm"]["finite"] is True
     assert report["router"]["hard_khot_sum"] == [4.0]
     assert report["router"]["camera_histogram"][0] and sum(report["router"]["camera_histogram"][0]) == 4
 

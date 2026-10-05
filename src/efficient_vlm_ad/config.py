@@ -75,6 +75,9 @@ class FusionConfig:
     tau_start: float = 2.0
     tau_min: float = 0.5
     eps: float = 1e-8
+    score_norm: bool = True
+    selected_norm: bool = True
+    norm_eps: float = 1e-5
 
 
 @dataclass(frozen=True)
@@ -217,6 +220,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 tau_start=float(fusion_raw.get("tau_start", 2.0)),
                 tau_min=float(fusion_raw.get("tau_min", 0.5)),
                 eps=float(fusion_raw.get("eps", 1e-8)),
+                score_norm=bool(fusion_raw.get("score_norm", True)),
+                selected_norm=bool(fusion_raw.get("selected_norm", True)),
+                norm_eps=float(fusion_raw.get("norm_eps", 1e-5)),
             ),
         ),
         training=TrainingConfig(
