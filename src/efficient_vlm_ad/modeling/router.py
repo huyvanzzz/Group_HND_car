@@ -31,6 +31,40 @@ class QuestionAttentionPooler(nn.Module):
         return question, weights
 
 
+class VisualSelfAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim: int,
+        num_heads: int = 4,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+        residual_scale: float = 1e-2,
+    ) -> None:
+        super().__init__()
+        hidden_dim = max(1, int(dim * float(mlp_ratio)))
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+        )
+        self.dropout2 = nn.Dropout(dropout)
+        self.gamma_1 = nn.Parameter(float(residual_scale) * torch.ones(dim))
+        self.gamma_2 = nn.Parameter(float(residual_scale) * torch.ones(dim))
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        normed = self.norm1(tokens)
+        attn_out, _ = self.attn(normed, normed, normed, need_weights=False)
+        tokens = tokens + self.gamma_1 * self.dropout1(attn_out)
+        ffn_out = self.ffn(self.norm2(tokens))
+        return tokens + self.gamma_2 * self.dropout2(ffn_out)
+
+
 class QuestionGuidedTokenRouter(nn.Module):
     def __init__(
         self,
@@ -47,6 +81,11 @@ class QuestionGuidedTokenRouter(nn.Module):
         score_norm: bool = True,
         selected_norm: bool = True,
         norm_eps: float = 1e-5,
+        visual_self_attention_layers: int = 0,
+        visual_self_attention_heads: int = 4,
+        visual_self_attention_mlp_ratio: float = 2.0,
+        visual_self_attention_dropout: float = 0.0,
+        visual_self_attention_residual_scale: float = 1e-2,
     ) -> None:
         super().__init__()
         if top_k <= 0:
@@ -63,6 +102,18 @@ class QuestionGuidedTokenRouter(nn.Module):
         self.question_pooler = QuestionAttentionPooler(text_dim)
         self.camera_embeddings = nn.Embedding(num_views, vision_dim)
         self.film = nn.Sequential(nn.Linear(text_dim, vision_dim * 2), nn.GELU(), nn.Linear(vision_dim * 2, vision_dim * 2))
+        self.visual_self_attention = nn.ModuleList(
+            [
+                VisualSelfAttentionBlock(
+                    dim=vision_dim,
+                    num_heads=visual_self_attention_heads,
+                    mlp_ratio=visual_self_attention_mlp_ratio,
+                    dropout=visual_self_attention_dropout,
+                    residual_scale=visual_self_attention_residual_scale,
+                )
+                for _ in range(max(0, int(visual_self_attention_layers)))
+            ]
+        )
         self.pre_score_norm: nn.Module = nn.LayerNorm(vision_dim, eps=norm_eps) if score_norm else nn.Identity()
         self.selected_norm: nn.Module = nn.LayerNorm(vision_dim, eps=norm_eps) if selected_norm else nn.Identity()
         self.scorer = nn.Linear(vision_dim, 1)
@@ -156,7 +207,10 @@ class QuestionGuidedTokenRouter(nn.Module):
         question, question_weights = self.question_pooler(text_tokens, attention_mask)
         gamma, beta = self.film(question).chunk(2, dim=-1)
         routed = flat * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-        score_tokens = self.pre_score_norm(routed)
+        value_tokens = routed
+        for layer in self.visual_self_attention:
+            value_tokens = layer(value_tokens)
+        score_tokens = self.pre_score_norm(value_tokens)
         scores = self.scorer(score_tokens).squeeze(-1)
         if return_debug and scores.requires_grad:
             scores.retain_grad()
@@ -165,8 +219,9 @@ class QuestionGuidedTokenRouter(nn.Module):
             training=use_training,
             mask_dtype=visual_features.dtype,
         )
-        masked_visual = routed * ste_mask.unsqueeze(-1)
-        selected_before_norm = _batched_gather_tokens(masked_visual, topk_idx)
+        selected_value = _batched_gather_tokens(value_tokens, topk_idx)
+        selected_ste = torch.gather(ste_mask, dim=1, index=topk_idx).to(dtype=selected_value.dtype)
+        selected_before_norm = selected_value * selected_ste.unsqueeze(-1)
         selected = self.selected_norm(selected_before_norm).to(dtype=visual_features.dtype)
         diversity_raw = self._diversity_loss(selected)
         diversity_weighted = diversity_raw * self.diversity_weight
@@ -176,12 +231,16 @@ class QuestionGuidedTokenRouter(nn.Module):
             dim=0,
         ).to(device=topk_idx.device)
         debug = {
-            "routed_tokens_before_norm": routed,
+            "tokens_after_film": routed,
+            "tokens_after_visual_self_attention": value_tokens,
+            "routed_tokens_before_norm": value_tokens,
             "routed_tokens_after_score_norm": score_tokens,
             "scores": scores,
             "ste_mask": ste_mask,
             "soft_khot": soft_khot,
             "hard_khot": hard_khot,
+            "selected_value_tokens": selected_value,
+            "selected_ste": selected_ste,
             "selected_tokens_before_norm": selected_before_norm,
             "selected_tokens_after_norm": selected,
             "selected_indices": topk_idx,
@@ -248,8 +307,12 @@ def router_debug_payload(router: QuestionGuidedTokenRouter) -> dict[str, Any]:
             "std": float(scores.std(unbiased=False).item()),
         }
     for name in (
+        "tokens_after_film",
+        "tokens_after_visual_self_attention",
         "routed_tokens_before_norm",
         "routed_tokens_after_score_norm",
+        "selected_value_tokens",
+        "selected_ste",
         "selected_tokens_before_norm",
         "selected_tokens_after_norm",
     ):

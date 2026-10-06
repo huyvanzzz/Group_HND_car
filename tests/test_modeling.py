@@ -5,7 +5,7 @@ from efficient_vlm_ad.modeling.adapters import DynamicInstructionAdapter
 from efficient_vlm_ad.modeling.gpa import GatedPoolingAttention
 from efficient_vlm_ad.modeling.factory import FakeVisionEncoder, build_end_to_end_vlm_model, build_vlm_model
 from efficient_vlm_ad.modeling.multimodal import MultiModalProjector, set_trainable_for_stage
-from efficient_vlm_ad.modeling.router import QuestionGuidedTokenRouter, compute_tau_decay
+from efficient_vlm_ad.modeling.router import QuestionGuidedTokenRouter, VisualSelfAttentionBlock, compute_tau_decay
 
 
 def test_gpa_preserves_token_grid_and_returns_view_weights():
@@ -186,7 +186,7 @@ def test_router_uses_fp32_relaxed_khot_ste_and_native_gather():
     assert non_selected_grad.abs().sum() > 0
 
 
-def test_router_layer_norm_stabilizes_score_and_selected_tokens():
+def test_router_without_layer_norms_preserves_raw_selected_token_scale():
     torch.manual_seed(0)
     router = QuestionGuidedTokenRouter(
         vision_dim=8,
@@ -194,8 +194,8 @@ def test_router_layer_norm_stabilizes_score_and_selected_tokens():
         seq_len=4,
         num_views=6,
         top_k=5,
-        score_norm=True,
-        selected_norm=True,
+        score_norm=False,
+        selected_norm=False,
         norm_eps=1e-5,
     )
     visual = torch.randn(2, 6, 4, 8) * 1000
@@ -210,10 +210,75 @@ def test_router_layer_norm_stabilizes_score_and_selected_tokens():
     assert "routed_tokens_after_score_norm" in report
     assert "selected_tokens_before_norm" in report
     assert "selected_tokens_after_norm" in report
-    per_token_mean = selected.float().mean(dim=-1)
+    assert torch.allclose(report["routed_tokens_before_norm"], report["routed_tokens_after_score_norm"])
+    assert torch.allclose(report["selected_tokens_before_norm"], report["selected_tokens_after_norm"])
     per_token_std = selected.float().std(dim=-1, unbiased=False)
-    assert torch.allclose(per_token_mean, torch.zeros_like(per_token_mean), atol=1e-4)
-    assert torch.allclose(per_token_std, torch.ones_like(per_token_std), atol=1e-3)
+    assert per_token_std.mean() > 10.0
+
+
+def test_visual_self_attention_block_preserves_shape_and_uses_layerscale():
+    torch.manual_seed(0)
+    block = VisualSelfAttentionBlock(dim=8, num_heads=2, mlp_ratio=2.0, dropout=0.0, residual_scale=1.0e-2)
+    tokens = torch.randn(2, 24, 8, requires_grad=True)
+
+    out = block(tokens)
+    loss = out.float().pow(2).mean()
+    loss.backward()
+
+    assert out.shape == tokens.shape
+    assert torch.isfinite(out).all()
+    assert not torch.allclose(out, tokens)
+    assert block.gamma_1.shape == (8,)
+    assert block.gamma_2.shape == (8,)
+    assert torch.allclose(block.gamma_1.detach(), torch.full((8,), 1.0e-2))
+    assert torch.allclose(block.gamma_2.detach(), torch.full((8,), 1.0e-2))
+    assert block.gamma_1.grad is not None and block.gamma_1.grad.abs().sum() > 0
+    assert block.gamma_2.grad is not None and block.gamma_2.grad.abs().sum() > 0
+
+
+def test_router_vsa_uses_score_norm_only_and_gather_first_selection():
+    torch.manual_seed(0)
+    router = QuestionGuidedTokenRouter(
+        vision_dim=8,
+        text_dim=6,
+        seq_len=4,
+        num_views=6,
+        top_k=5,
+        score_norm=True,
+        selected_norm=False,
+        visual_self_attention_layers=1,
+        visual_self_attention_heads=2,
+        visual_self_attention_mlp_ratio=2.0,
+        visual_self_attention_dropout=0.0,
+        visual_self_attention_residual_scale=1.0e-2,
+    )
+    visual = (torch.randn(2, 6, 4, 8) * 100).requires_grad_(True)
+    text = torch.randn(2, 7, 6)
+    attention_mask = torch.ones(2, 7, dtype=torch.long)
+
+    selected, report = router(visual, text, attention_mask, training=True, return_debug=True)
+    selected.sum().backward()
+
+    assert selected.shape == (2, 5, 8)
+    assert "tokens_after_film" in report
+    assert "tokens_after_visual_self_attention" in report
+    assert "selected_value_tokens" in report
+    assert "selected_ste" in report
+    assert torch.isfinite(report["tokens_after_visual_self_attention"]).all()
+    assert report["selected_ste"].dtype == selected.dtype
+    assert torch.allclose(report["selected_tokens_before_norm"], report["selected_value_tokens"] * report["selected_ste"].unsqueeze(-1))
+    score_mean = report["routed_tokens_after_score_norm"].float().mean(dim=-1)
+    score_std = report["routed_tokens_after_score_norm"].float().std(dim=-1, unbiased=False)
+    assert torch.allclose(score_mean, torch.zeros_like(score_mean), atol=1e-4)
+    assert torch.allclose(score_std, torch.ones_like(score_std), atol=1e-3)
+    selected_mean = selected.detach().float().mean(dim=-1).abs().mean()
+    assert selected_mean > 1.0
+    assert router.scorer.weight.grad is not None
+    assert router.scorer.weight.grad.abs().sum() > 0
+    non_selected_grad = report["scores"].grad[report["hard_khot"] == 0]
+    assert non_selected_grad.abs().sum() > 0
+    assert router.visual_self_attention[0].gamma_1.grad is not None
+    assert router.visual_self_attention[0].gamma_1.grad.abs().sum() > 0
 
 
 def test_router_eval_is_deterministic_and_tau_decay_uses_optimizer_steps():

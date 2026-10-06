@@ -45,6 +45,18 @@ def test_refactor_notebook_was_removed_to_avoid_stale_entrypoint():
     assert not Path("notebooks/kaggle_run_em_vlm4ad_refactor.ipynb").exists()
 
 
+def test_router_base_notebooks_are_no_norm_entrypoints():
+    debug_source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router.ipynb")
+    full_source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router.ipynb")
+
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router.yaml" in debug_source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_safe.yaml" in full_source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_k49" in debug_source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_k49" in full_source
+    assert "router_norm_k49" not in debug_source
+    assert "router_norm_k49" not in full_source
+
+
 def test_end_to_end_debug_notebook_exercises_raw_image_training_path():
     source = _notebook_source("notebooks/kaggle_e2e_debug_repvit_t5_efficient_mini_2gpu.ipynb")
 
@@ -117,9 +129,9 @@ def test_di_adapter_full_notebook_runs_full_epochs_without_smoke_limits():
 
 
 def test_router_debug_notebook_exercises_cached_feature_router_path():
-    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router.ipynb")
+    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router_vsa_k49.ipynb")
 
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router.yaml" in source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
     assert "prepare-features" in source
     assert "diagnose-train" in source
     assert "--debug-numerics" in source
@@ -132,10 +144,10 @@ def test_router_debug_notebook_exercises_cached_feature_router_path():
 
 
 def test_router_full_notebook_runs_full_epochs_without_smoke_limits():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router.ipynb")
+    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router_vsa_k49.ipynb")
 
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_safe.yaml" in source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_safe.yaml" in source
     assert "prepare-data --config" in source
     assert "prepare-features --config" in source
     assert "accelerate launch" in source

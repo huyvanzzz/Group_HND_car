@@ -189,6 +189,11 @@ def build_visual_fusion(cfg):
             score_norm=cfg.model.fusion.score_norm,
             selected_norm=cfg.model.fusion.selected_norm,
             norm_eps=cfg.model.fusion.norm_eps,
+            visual_self_attention_layers=cfg.model.fusion.visual_self_attention_layers,
+            visual_self_attention_heads=cfg.model.fusion.visual_self_attention_heads,
+            visual_self_attention_mlp_ratio=cfg.model.fusion.visual_self_attention_mlp_ratio,
+            visual_self_attention_dropout=cfg.model.fusion.visual_self_attention_dropout,
+            visual_self_attention_residual_scale=cfg.model.fusion.visual_self_attention_residual_scale,
         )
     raise ValueError(f"Unknown fusion: {cfg.model.fusion.name}")
 

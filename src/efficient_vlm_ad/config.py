@@ -78,6 +78,11 @@ class FusionConfig:
     score_norm: bool = True
     selected_norm: bool = True
     norm_eps: float = 1e-5
+    visual_self_attention_layers: int = 0
+    visual_self_attention_heads: int = 4
+    visual_self_attention_mlp_ratio: float = 2.0
+    visual_self_attention_dropout: float = 0.0
+    visual_self_attention_residual_scale: float = 1e-2
 
 
 @dataclass(frozen=True)
@@ -223,6 +228,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 score_norm=bool(fusion_raw.get("score_norm", True)),
                 selected_norm=bool(fusion_raw.get("selected_norm", True)),
                 norm_eps=float(fusion_raw.get("norm_eps", 1e-5)),
+                visual_self_attention_layers=int(fusion_raw.get("visual_self_attention_layers", 0)),
+                visual_self_attention_heads=int(fusion_raw.get("visual_self_attention_heads", 4)),
+                visual_self_attention_mlp_ratio=float(fusion_raw.get("visual_self_attention_mlp_ratio", 2.0)),
+                visual_self_attention_dropout=float(fusion_raw.get("visual_self_attention_dropout", 0.0)),
+                visual_self_attention_residual_scale=float(fusion_raw.get("visual_self_attention_residual_scale", 1e-2)),
             ),
         ),
         training=TrainingConfig(
