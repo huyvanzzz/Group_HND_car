@@ -130,6 +130,28 @@ def test_loads_kaggle_router_vsa_profile():
     assert safe_cfg.training.gradient_accumulation_steps == 4
 
 
+def test_loads_kaggle_router_vsa_nonorm_profile():
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml")
+    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_safe.yaml")
+
+    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49"
+    assert cfg.model.fusion.name == "question_guided_router"
+    assert cfg.model.fusion.top_k == 49
+    assert cfg.model.fusion.score_norm is False
+    assert cfg.model.fusion.selected_norm is False
+    assert cfg.model.fusion.visual_self_attention_layers == 1
+    assert cfg.model.fusion.visual_self_attention_heads == 4
+    assert cfg.model.fusion.visual_self_attention_mlp_ratio == 2.0
+    assert cfg.model.fusion.visual_self_attention_dropout == 0.0
+    assert cfg.model.fusion.visual_self_attention_residual_scale == 1.0e-2
+    assert cfg.training.batch_size == 16
+    assert cfg.training.gradient_accumulation_steps == 2
+    assert cfg.training.effective_batch_size_for_processes(2) == 64
+    assert safe_cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_safe"
+    assert safe_cfg.training.batch_size == 8
+    assert safe_cfg.training.gradient_accumulation_steps == 4
+
+
 def test_default_fusion_config_keeps_visual_self_attention_off():
     cfg = load_config("configs/repvit_t5_efficient_mini.yaml")
 
