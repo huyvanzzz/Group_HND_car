@@ -12,9 +12,9 @@ runtime:
   precision: fp32
 model:
   fastv:
-    k: 3
-    r: [0.3]
-    image_start_index: [0]
+    k: 1
+    r: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    image_start_index: [0, 49, 98, 147, 196, 245]
     image_token_length: 49
   profile: repvit_t5_efficient_mini_kaggle_2gpu_di_adapter_safe
   vision:

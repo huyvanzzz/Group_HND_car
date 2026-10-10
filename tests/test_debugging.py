@@ -53,7 +53,6 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 2
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1

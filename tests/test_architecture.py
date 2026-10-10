@@ -29,7 +29,6 @@ def test_vlm_fuses_visual_tokens_before_text_and_builds_combined_mask():
         vision_dim=512,
         d_model=384,
         seq_len=49,
-        gpa_hidden_size=8,
     )
     input_ids = torch.tensor([[1, 2, 0], [3, 0, 0]])
     attention_mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
@@ -43,11 +42,10 @@ def test_vlm_fuses_visual_tokens_before_text_and_builds_combined_mask():
     )
 
     assert out.loss is not None
-    assert text_model.last_inputs_embeds.shape == (2, 52, 384)
-    assert text_model.last_attention_mask.shape == (2, 52)
-    assert text_model.last_attention_mask[:, :49].sum().item() == 98
-    assert text_model.last_attention_mask[:, 49:].tolist() == attention_mask.tolist()
-    assert model.last_gpa_weights.shape == (2, 6)
+    assert text_model.last_inputs_embeds.shape == (2, 297, 384)
+    assert text_model.last_attention_mask.shape == (2, 297)
+    assert text_model.last_attention_mask[:, :294].sum().item() == 588
+    assert text_model.last_attention_mask[:, 294:].tolist() == attention_mask.tolist()
 
 
 def test_vlm_forward_delegates_to_forward_from_features_for_ddp_wrappers():
@@ -57,7 +55,6 @@ def test_vlm_forward_delegates_to_forward_from_features_for_ddp_wrappers():
         vision_dim=512,
         d_model=384,
         seq_len=49,
-        gpa_hidden_size=8,
     )
 
     out = model(
@@ -68,4 +65,4 @@ def test_vlm_forward_delegates_to_forward_from_features_for_ddp_wrappers():
     )
 
     assert out.loss is not None
-    assert text_model.last_inputs_embeds.shape == (1, 52, 384)
+    assert text_model.last_inputs_embeds.shape == (1, 297, 384)

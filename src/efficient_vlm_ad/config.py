@@ -78,8 +78,9 @@ class ModelConfig:
     profile: str
     vision: VisionConfig
     text: TextConfig
-    fastv: FastVConfig
     adapter: AdapterConfig = field(default_factory=AdapterConfig)
+    fastv: FastVConfig | None = None
+
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,6 @@ class TrainingConfig:
     scheduler_gamma: float = 0.9
     align_epochs: int = 6
     finetune_epochs: int = 6
-    gpa_hidden_size: int = 128
     max_steps: int | None = None
     align_max_steps: int | None = None
     finetune_max_steps: int | None = None
@@ -155,7 +155,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     model_raw = _require(raw, "model")
     vision_raw = _require(model_raw, "vision")
     text_raw = _require(model_raw, "text")
-    fastv_raw = _require(model_raw, "fastv")
+    fastv_raw = model_raw.get("fastv", {})
     adapter_raw = model_raw.get("adapter", {})
     train_raw = _require(raw, "training")
     cache_raw = raw.get("cache", {})
@@ -202,7 +202,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 r=[float(x) for x in _require(fastv_raw, "r")],
                 image_start_index=[int(x) for x in _require(fastv_raw, "image_start_index")],
                 image_token_length=int(_require(fastv_raw, "image_token_length")),
-            ),
+            ) if fastv_raw else None,
             adapter=AdapterConfig(
                 name=adapter_name,
                 num_heads=int(adapter_raw.get("num_heads", 8)),
@@ -221,7 +221,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
             scheduler_gamma=float(train_raw.get("scheduler_gamma", 0.9)),
             align_epochs=int(train_raw.get("align_epochs", 6)),
             finetune_epochs=int(train_raw.get("finetune_epochs", 6)),
-            gpa_hidden_size=int(train_raw.get("gpa_hidden_size", 128)),
             max_steps=int(train_raw["max_steps"]) if train_raw.get("max_steps") is not None else None,
             align_max_steps=int(train_raw["align_max_steps"]) if train_raw.get("align_max_steps") is not None else None,
             finetune_max_steps=int(train_raw["finetune_max_steps"]) if train_raw.get("finetune_max_steps") is not None else None,

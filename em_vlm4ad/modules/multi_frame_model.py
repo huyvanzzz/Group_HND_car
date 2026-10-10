@@ -58,11 +58,11 @@ class DriveVLMT5(nn.Module):
         print_trainable_parameters(self.model)
 
         # Create instance for multi-view processor
-        self.mvp = self.MultiViewProcessor(config.gpa_hidden_size, hidden_size, config.lm, freeze=True)
+        self.mvp = self.MultiViewProcessor(hidden_size, config.lm, freeze=True)
 
     class MultiViewProcessor(nn.Module):
 
-        def __init__(self, gpa_hidden_size, hidden_size, lm, freeze=False):
+        def __init__(self, hidden_size, lm, freeze=False):
 
             super().__init__()
 
@@ -79,35 +79,8 @@ class DriveVLMT5(nn.Module):
                 for param in self.img_model.parameters():
                     param.requires_grad = False
 
-            # Set matrices based on MIVC paper
-            self.w = nn.Linear(in_features=gpa_hidden_size, out_features=1)
-            self.Z = nn.Sequential(
-                nn.Linear(in_features=VIT_HIDDEN_STATE * VIT_SEQ_LENGTH, out_features=gpa_hidden_size, bias=False),
-                nn.Tanh()
-            )
-            self.G = nn.Sequential(
-                nn.Linear(in_features=VIT_HIDDEN_STATE * VIT_SEQ_LENGTH, out_features=gpa_hidden_size, bias=False),
-                nn.Sigmoid()
-            )
-
             if self.lm != 'T5-Base':
                 self.img_projection_layer = nn.Linear(in_features=VIT_HIDDEN_STATE, out_features=hidden_size)
-
-        def gpa(self, img_embeddings):
-
-            """"
-            Calculates the gated-pooling attention score for the image embeddings
-            :param img_embeddings: (6x768) dimensional
-            :return single embedding of size (768,)
-            """
-
-            # Get weights for gated pooling attention
-            gpa_weights = torch.softmax(self.w(self.Z(img_embeddings) * self.G(img_embeddings)), dim=0)
-
-            # Take a linear combination of all the image embeddings
-            fused_embeddings = torch.sum(gpa_weights * img_embeddings, dim=0)
-
-            return fused_embeddings
 
         def get_img_embedding(self, imgs):
 
@@ -125,9 +98,7 @@ class DriveVLMT5(nn.Module):
             merged_embedding = merged_embedding[:, :, 1:]
 
             # Get merged embedding and reshape to 2D embedding -> (N, 1, 49, H)
-            merged_embedding = torch.stack([self.gpa(embedding.flatten(start_dim=1)).reshape(VIT_SEQ_LENGTH,
-                                                                                             VIT_HIDDEN_STATE) for
-                                            embedding in merged_embedding], dim=0)
+            merged_embedding = merged_embedding.reshape(N, -1, VIT_HIDDEN_STATE)
 
             # Project to VL dimension -> (1, 49, H) (H is 512 for t5-small, 768 for t5-base)
             if self.lm != 'T5-Base':

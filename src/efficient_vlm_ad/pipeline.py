@@ -483,7 +483,6 @@ def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
     modules = {
         "vision": getattr(model, "vision_encoder", torch.nn.Identity()),
         "text": model.text_model,
-        "gpa": model.gpa,
         "projector": model.projector,
         "spatial_pos": torch.nn.ModuleList([m for m in [model.row_embeddings, model.col_embeddings] if m]),
         "modal_embeddings": model.modal_embeddings,
@@ -598,7 +597,7 @@ def _expected_finetune_modules(cfg: ExperimentConfig, model: torch.nn.Module) ->
 
 
 def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, stage: str) -> list[str]:
-    expected = {"gpa", "modal_embeddings"}
+    expected = {"modal_embeddings"}
     if stage == "finetune":
         expected.add("text_model")
     if _module_has_parameters(getattr(model, "projector")):

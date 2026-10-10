@@ -50,7 +50,6 @@ training:
   gradient_accumulation_steps: 1
   align_epochs: 1
   finetune_epochs: 1
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1

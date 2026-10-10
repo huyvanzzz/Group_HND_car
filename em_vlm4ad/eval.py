@@ -76,8 +76,6 @@ def params():
                         help="Batch size per GPU/CPU for training and evaluation, defaults to 4.")
     parser.add_argument("--epochs", default=15, type=int,
                         help="Number of epochs to train for, default is 15")
-    parser.add_argument('--gpa-hidden-size', default=128, type=int, help='Hidden dimension for Gated Pooling Attention, '
-                                                                         'default is 128')
     parser.add_argument('--freeze-lm', action='store_true', help='Freeze LM during training')
     parser.add_argument('--lm', default='T5-Base', choices=['T5-Base', 'T5-Large'], type=str, help='Backbone LM to use, '
                                                                                         'use \'T5-Base\' for T5-Medium')

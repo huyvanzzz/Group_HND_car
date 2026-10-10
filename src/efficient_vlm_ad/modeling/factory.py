@@ -350,7 +350,6 @@ def build_vlm_model(cfg):
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
-        gpa_hidden_size=cfg.training.gpa_hidden_size,
     )
     return model, tokenizer
 
@@ -364,6 +363,5 @@ def build_end_to_end_vlm_model(cfg, vision_encoder: nn.Module):
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
-        gpa_hidden_size=cfg.training.gpa_hidden_size,
     )
     return model, tokenizer
