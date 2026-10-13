@@ -19,13 +19,14 @@ from .checkpointing import _restore_rng_state, load_checkpoint, read_checkpoint_
 from .config import ExperimentConfig
 from .data import format_prompt, normalize_camera_paths
 from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats
-from .evaluation import caption_metrics, metric_display_values, write_predictions
+from .evaluation import caption_metrics, metric_display_values, write_generation_diagnostics, write_predictions
 from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
 from .modeling.router import QuestionGuidedTokenRouter, router_debug_payload
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
+from .tokenization import decode_generated_predictions, less_than_token_metadata, repair_less_than_token_after_checkpoint
 from .verification import (
     assert_tied_weights_ok,
     dedupe_optimizer_param_groups,
@@ -587,6 +588,9 @@ def _generate_batch(model, batch: dict[str, Any], cfg: ExperimentConfig) -> torc
         "num_beams": cfg.generation.num_beams,
         "early_stopping": cfg.generation.early_stopping,
         "length_penalty": cfg.generation.length_penalty,
+        "repetition_penalty": cfg.generation.repetition_penalty,
+        "no_repeat_ngram_size": cfg.generation.no_repeat_ngram_size,
+        "renormalize_logits": cfg.generation.renormalize_logits,
     }
     if _uses_end_to_end_vision(cfg):
         return model.generate_from_images(**kwargs)
@@ -753,6 +757,7 @@ def train_stage(
             retie_text_model_weights(model)
             assert_tied_weights_ok(model)
             metadata = dict(resume_training_payload.get("metadata", {}))
+            repair_less_than_token_after_checkpoint(tokenizer, model, metadata)
             start_step = int(metadata.get("global_step", 0))
             start_epoch = int(metadata.get("completed_epochs", metadata.get("epoch", 0)))
             best_val_loss = float(metadata.get("best_val_loss", best_val_loss))
@@ -762,6 +767,7 @@ def train_stage(
                 metadata = _load_model_weights_allowing_new_vision(resume, model=model, map_location=device)
             else:
                 metadata = load_checkpoint(resume, model=model, map_location=device)
+            repair_less_than_token_after_checkpoint(tokenizer, model, metadata)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_load_done", metadata=metadata)
 
@@ -1034,6 +1040,12 @@ def train_stage(
                     "num_beams": cfg.generation.num_beams,
                     "early_stopping": cfg.generation.early_stopping,
                     "length_penalty": cfg.generation.length_penalty,
+                    "repetition_penalty": cfg.generation.repetition_penalty,
+                    "no_repeat_ngram_size": cfg.generation.no_repeat_ngram_size,
+                    "renormalize_logits": cfg.generation.renormalize_logits,
+                },
+                "tokenizer": {
+                    "less_than_token": less_than_token_metadata(tokenizer),
                 },
             }
             router = _router_module(unwrapped)
@@ -1275,6 +1287,7 @@ def verify_align_checkpoint(
 
     model.to(device)
     load_metadata = _strict_load_model_from_checkpoint(checkpoint_path, model, map_location=device)
+    repair_less_than_token_after_checkpoint(tokenizer, model, load_metadata)
     retie_report = retie_text_model_weights(model)
     assert_tied_weights_ok(model)
     _heartbeat(dbg, started_at, "checkpoint_strict_load_done", metadata=load_metadata)
@@ -1440,6 +1453,7 @@ def verify_resume_checkpoint(
     retie_report = retie_text_model_weights(model)
     assert_tied_weights_ok(model)
     metadata = dict(payload.get("metadata", {}))
+    repair_less_than_token_after_checkpoint(tokenizer, model, metadata)
     _heartbeat(dbg, started_at, "checkpoint_strict_load_done", metadata=metadata)
 
     actual_trainable = trainable_module_names(model)
@@ -1583,6 +1597,7 @@ def evaluate_checkpoint(
     model, tokenizer, transform = _build_train_model(cfg)
     model.to(device)
     metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    repair_less_than_token_after_checkpoint(tokenizer, model, metadata)
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
@@ -1592,6 +1607,7 @@ def evaluate_checkpoint(
     log_every = max(1, progress_log_every_samples or cfg.evaluation.eval_progress_log_every_samples)
     loader = DataLoader(dataset, batch_size=eval_batch_size, shuffle=False, collate_fn=collator)
     rows: list[dict[str, Any]] = []
+    diagnostic_rows: list[dict[str, Any]] = []
     progress_writer = MinimalProgressWriter(cfg.project.output_dir, "eval_progress.jsonl")
     progress_started = time.perf_counter()
     total_samples = len(dataset)
@@ -1604,7 +1620,8 @@ def evaluate_checkpoint(
                 if key in batch:
                     batch[key] = batch[key].to(device)
             ids = _generate_batch(model, batch, cfg)
-            preds = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            ids_cpu = ids.detach().cpu()
+            preds = decode_generated_predictions(tokenizer, ids_cpu)
             for offset, pred in enumerate(preds):
                 sample_index = processed + offset
                 if sample_index < dbg.samples:
@@ -1618,7 +1635,10 @@ def evaluate_checkpoint(
                             "reference": safe_preview(batch["answers"][offset]),
                         },
                     )
-                rows.append({"eval_id": batch["eval_ids"][offset], "prediction": pred, "reference": batch["answers"][offset]})
+                row = {"eval_id": batch["eval_ids"][offset], "prediction": pred, "reference": batch["answers"][offset]}
+                rows.append(row)
+                token_count = int((ids_cpu[offset] != getattr(tokenizer, "pad_token_id", 0)).sum().item())
+                diagnostic_rows.append({**row, "generated_token_count": token_count})
             processed += len(preds)
             if processed >= next_log_at or processed == total_samples:
                 _write_minimal_progress(progress_writer, stage="evaluate", current=processed, total=total_samples, start=progress_started)
@@ -1626,10 +1646,11 @@ def evaluate_checkpoint(
                     next_log_at += log_every
     output_dir = Path(cfg.project.output_dir)
     write_predictions(output_dir / "predictions.jsonl", rows)
+    diagnostics = write_generation_diagnostics(output_dir / "generation_diagnostics.json", diagnostic_rows, max_new_tokens=cfg.generation.max_new_tokens)
     metrics = caption_metrics(rows)
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     (output_dir / "metrics_display.json").write_text(json.dumps(metric_display_values(metrics), indent=2), encoding="utf-8")
-    dbg.log("EVAL", {"prediction_count": len(rows), "metrics": metrics, "metrics_display": metric_display_values(metrics)})
+    dbg.log("EVAL", {"prediction_count": len(rows), "metrics": metrics, "metrics_display": metric_display_values(metrics), "generation_diagnostics": diagnostics})
     return metrics
 
 
@@ -1648,6 +1669,7 @@ def benchmark_checkpoint(
     model, tokenizer, transform = _build_train_model(cfg)
     model.to(device)
     metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    repair_less_than_token_after_checkpoint(tokenizer, model, metadata)
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
@@ -1675,7 +1697,7 @@ def benchmark_checkpoint(
             if device.type == "cuda":
                 torch.cuda.synchronize()
             gen.append(time.perf_counter() - gen_start)
-            tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            decode_generated_predictions(tokenizer, ids.detach().cpu())
             e2e.append(time.perf_counter() - start)
             token_counts.append(int((ids != getattr(tokenizer, "pad_token_id", 0)).sum().item()))
             if idx < dbg.samples:

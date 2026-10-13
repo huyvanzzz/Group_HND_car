@@ -192,6 +192,47 @@ def test_router_vsa_nonorm_full_notebook_uses_nonorm_config():
     assert "--batch-size 16" in source
 
 
+def test_router_vsa_nonorm_finetune_only_notebook_has_debug_and_no_align_train():
+    source = _notebook_source("notebooks/kaggle_finetune_only_router_vsa_nonorm_k49.ipynb")
+
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml" in source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_finetune_only" in source
+    assert "decode_generated_predictions" in source
+    assert "tag decoded" in source
+    assert "speed decoded" in source
+    assert "generation_diagnostics.json" in source
+    assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
+    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune --max-steps 20" in source
+    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
+    assert "verify-resume-checkpoint" in source
+    assert "finetune_resume_checkpoint_verify.json" in source
+    assert "--batch-size 16" in source
+    assert "--stage align" not in source
+    assert "verify-align-checkpoint" not in source
+    assert "align_best.pt" not in source
+
+
+def test_router_vsa_finetune_only_notebook_targets_score_norm_vsa_config():
+    source = _notebook_source("notebooks/kaggle_finetune_only_router_vsa_k49.ipynb")
+
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_safe.yaml" in source
+    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_finetune_only" in source
+    assert "decode_generated_predictions" in source
+    assert "tag decoded" in source
+    assert "speed decoded" in source
+    assert "generation_diagnostics.json" in source
+    assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
+    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune --max-steps 20" in source
+    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
+    assert "verify-resume-checkpoint" in source
+    assert "--batch-size 16" in source
+    assert "--stage align" not in source
+    assert "verify-align-checkpoint" not in source
+    assert "align_best.pt" not in source
+    assert "router_vsa_nonorm" not in source
+
+
 def test_resume_verify_notebook_checks_same_stage_resume_cases():
     source = _notebook_source("notebooks/kaggle_verify_resume_checkpoints.ipynb")
 

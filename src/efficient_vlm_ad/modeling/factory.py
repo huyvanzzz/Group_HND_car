@@ -7,6 +7,7 @@ from .adapters import DynamicInstructionAdapter
 from .router import QuestionGuidedTokenRouter
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
+from ..tokenization import ensure_special_less_than_token
 
 
 class SimpleTokenizer:
@@ -110,6 +111,9 @@ class TinySeq2Seq(nn.Module):
         num_beams=1,
         early_stopping=False,
         length_penalty=1.0,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=0,
+        renormalize_logits=True,
     ):
         batch = inputs_embeds.shape[0]
         return torch.ones((batch, max(1, min(max_new_tokens, 4))), dtype=torch.long, device=inputs_embeds.device)
@@ -134,6 +138,7 @@ def build_text_and_tokenizer(cfg):
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
     model = AutoModelForSeq2SeqLM.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
+    ensure_special_less_than_token(tokenizer, model)
     return model, tokenizer
 
 

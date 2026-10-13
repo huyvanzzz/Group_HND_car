@@ -36,6 +36,9 @@ def test_loads_kaggle_2gpu_profiles():
     assert cfg.generation.num_beams == 3
     assert cfg.generation.early_stopping is True
     assert cfg.generation.length_penalty == 1.0
+    assert cfg.generation.repetition_penalty == 1.1
+    assert cfg.generation.no_repeat_ngram_size == 4
+    assert cfg.generation.renormalize_logits is True
     assert cfg.evaluation.eval_batch_size == 16
     assert cfg.evaluation.eval_progress_log_every_samples == 256
     assert cfg.evaluation.benchmark_max_samples == 200
