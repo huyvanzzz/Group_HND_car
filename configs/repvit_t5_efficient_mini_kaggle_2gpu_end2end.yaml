@@ -45,9 +45,6 @@ generation:
   num_beams: 3
   early_stopping: true
   length_penalty: 1.0
-  repetition_penalty: 1.1
-  no_repeat_ngram_size: 4
-  renormalize_logits: true
 evaluation:
   eval_batch_size: 16
   eval_progress_log_every_samples: 256

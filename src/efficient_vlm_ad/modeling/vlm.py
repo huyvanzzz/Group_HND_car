@@ -192,9 +192,6 @@ class EfficientVLMForAD(nn.Module):
         num_beams: int = 1,
         early_stopping: bool = False,
         length_penalty: float = 1.0,
-        repetition_penalty: float = 1.0,
-        no_repeat_ngram_size: int = 0,
-        renormalize_logits: bool = True,
     ) -> torch.Tensor:
         text_tokens = self.text_model.get_input_embeddings()(input_ids)
         if self.visual_adapter is not None:
@@ -227,9 +224,6 @@ class EfficientVLMForAD(nn.Module):
             num_beams=num_beams,
             early_stopping=early_stopping,
             length_penalty=length_penalty,
-            repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            renormalize_logits=renormalize_logits,
         )
 
 
@@ -310,9 +304,6 @@ class EndToEndEfficientVLMForAD(EfficientVLMForAD):
         num_beams: int = 1,
         early_stopping: bool = False,
         length_penalty: float = 1.0,
-        repetition_penalty: float = 1.0,
-        no_repeat_ngram_size: int = 0,
-        renormalize_logits: bool = True,
     ) -> torch.Tensor:
         return self.generate_from_features(
             input_ids=input_ids,
@@ -322,7 +313,4 @@ class EndToEndEfficientVLMForAD(EfficientVLMForAD):
             num_beams=num_beams,
             early_stopping=early_stopping,
             length_penalty=length_penalty,
-            repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            renormalize_logits=renormalize_logits,
         )

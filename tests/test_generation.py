@@ -15,18 +15,10 @@ class CapturingModel:
         return torch.ones((1, 2), dtype=torch.long)
 
 
-def test_generate_batch_passes_anti_repetition_kwargs():
+def test_generate_batch_uses_base_generation_kwargs_only():
     model = CapturingModel()
     cfg = SimpleNamespace(
-        generation=GenerationConfig(
-            max_new_tokens=32,
-            num_beams=3,
-            early_stopping=True,
-            length_penalty=0.8,
-            repetition_penalty=1.1,
-            no_repeat_ngram_size=4,
-            renormalize_logits=True,
-        ),
+        generation=GenerationConfig(max_new_tokens=32, num_beams=3, early_stopping=True, length_penalty=0.8),
         training=SimpleNamespace(vision_training="feature_cache"),
     )
     batch = {
@@ -37,6 +29,9 @@ def test_generate_batch_passes_anti_repetition_kwargs():
 
     _generate_batch(model, batch, cfg)
 
-    assert model.kwargs["repetition_penalty"] == 1.1
-    assert model.kwargs["no_repeat_ngram_size"] == 4
-    assert model.kwargs["renormalize_logits"] is True
+    assert model.kwargs["max_new_tokens"] == 32
+    assert model.kwargs["num_beams"] == 3
+    assert model.kwargs["early_stopping"] is True
+    assert model.kwargs["length_penalty"] == 0.8
+    removed_keys = ["repetition" + "_penalty", "no_repeat" + "_ngram_size", "renormalize" + "_logits"]
+    assert not any(key in model.kwargs for key in removed_keys)

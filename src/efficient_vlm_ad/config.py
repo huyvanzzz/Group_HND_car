@@ -40,9 +40,6 @@ class GenerationConfig:
     num_beams: int = 1
     early_stopping: bool = False
     length_penalty: float = 1.0
-    repetition_penalty: float = 1.0
-    no_repeat_ngram_size: int = 0
-    renormalize_logits: bool = True
 
 
 @dataclass(frozen=True)
@@ -268,9 +265,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
             num_beams=int(generation_raw.get("num_beams", 1)),
             early_stopping=bool(generation_raw.get("early_stopping", False)),
             length_penalty=float(generation_raw.get("length_penalty", 1.0)),
-            repetition_penalty=float(generation_raw.get("repetition_penalty", 1.0)),
-            no_repeat_ngram_size=int(generation_raw.get("no_repeat_ngram_size", 0)),
-            renormalize_logits=bool(generation_raw.get("renormalize_logits", True)),
         ),
         evaluation=EvaluationConfig(
             eval_batch_size=int(evaluation_raw.get("eval_batch_size", 16)),

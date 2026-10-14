@@ -588,9 +588,6 @@ def _generate_batch(model, batch: dict[str, Any], cfg: ExperimentConfig) -> torc
         "num_beams": cfg.generation.num_beams,
         "early_stopping": cfg.generation.early_stopping,
         "length_penalty": cfg.generation.length_penalty,
-        "repetition_penalty": cfg.generation.repetition_penalty,
-        "no_repeat_ngram_size": cfg.generation.no_repeat_ngram_size,
-        "renormalize_logits": cfg.generation.renormalize_logits,
     }
     if _uses_end_to_end_vision(cfg):
         return model.generate_from_images(**kwargs)
@@ -1040,9 +1037,6 @@ def train_stage(
                     "num_beams": cfg.generation.num_beams,
                     "early_stopping": cfg.generation.early_stopping,
                     "length_penalty": cfg.generation.length_penalty,
-                    "repetition_penalty": cfg.generation.repetition_penalty,
-                    "no_repeat_ngram_size": cfg.generation.no_repeat_ngram_size,
-                    "renormalize_logits": cfg.generation.renormalize_logits,
                 },
                 "tokenizer": {
                     "less_than_token": less_than_token_metadata(tokenizer),
@@ -1607,7 +1601,6 @@ def evaluate_checkpoint(
     log_every = max(1, progress_log_every_samples or cfg.evaluation.eval_progress_log_every_samples)
     loader = DataLoader(dataset, batch_size=eval_batch_size, shuffle=False, collate_fn=collator)
     rows: list[dict[str, Any]] = []
-    diagnostic_rows: list[dict[str, Any]] = []
     progress_writer = MinimalProgressWriter(cfg.project.output_dir, "eval_progress.jsonl")
     progress_started = time.perf_counter()
     total_samples = len(dataset)
@@ -1637,8 +1630,6 @@ def evaluate_checkpoint(
                     )
                 row = {"eval_id": batch["eval_ids"][offset], "prediction": pred, "reference": batch["answers"][offset]}
                 rows.append(row)
-                token_count = int((ids_cpu[offset] != getattr(tokenizer, "pad_token_id", 0)).sum().item())
-                diagnostic_rows.append({**row, "generated_token_count": token_count})
             processed += len(preds)
             if processed >= next_log_at or processed == total_samples:
                 _write_minimal_progress(progress_writer, stage="evaluate", current=processed, total=total_samples, start=progress_started)
@@ -1646,7 +1637,7 @@ def evaluate_checkpoint(
                     next_log_at += log_every
     output_dir = Path(cfg.project.output_dir)
     write_predictions(output_dir / "predictions.jsonl", rows)
-    diagnostics = write_generation_diagnostics(output_dir / "generation_diagnostics.json", diagnostic_rows, max_new_tokens=cfg.generation.max_new_tokens)
+    diagnostics = write_generation_diagnostics(output_dir / "generation_diagnostics.json", rows)
     metrics = caption_metrics(rows)
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     (output_dir / "metrics_display.json").write_text(json.dumps(metric_display_values(metrics), indent=2), encoding="utf-8")

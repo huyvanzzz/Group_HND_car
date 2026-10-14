@@ -111,9 +111,6 @@ class TinySeq2Seq(nn.Module):
         num_beams=1,
         early_stopping=False,
         length_penalty=1.0,
-        repetition_penalty=1.0,
-        no_repeat_ngram_size=0,
-        renormalize_logits=True,
     ):
         batch = inputs_embeds.shape[0]
         return torch.ones((batch, max(1, min(max_new_tokens, 4))), dtype=torch.long, device=inputs_embeds.device)
