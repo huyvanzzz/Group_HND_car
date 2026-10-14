@@ -58,6 +58,7 @@ def decode_generated_predictions(tokenizer: Any, rows: Any) -> list[str]:
 
 def _normalize_object_tag_spacing(text: str) -> str:
     text = re.sub(r"<\s+(c\d+,\s*CAM_[A-Za-z_]+)", r"<\1", text)
+    text = re.sub(r"(?<=[A-Za-z0-9,])(?=<c\d+,\s*CAM_[A-Za-z_]+)", " ", text)
     text = re.sub(r"(?<=[A-Za-z0-9])<\s*(?!c\d+,\s*CAM_)", " < ", text)
     return re.sub(r"\s{2,}", " ", text).strip()
 
