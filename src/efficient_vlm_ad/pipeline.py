@@ -44,6 +44,7 @@ from .verification import (
     retie_text_model_weights,
     t5_tied_weight_report,
     trainable_module_names,
+    trainable_gradient_finite_report,
     trainable_parameter_finite_report,
 )
 
@@ -1346,6 +1347,31 @@ def diagnose_train(
             )
         dbg.log("NUMERICS", {"stage": "diagnose_forward", **numerics})
 
+    begin = time.perf_counter()
+    optimizer.zero_grad(set_to_none=True)
+    with accelerator.autocast():
+        diagnose_output = model(**_batch_model_inputs(batch, cfg))
+        diagnose_loss = diagnose_output.loss
+    loss_finite = bool(torch.isfinite(diagnose_loss.detach()).item())
+    if not loss_finite:
+        raise FloatingPointError(f"Diagnose forward loss is not finite: {diagnose_loss.detach().cpu().item()}")
+    accelerator.backward(diagnose_loss)
+    gradient_report = trainable_gradient_finite_report(accelerator.unwrap_model(model))
+    mark("backward", begin)
+    if accelerator.is_main_process:
+        dbg.log(
+            "NUMERICS",
+            {
+                "stage": "diagnose_backward",
+                "loss": float(diagnose_loss.detach().cpu().item()),
+                "gradients": gradient_report,
+                "optimizer_step_performed": False,
+            },
+        )
+    if not gradient_report["ok"]:
+        raise FloatingPointError(f"Non-finite gradients during diagnose: {gradient_report}")
+    optimizer.zero_grad(set_to_none=True)
+
     report = {
         "stage": stage,
         "device": str(device),
@@ -1358,6 +1384,10 @@ def diagnose_train(
         "feature_cache_shape": list(dataset.features.shape) if hasattr(dataset, "features") else None,
         "batch": batch_summary,
         "numerics": numerics,
+        "loss": float(diagnose_loss.detach().cpu().item()),
+        "loss_finite": loss_finite,
+        "gradients": gradient_report,
+        "optimizer_step_performed": False,
         "durations": durations,
     }
     _heartbeat(dbg, started_at, "diagnose_done")

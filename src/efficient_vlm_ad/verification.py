@@ -67,6 +67,47 @@ def trainable_parameter_finite_report(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+def trainable_gradient_finite_report(model: torch.nn.Module) -> dict[str, Any]:
+    checked = 0
+    missing: list[str] = []
+    non_finite: list[str] = []
+    nan_values = 0
+    inf_values = 0
+    squared_norm = 0.0
+    module_squared_norms: dict[str, float] = defaultdict(float)
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.grad is None:
+            missing.append(name)
+            continue
+        checked += 1
+        gradient = param.grad.detach()
+        nan_count = int(torch.isnan(gradient).sum().item())
+        inf_count = int(torch.isinf(gradient).sum().item())
+        nan_values += nan_count
+        inf_values += inf_count
+        if nan_count or inf_count:
+            non_finite.append(name)
+            continue
+        norm = float(gradient.float().norm(2).item())
+        squared_norm += norm * norm
+        module_squared_norms[name.split(".")[0]] += norm * norm
+    ok = not non_finite
+    return {
+        "checked_gradient_tensors": checked,
+        "parameters_without_gradient": missing,
+        "non_finite_gradient_tensors": non_finite,
+        "nan_values": nan_values,
+        "inf_values": inf_values,
+        "global_grad_norm": squared_norm**0.5 if ok else None,
+        "module_grad_norms": {
+            module: value**0.5 for module, value in sorted(module_squared_norms.items())
+        },
+        "ok": ok,
+    }
+
+
 def _text_model_from(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "text_model", model)
 
