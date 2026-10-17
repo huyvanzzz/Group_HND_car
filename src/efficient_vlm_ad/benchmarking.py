@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import statistics
+from typing import Any, Iterable
 
 
 def _mean_ms(values: list[float]) -> float:
@@ -35,4 +36,26 @@ def summarize_latencies(
         else 0.0,
         "tokens_per_second": round(total_tokens / total_generation, 6) if total_generation else 0.0,
     }
+
+
+def summarize_component_events(events: Iterable[Any], *, iterations: int) -> dict[str, dict[str, float]]:
+    names = {
+        "mvpruner.spatial_camera_projector",
+        "mvpruner.stage1_dra_ccts",
+        "mvpruner.t5_blocks_0_1",
+        "mvpruner.stage2_ira_gumbel",
+        "mvpruner.t5_blocks_2_3",
+    }
+    denominator = max(1, int(iterations))
+    output: dict[str, dict[str, float]] = {}
+    for event in events:
+        if event.key not in names:
+            continue
+        output[event.key] = {
+            "cpu_total_ms": round(float(event.cpu_time_total) / 1000.0, 6),
+            "cpu_mean_ms": round(float(event.cpu_time_total) / 1000.0 / denominator, 6),
+            "cuda_total_ms": round(float(getattr(event, "device_time_total", 0.0)) / 1000.0, 6),
+            "cuda_mean_ms": round(float(getattr(event, "device_time_total", 0.0)) / 1000.0 / denominator, 6),
+        }
+    return output
 

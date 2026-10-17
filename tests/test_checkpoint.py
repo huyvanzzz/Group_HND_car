@@ -1,9 +1,19 @@
 import random
 
 import numpy as np
+import pytest
 import torch
 
-from efficient_vlm_ad.checkpointing import _restore_rng_state, _rng_state, load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from efficient_vlm_ad.checkpointing import (
+    _restore_rng_state,
+    _rng_state,
+    load_checkpoint,
+    load_rank_rng_state,
+    read_checkpoint_metadata,
+    save_checkpoint,
+    save_rank_rng_state,
+    write_rank_rng_manifest,
+)
 from efficient_vlm_ad.verification import dedupe_optimizer_param_groups, t5_tied_weight_report
 
 
@@ -170,3 +180,50 @@ def test_restore_rng_state_passes_cpu_byte_tensors_to_cuda_rng(monkeypatch):
 
     assert captured["states"][0].device.type == "cpu"
     assert captured["states"][0].dtype == torch.uint8
+
+
+def test_rank_rng_sidecars_restore_the_matching_rank(tmp_path):
+    checkpoint = tmp_path / "align_latest.pt"
+    torch.manual_seed(10)
+    save_rank_rng_state(checkpoint, rank=0, world_size=2, epoch=3, batch_cursor=7, optimizer_step=11)
+    expected_rank0 = torch.rand(1)
+    torch.manual_seed(20)
+    save_rank_rng_state(checkpoint, rank=1, world_size=2, epoch=3, batch_cursor=7, optimizer_step=11)
+    expected_rank1 = torch.rand(1)
+    write_rank_rng_manifest(checkpoint, world_size=2)
+
+    metadata = load_rank_rng_state(checkpoint, rank=1, world_size=2)
+    actual_rank1 = torch.rand(1)
+
+    assert metadata == {"rank": 1, "world_size": 2, "epoch": 3, "batch_cursor": 7, "optimizer_step": 11}
+    torch.testing.assert_close(actual_rank1, expected_rank1)
+    assert not torch.equal(actual_rank1, expected_rank0)
+
+
+def test_rank_rng_sidecar_returns_saved_sampler_state(tmp_path):
+    checkpoint = tmp_path / "align_latest.pt"
+    sampler_state = {"epoch": 4, "cursor": 12}
+    save_rank_rng_state(
+        checkpoint,
+        rank=0,
+        world_size=1,
+        epoch=4,
+        batch_cursor=12,
+        optimizer_step=9,
+        sampler_state=sampler_state,
+    )
+    write_rank_rng_manifest(checkpoint, world_size=1)
+
+    payload = load_rank_rng_state(checkpoint, rank=0, world_size=1, return_payload=True)
+
+    assert payload["sampler_state"] == sampler_state
+    assert payload["metadata"]["optimizer_step"] == 9
+
+
+def test_rank_rng_sidecars_reject_world_size_mismatch(tmp_path):
+    checkpoint = tmp_path / "align_latest.pt"
+    save_rank_rng_state(checkpoint, rank=0, world_size=1, epoch=0, batch_cursor=0, optimizer_step=0)
+    write_rank_rng_manifest(checkpoint, world_size=1)
+
+    with pytest.raises(RuntimeError, match="world size"):
+        load_rank_rng_state(checkpoint, rank=0, world_size=2)

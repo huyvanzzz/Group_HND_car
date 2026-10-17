@@ -15,7 +15,15 @@ from torch.utils.data import DataLoader, Dataset
 
 from .benchmarking import summarize_latencies
 from .cache import FeatureCacheManifest, create_memmap, validate_manifest
-from .checkpointing import _restore_rng_state, load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from .checkpointing import (
+    _restore_rng_state,
+    load_checkpoint,
+    load_rank_rng_state,
+    read_checkpoint_metadata,
+    save_checkpoint,
+    save_rank_rng_state,
+    write_rank_rng_manifest,
+)
 from .config import ExperimentConfig
 from .data import format_prompt, normalize_camera_paths
 from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats
@@ -24,6 +32,7 @@ from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
 from .modeling.router import QuestionGuidedTokenRouter, router_debug_payload
+from .modeling.mvpruner import MVPrunerTwoStage
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
 from .tokenization import decode_generated_predictions, less_than_token_metadata, repair_less_than_token_after_checkpoint
@@ -75,6 +84,32 @@ class _SingleProcessAccelerator:
 
     def clip_grad_norm_(self, parameters, max_norm: float) -> None:
         torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+
+def _broadcast_bool(value: bool, accelerator) -> bool:
+    if int(getattr(accelerator, "num_processes", 1)) == 1:
+        return bool(value)
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError("Distributed accelerator is active but torch.distributed is not initialized")
+    tensor = torch.tensor([1 if value else 0], device=accelerator.device, dtype=torch.int64)
+    torch.distributed.broadcast(tensor, src=0)
+    return bool(tensor.item())
+
+
+def _sampler_state(loader) -> Any | None:
+    sampler = getattr(loader, "sampler", None)
+    if sampler is not None and hasattr(sampler, "state_dict"):
+        return sampler.state_dict()
+    return None
+
+
+def _restore_sampler_state(loader, state: Any | None) -> None:
+    if state is None:
+        return
+    sampler = getattr(loader, "sampler", None)
+    if sampler is None or not hasattr(sampler, "load_state_dict"):
+        raise RuntimeError("Checkpoint contains sampler state but the prepared data loader sampler cannot restore it")
+    sampler.load_state_dict(state)
 
 
 def _accelerate_precision(cfg: ExperimentConfig) -> str:
@@ -540,6 +575,11 @@ def _router_module(model: torch.nn.Module) -> QuestionGuidedTokenRouter | None:
     return fusion if isinstance(fusion, QuestionGuidedTokenRouter) else None
 
 
+def _mvpruner_module(model: torch.nn.Module) -> MVPrunerTwoStage | None:
+    fusion = getattr(model, "visual_fusion", None)
+    return fusion if isinstance(fusion, MVPrunerTwoStage) else None
+
+
 def _target_optimizer_steps(*, batches_per_epoch: int, total_epochs: int, gradient_accumulation_steps: int, step_limit: int | None) -> int:
     accum = max(1, int(gradient_accumulation_steps))
     if step_limit is not None:
@@ -552,18 +592,37 @@ def _configure_router_tau(model: torch.nn.Module, *, target_steps: int, reset: b
     router = _router_module(model)
     if router is not None:
         router.configure_tau(target_steps, reset=reset)
+    mvpruner = _mvpruner_module(model)
+    if mvpruner is not None:
+        mvpruner.configure_beta(target_steps, reset=reset)
 
 
 def _step_router_tau(model: torch.nn.Module) -> None:
     router = _router_module(model)
     if router is not None:
         router.step_tau()
+    mvpruner = _mvpruner_module(model)
+    if mvpruner is not None:
+        mvpruner.step_beta()
 
 
 def _router_train_payload(model: torch.nn.Module) -> dict[str, Any]:
     router = _router_module(model)
     if router is None:
-        return {}
+        mvpruner = _mvpruner_module(model)
+        if mvpruner is None:
+            return {}
+        debug = getattr(mvpruner, "last_debug", {}) or {}
+        payload: dict[str, Any] = {
+            "beta": mvpruner.current_beta(),
+            "beta_step": int(mvpruner.beta_step.item()),
+            "beta_target_steps": int(mvpruner.beta_target_steps.item()),
+            "tau": float(mvpruner.tau.item()),
+        }
+        for key in ("stage1_budgets", "stage2_budgets", "stage1_indices", "stage2_indices"):
+            if key in debug:
+                payload[key] = debug[key].detach().cpu().tolist()
+        return {"mvpruner": payload}
     payload = router_debug_payload(router)
     payload["scorer_grad_norm"] = _module_grad_norm(router.scorer)
     return {"router": payload}
@@ -732,6 +791,7 @@ def train_stage(
     best_val_loss = float("inf")
     best_epoch = 0
     resume_training_payload: dict[str, Any] | None = None
+    rank_resume_payload: dict[str, Any] | None = None
     if resume:
         resume_path = Path(resume)
         if accelerator.is_main_process:
@@ -776,6 +836,14 @@ def train_stage(
             if resume_training_payload.get("scheduler") is not None:
                 scheduler.load_state_dict(resume_training_payload["scheduler"])
             _restore_rng_state(resume_training_payload["rng_state"])
+            rank_manifest = Path(str(resume) + ".rng") / "manifest.json"
+            if rank_manifest.exists():
+                rank_resume_payload = load_rank_rng_state(
+                    resume,
+                    rank=int(getattr(accelerator, "process_index", 0)),
+                    world_size=int(getattr(accelerator, "num_processes", 1)),
+                    return_payload=True,
+                )
         except Exception as exc:
             raise RuntimeError(
                 "Could not restore optimizer/scheduler state after retie/dedupe. "
@@ -815,6 +883,8 @@ def train_stage(
         reset=resume_training_payload is None,
     )
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    if rank_resume_payload is not None:
+        _restore_sampler_state(loader, rank_resume_payload.get("sampler_state"))
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "accelerator_prepare_done")
     global_step = start_step
@@ -966,6 +1036,7 @@ def train_stage(
         epoch_train_loss = epoch_loss / epoch_batches
         accelerator.wait_for_everyone()
         val_loss = None
+        is_best = False
         if accelerator.is_main_process:
             unwrapped = accelerator.unwrap_model(model)
             progress_writer.write(
@@ -1052,6 +1123,18 @@ def train_stage(
                     "tau_decay": float(router.tau_decay.item()),
                     "target_optimizer_steps": int(router.target_optimizer_steps.item()),
                 }
+            mvpruner = _mvpruner_module(unwrapped)
+            if mvpruner is not None:
+                metadata["mvpruner"] = {
+                    "stage1_top_k": mvpruner.stage1_top_k,
+                    "stage2_top_k": mvpruner.stage2_top_k,
+                    "beta": mvpruner.current_beta(),
+                    "beta_step": int(mvpruner.beta_step.item()),
+                    "beta_start": float(mvpruner.beta_start.item()),
+                    "beta_end": float(mvpruner.beta_end.item()),
+                    "beta_target_steps": int(mvpruner.beta_target_steps.item()),
+                    "tau": float(mvpruner.tau.item()),
+                }
             save_checkpoint(
                 latest_ckpt,
                 model=unwrapped,
@@ -1118,6 +1201,38 @@ def train_stage(
                 elapsed_seconds=round(time.perf_counter() - epoch_started_at, 3),
                 **_cuda_memory_payload(device),
             )
+        is_best = _broadcast_bool(is_best, accelerator)
+        accelerator.wait_for_everyone()
+        rank = int(getattr(accelerator, "process_index", 0))
+        world_size = int(getattr(accelerator, "num_processes", 1))
+        save_rank_rng_state(
+            latest_ckpt,
+            rank=rank,
+            world_size=world_size,
+            epoch=epoch_number,
+            batch_cursor=epoch_batches,
+            optimizer_step=int(_mvpruner_module(accelerator.unwrap_model(model)).beta_step.item())
+            if _mvpruner_module(accelerator.unwrap_model(model)) is not None
+            else global_step,
+            sampler_state=_sampler_state(loader),
+        )
+        if is_best:
+            save_rank_rng_state(
+                best_ckpt,
+                rank=rank,
+                world_size=world_size,
+                epoch=epoch_number,
+                batch_cursor=epoch_batches,
+                optimizer_step=int(_mvpruner_module(accelerator.unwrap_model(model)).beta_step.item())
+                if _mvpruner_module(accelerator.unwrap_model(model)) is not None
+                else global_step,
+                sampler_state=_sampler_state(loader),
+            )
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            write_rank_rng_manifest(latest_ckpt, world_size=world_size)
+            if is_best:
+                write_rank_rng_manifest(best_ckpt, world_size=world_size)
         accelerator.wait_for_everyone()
 
     return latest_ckpt

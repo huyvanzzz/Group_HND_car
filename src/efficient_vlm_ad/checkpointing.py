@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,86 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
     if torch.cuda.is_available() and "cuda" in state:
         cuda_states = [cuda_state.detach().to(device="cpu", dtype=torch.uint8) for cuda_state in state["cuda"]]
         torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _rank_rng_dir(checkpoint_path: str | Path) -> Path:
+    path = Path(checkpoint_path)
+    return path.with_name(path.name + ".rng")
+
+
+def save_rank_rng_state(
+    checkpoint_path: str | Path,
+    *,
+    rank: int,
+    world_size: int,
+    epoch: int,
+    batch_cursor: int,
+    optimizer_step: int,
+    sampler_state: Any | None = None,
+) -> Path:
+    directory = _rank_rng_dir(checkpoint_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"rank_{int(rank):05d}.pt"
+    temporary = directory / f".{target.name}.{os.getpid()}.tmp"
+    payload = {
+        "rng_state": _rng_state(),
+        "sampler_state": sampler_state,
+        "metadata": {
+            "rank": int(rank),
+            "world_size": int(world_size),
+            "epoch": int(epoch),
+            "batch_cursor": int(batch_cursor),
+            "optimizer_step": int(optimizer_step),
+        },
+    }
+    torch.save(payload, temporary)
+    os.replace(temporary, target)
+    return target
+
+
+def write_rank_rng_manifest(checkpoint_path: str | Path, *, world_size: int) -> Path:
+    directory = _rank_rng_dir(checkpoint_path)
+    expected = [directory / f"rank_{rank:05d}.pt" for rank in range(int(world_size))]
+    missing = [str(path.name) for path in expected if not path.exists()]
+    if missing:
+        raise RuntimeError(f"Cannot publish rank RNG manifest; missing sidecars: {missing}")
+    target = directory / "manifest.json"
+    temporary = directory / f".manifest.{os.getpid()}.tmp"
+    temporary.write_text(
+        json.dumps({"world_size": int(world_size), "ranks": list(range(int(world_size)))}, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
+    return target
+
+
+def load_rank_rng_state(
+    checkpoint_path: str | Path,
+    *,
+    rank: int,
+    world_size: int,
+    return_payload: bool = False,
+) -> dict[str, Any]:
+    directory = _rank_rng_dir(checkpoint_path)
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(f"Missing distributed RNG manifest for {checkpoint_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if int(manifest.get("world_size", -1)) != int(world_size):
+        raise RuntimeError(
+            f"Checkpoint world size {manifest.get('world_size')} does not match current world size {world_size}"
+        )
+    sidecar = directory / f"rank_{int(rank):05d}.pt"
+    if not sidecar.exists():
+        raise RuntimeError(f"Missing RNG sidecar for rank {rank}")
+    payload = torch.load(sidecar, map_location="cpu", weights_only=False)
+    metadata = dict(payload["metadata"])
+    if metadata["rank"] != int(rank) or metadata["world_size"] != int(world_size):
+        raise RuntimeError("Rank RNG sidecar metadata mismatch")
+    _restore_rng_state(payload["rng_state"])
+    if return_payload:
+        return {"metadata": metadata, "sampler_state": payload.get("sampler_state")}
+    return metadata
 
 
 def save_checkpoint(

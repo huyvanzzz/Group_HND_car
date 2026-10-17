@@ -83,6 +83,15 @@ class FusionConfig:
     visual_self_attention_mlp_ratio: float = 2.0
     visual_self_attention_dropout: float = 0.0
     visual_self_attention_residual_scale: float = 1e-2
+    stage1_top_k: int = 196
+    stage2_top_k: int = 49
+    stage2_layer: int = 2
+    min_tokens_per_camera: int = 1
+    stage1_relevance_mode: str = "shifted_max_cosine"
+    beta_start: float = 0.2
+    beta_end: float = 0.0
+    beta_schedule: str = "linear"
+    tau: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -184,8 +193,34 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if adapter_name not in {"none", "minidrive_di"}:
         raise ValueError("model.adapter.name must be one of: none, minidrive_di")
     fusion_name = str(fusion_raw.get("name", "gpa"))
-    if fusion_name not in {"gpa", "question_guided_router"}:
-        raise ValueError("model.fusion.name must be one of: gpa, question_guided_router")
+    if fusion_name not in {"gpa", "question_guided_router", "mvpruner_two_stage"}:
+        raise ValueError("model.fusion.name must be one of: gpa, question_guided_router, mvpruner_two_stage")
+    stage1_top_k = int(fusion_raw.get("stage1_top_k", len(view_order) * int(vision_raw.get("seq_len", 49))))
+    stage2_top_k = int(fusion_raw.get("stage2_top_k", fusion_raw.get("top_k", vision_raw.get("seq_len", 49))))
+    minimum_per_camera = int(fusion_raw.get("min_tokens_per_camera", 1))
+    relevance_mode = str(fusion_raw.get("stage1_relevance_mode", "shifted_max_cosine"))
+    beta_start = float(fusion_raw.get("beta_start", 0.2))
+    beta_end = float(fusion_raw.get("beta_end", 0.0))
+    beta_schedule = str(fusion_raw.get("beta_schedule", "linear"))
+    tau = float(fusion_raw.get("tau", 1.0))
+    if fusion_name == "mvpruner_two_stage":
+        total_visual = len(view_order) * int(_require(vision_raw, "seq_len"))
+        if not (len(view_order) * minimum_per_camera <= stage2_top_k <= stage1_top_k <= total_visual):
+            raise ValueError("mvpruner budgets must satisfy views*minimum <= stage2_top_k <= stage1_top_k <= total visual tokens")
+        if relevance_mode not in {"shifted_max_cosine", "diversity_only"}:
+            raise ValueError("stage1_relevance_mode must be shifted_max_cosine or diversity_only")
+        if beta_start < beta_end or beta_end < 0:
+            raise ValueError("mvpruner beta must satisfy beta_start >= beta_end >= 0")
+        if beta_schedule != "linear":
+            raise ValueError("mvpruner beta_schedule must be linear")
+        if tau <= 0:
+            raise ValueError("mvpruner tau must be positive")
+        if int(fusion_raw.get("stage2_layer", 2)) != 2:
+            raise ValueError("mvpruner stage2_layer must be 2 for the tested four-block T5 adapter")
+        if adapter_name != "none":
+            raise ValueError("mvpruner_two_stage requires model.adapter.name=none")
+        if vision_training != "feature_cache":
+            raise ValueError("mvpruner_two_stage currently requires feature_cache vision training")
     expected_counts = data_raw.get("expected_counts") or {"train": 341381, "val": 19785, "test": 16817}
 
     return ExperimentConfig(
@@ -233,6 +268,15 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 visual_self_attention_mlp_ratio=float(fusion_raw.get("visual_self_attention_mlp_ratio", 2.0)),
                 visual_self_attention_dropout=float(fusion_raw.get("visual_self_attention_dropout", 0.0)),
                 visual_self_attention_residual_scale=float(fusion_raw.get("visual_self_attention_residual_scale", 1e-2)),
+                stage1_top_k=stage1_top_k,
+                stage2_top_k=stage2_top_k,
+                stage2_layer=int(fusion_raw.get("stage2_layer", 2)),
+                min_tokens_per_camera=minimum_per_camera,
+                stage1_relevance_mode=relevance_mode,
+                beta_start=beta_start,
+                beta_end=beta_end,
+                beta_schedule=beta_schedule,
+                tau=tau,
             ),
         ),
         training=TrainingConfig(

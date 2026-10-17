@@ -1,0 +1,311 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+def _require_finite(name: str, value: torch.Tensor) -> None:
+    if not bool(torch.isfinite(value).all()):
+        detached = value.detach()
+        raise FloatingPointError(
+            f"{name} contains NaN/Inf: shape={tuple(value.shape)} "
+            f"nan={int(torch.isnan(detached).sum())} inf={int(torch.isinf(detached).sum())}"
+        )
+
+
+def allocate_bounded_budget(
+    weights: torch.Tensor,
+    capacity: torch.Tensor,
+    *,
+    total: int,
+    minimum: int = 1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Allocate an exact integer budget independently for every batch row."""
+    if weights.ndim != 2 or capacity.shape != weights.shape:
+        raise ValueError("weights and capacity must have shape [B,V]")
+    _require_finite("allocation weights", weights)
+    if minimum * weights.shape[1] > total:
+        raise ValueError("minimum allocation exceeds total")
+    if bool((capacity < minimum).any()) or bool((capacity.sum(dim=1) < total).any()):
+        raise ValueError("capacity cannot satisfy requested allocation")
+
+    safe_weights = weights.clamp_min(0)
+    sums = safe_weights.sum(dim=1, keepdim=True)
+    fallback = capacity.to(weights.dtype)
+    safe_weights = torch.where(sums <= eps, fallback, safe_weights)
+    quotas = safe_weights / safe_weights.sum(dim=1, keepdim=True).clamp_min(eps) * float(total)
+    allocation = torch.floor(quotas).to(torch.long)
+    allocation = torch.maximum(allocation, torch.full_like(allocation, minimum))
+    allocation = torch.minimum(allocation, capacity.to(torch.long))
+
+    # Repair over-allocation caused by minimums/caps, then distribute every remainder.
+    for _ in range(total + weights.shape[1]):
+        excess = allocation.sum(dim=1) - total
+        removable = allocation > minimum
+        remove_priority = (allocation.to(quotas.dtype) - quotas).masked_fill(~removable, float("-inf"))
+        remove_idx = remove_priority.argmax(dim=1, keepdim=True)
+        remove = (excess > 0).to(torch.long).unsqueeze(1)
+        allocation.scatter_add_(1, remove_idx, -remove)
+
+    for _ in range(total):
+        need = total - allocation.sum(dim=1)
+        available = allocation < capacity
+        priority = (quotas - allocation.to(quotas.dtype)).masked_fill(~available, float("-inf"))
+        add_idx = priority.argmax(dim=1, keepdim=True)
+        add = (need > 0).to(torch.long).unsqueeze(1)
+        allocation.scatter_add_(1, add_idx, add)
+    if bool((allocation.sum(dim=1) != total).any()):
+        raise RuntimeError("bounded allocation failed to reach exact total")
+    return allocation
+
+
+def gather_position_bias(position_bias: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    if position_bias.ndim != 4 or indices.ndim != 2:
+        raise ValueError("position_bias must be [1|B,H,S,S] and indices [B,K]")
+    batch = indices.shape[0]
+    if position_bias.shape[0] == 1:
+        source = position_bias.expand(batch, -1, -1, -1)
+    elif position_bias.shape[0] == batch:
+        source = position_bias
+    else:
+        raise ValueError("position_bias batch dimension must be 1 or match indices")
+    heads = source.shape[1]
+    query_index = indices[:, None, :, None].expand(batch, heads, indices.shape[1], source.shape[-1])
+    gathered_queries = torch.gather(source, 2, query_index)
+    key_index = indices[:, None, None, :].expand(batch, heads, indices.shape[1], indices.shape[1])
+    return torch.gather(gathered_queries, 3, key_index)
+
+
+def validate_attention_numerics(logits: torch.Tensor, probabilities: torch.Tensor, key_mask: torch.Tensor) -> None:
+    if bool(torch.isnan(logits).any()) or bool(torch.isposinf(logits).any()):
+        raise FloatingPointError("attention logits contain NaN or +Inf")
+    valid = key_mask.to(torch.bool)[:, None, None, :].expand_as(logits)
+    if not bool(torch.isfinite(logits[valid]).all()):
+        raise FloatingPointError("attention logits at a valid key must be finite")
+    if not bool(torch.isfinite(probabilities).all()):
+        raise FloatingPointError("attention probabilities must be finite")
+    masked = ~valid
+    if masked.any() and not bool((probabilities[masked].abs() <= 1e-6).all()):
+        raise FloatingPointError("masked attention probabilities must be zero")
+
+
+@dataclass
+class Stage2Result:
+    values: torch.Tensor
+    indices: torch.Tensor
+    camera_ids: torch.Tensor
+    debug: dict[str, Any]
+
+
+class MVPrunerTwoStage(nn.Module):
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        vision_dim: int | None = None,
+        num_views: int = 6,
+        tokens_per_view: int = 49,
+        stage1_top_k: int = 196,
+        stage2_top_k: int = 49,
+        min_tokens_per_camera: int = 1,
+        relevance_mode: str = "shifted_max_cosine",
+        beta_start: float = 0.2,
+        beta_end: float = 0.0,
+        tau: float = 1.0,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        total = num_views * tokens_per_view
+        if not (num_views * min_tokens_per_camera <= stage2_top_k <= stage1_top_k <= total):
+            raise ValueError("invalid MVPruner token budgets")
+        self.d_model = d_model
+        self.vision_dim = int(vision_dim or d_model)
+        self.num_views = num_views
+        self.tokens_per_view = tokens_per_view
+        self.stage1_top_k = stage1_top_k
+        self.stage2_top_k = stage2_top_k
+        self.min_tokens_per_camera = min_tokens_per_camera
+        self.relevance_mode = relevance_mode
+        self.eps = eps
+        self.register_buffer("beta_start", torch.tensor(float(beta_start)))
+        self.register_buffer("beta_end", torch.tensor(float(beta_end)))
+        self.register_buffer("tau", torch.tensor(float(tau)))
+        self.register_buffer("beta_step", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("beta_target_steps", torch.tensor(1, dtype=torch.long))
+        self.camera_embeddings = nn.Embedding(num_views, self.vision_dim)
+
+    def add_camera_embeddings(self, visual: torch.Tensor) -> torch.Tensor:
+        if visual.ndim != 4 or visual.shape[1:3] != (self.num_views, self.tokens_per_view):
+            raise ValueError(
+                f"expected camera features [B,{self.num_views},{self.tokens_per_view},{self.vision_dim}]"
+            )
+        camera_ids = torch.arange(self.num_views, device=visual.device)
+        embeddings = self.camera_embeddings(camera_ids).view(1, self.num_views, 1, self.vision_dim)
+        return visual + embeddings
+
+    @property
+    def identity_mode(self) -> bool:
+        total = self.num_views * self.tokens_per_view
+        return self.stage1_top_k == total and self.stage2_top_k == total
+
+    def configure_beta(self, target_steps: int, *, reset: bool = False) -> None:
+        self.beta_target_steps.fill_(max(1, int(target_steps)))
+        if reset:
+            self.beta_step.zero_()
+
+    def current_beta(self) -> float:
+        denominator = max(1, int(self.beta_target_steps.item()) - 1)
+        fraction = min(1.0, int(self.beta_step.item()) / denominator)
+        return float(self.beta_start.item() + fraction * (self.beta_end.item() - self.beta_start.item()))
+
+    def step_beta(self) -> None:
+        self.beta_step.add_(1)
+
+    def _pairwise_distance(self, visual: torch.Tensor) -> torch.Tensor:
+        normalized = F.normalize(visual.float(), p=2, dim=-1, eps=self.eps)
+        distance = 1.0 - torch.matmul(normalized, normalized.transpose(-1, -2))
+        diagonal = torch.eye(self.tokens_per_view, dtype=torch.bool, device=visual.device)
+        return distance.masked_fill(diagonal.view(1, 1, self.tokens_per_view, self.tokens_per_view), float("inf"))
+
+    def stage1(
+        self, visual: torch.Tensor, question: torch.Tensor, question_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        batch, total, dim = visual.shape
+        expected = self.num_views * self.tokens_per_view
+        if total != expected or dim != self.d_model:
+            raise ValueError(f"expected visual [B,{expected},{self.d_model}]")
+        base_indices = torch.arange(total, device=visual.device).expand(batch, -1)
+        all_camera_ids = (base_indices // self.tokens_per_view).to(torch.long)
+        if self.stage1_top_k == total:
+            debug = {"raw_relevance": visual.new_zeros(batch, total), "shifted_relevance": visual.new_ones(batch, total)}
+            return visual, base_indices, all_camera_ids, debug
+
+        per_view = visual.reshape(batch, self.num_views, self.tokens_per_view, dim)
+        distances = self._pairwise_distance(per_view)
+        uniqueness = distances.min(dim=-1).values
+        _require_finite("stage1 uniqueness", uniqueness)
+
+        visual_norm = F.normalize(visual.float(), p=2, dim=-1, eps=self.eps)
+        question_norm = F.normalize(question.float(), p=2, dim=-1, eps=self.eps)
+        similarity = torch.matmul(visual_norm, question_norm.transpose(1, 2))
+        similarity = similarity.masked_fill(~question_mask.to(torch.bool).unsqueeze(1), float("-inf"))
+        raw_relevance = similarity.max(dim=-1).values
+        _require_finite("stage1 relevance", raw_relevance)
+        shifted = ((raw_relevance + 1.0) * 0.5).clamp(0.0, 1.0)
+        relevance = torch.ones_like(shifted) if self.relevance_mode == "diversity_only" else shifted
+        relevance = relevance.reshape(batch, self.num_views, self.tokens_per_view)
+
+        camera_weights = uniqueness.mean(dim=-1)
+        capacity = torch.full_like(camera_weights, self.tokens_per_view, dtype=torch.long)
+        budgets = allocate_bounded_budget(
+            camera_weights, capacity, total=self.stage1_top_k, minimum=self.min_tokens_per_camera, eps=self.eps
+        )
+
+        selected = torch.zeros_like(uniqueness, dtype=torch.bool)
+        running_uniqueness = uniqueness.clone()
+        for step in range(self.tokens_per_view):
+            active = step < budgets
+            importance = running_uniqueness * relevance
+            importance = importance.masked_fill(selected | ~active.unsqueeze(-1), float("-inf"))
+            chosen = importance.argmax(dim=-1)
+            addition = torch.zeros_like(selected).scatter(-1, chosen.unsqueeze(-1), active.unsqueeze(-1))
+            selected |= addition
+            chosen_distance = torch.gather(
+                distances, -1, chosen.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.tokens_per_view, 1)
+            ).squeeze(-1)
+            running_uniqueness = torch.minimum(running_uniqueness, chosen_distance)
+
+        global_selected = selected.reshape(batch, total)
+        sortable = torch.where(global_selected, base_indices, torch.full_like(base_indices, total))
+        indices = sortable.topk(self.stage1_top_k, dim=1, largest=False, sorted=True).values
+        gathered = torch.gather(visual, 1, indices.unsqueeze(-1).expand(-1, -1, dim))
+        camera_ids = indices // self.tokens_per_view
+        debug = {
+            "raw_relevance": raw_relevance,
+            "shifted_relevance": shifted,
+            "stage1_budgets": budgets,
+            "stage1_indices": indices,
+        }
+        return gathered.to(visual.dtype), indices, camera_ids, debug
+
+    def _relaxed_slots(self, logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        hard_ranked = logits.topk(k, dim=-1, sorted=True).indices
+        remaining = logits
+        slots = []
+        for _ in range(k):
+            probability = torch.softmax(remaining / float(self.tau.item()), dim=-1)
+            slots.append(probability)
+            remaining = remaining + torch.log((1.0 - probability).clamp(self.eps, 1.0))
+        return hard_ranked, torch.stack(slots, dim=-2)
+
+    def stage2_from_scores(
+        self,
+        values: torch.Tensor,
+        scores: torch.Tensor,
+        camera_ids: torch.Tensor,
+        *,
+        training: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        batch, count, dim = values.shape
+        use_training = self.training if training is None else training
+        if self.stage2_top_k == count:
+            indices = torch.arange(count, device=values.device).expand(batch, -1)
+            return values, indices, camera_ids, {"stage2_indices": indices}
+        _require_finite("stage2 scores", scores)
+        counts = torch.stack([(camera_ids == p).sum(dim=1) for p in range(self.num_views)], dim=1)
+        camera_relevance = torch.stack(
+            [
+                (scores * (camera_ids == p)).sum(dim=1) / counts[:, p].clamp_min(1)
+                for p in range(self.num_views)
+            ],
+            dim=1,
+        )
+        low = camera_relevance.min(dim=1, keepdim=True).values
+        high = camera_relevance.max(dim=1, keepdim=True).values
+        normalized = (camera_relevance - low) / (high - low).clamp_min(self.eps)
+        relevance_share = torch.softmax(normalized, dim=1)
+        first_share = counts.to(scores.dtype) / counts.sum(dim=1, keepdim=True).clamp_min(1)
+        weights = counts.to(scores.dtype) * (1.0 + relevance_share - first_share).clamp(0.0, 2.0)
+        budgets = allocate_bounded_budget(
+            weights, counts, total=self.stage2_top_k, minimum=self.min_tokens_per_camera, eps=self.eps
+        )
+
+        beta = self.current_beta() if use_training else 0.0
+        camera_axis = torch.arange(self.num_views, device=values.device).view(1, self.num_views, 1)
+        candidate_mask = camera_ids.unsqueeze(1) == camera_axis
+        logits = scores.clamp_min(self.eps).log().unsqueeze(1).expand(-1, self.num_views, -1)
+        logits = logits.masked_fill(~candidate_mask, float("-inf"))
+        if use_training and beta > 0:
+            uniform = torch.rand_like(logits).clamp(self.eps, 1.0 - self.eps)
+            noise = -torch.log(-torch.log(uniform))
+            logits = torch.where(candidate_mask, logits + beta * noise, logits)
+
+        max_slots = min(count, self.stage2_top_k - (self.num_views - 1) * self.min_tokens_per_camera)
+        hard_slots, soft_slots = self._relaxed_slots(logits.float(), max_slots)
+        slot_axis = torch.arange(max_slots, device=values.device).view(1, 1, max_slots)
+        active_slots = slot_axis < budgets.unsqueeze(-1)
+        sentinel = torch.full_like(hard_slots, count)
+        hard_for_sort = torch.where(active_slots, hard_slots, sentinel)
+
+        flat_hard = hard_for_sort.reshape(batch, -1)
+        flat_soft = soft_slots.reshape(batch, -1, count)
+        canonical_order = flat_hard.argsort(dim=1)[:, : self.stage2_top_k]
+        indices = torch.gather(flat_hard, 1, canonical_order)
+        p_soft = torch.gather(flat_soft, 1, canonical_order.unsqueeze(-1).expand(-1, -1, count)).to(values.dtype)
+        p_hard = values.new_zeros(batch, self.stage2_top_k, count).scatter(2, indices.unsqueeze(-1), 1.0)
+        p_ste = p_hard - p_soft.detach() + p_soft
+        result = torch.matmul(p_ste, values)
+        selected_cameras = torch.gather(camera_ids, 1, indices)
+        debug = {
+            "stage2_indices": indices,
+            "stage2_budgets": budgets,
+            "camera_relevance": camera_relevance,
+            "p_soft": p_soft,
+            "p_hard": p_hard,
+        }
+        return result, indices, selected_cameras, debug

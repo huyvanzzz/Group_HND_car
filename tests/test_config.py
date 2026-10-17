@@ -189,6 +189,37 @@ def test_accelerate_is_declared_dependency():
     assert "accelerate" in pyproject["project"]["dependencies"]
 
 
+def test_loads_mvpruner_profile_and_exact_transformers_extra():
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml")
+
+    assert cfg.model.fusion.name == "mvpruner_two_stage"
+    assert cfg.model.fusion.stage1_top_k == 196
+    assert cfg.model.fusion.stage2_top_k == 49
+    assert cfg.model.fusion.stage2_layer == 2
+    assert cfg.model.fusion.min_tokens_per_camera == 1
+    assert cfg.model.fusion.stage1_relevance_mode == "shifted_max_cosine"
+    assert cfg.model.fusion.beta_start == 0.2
+    assert cfg.model.fusion.beta_end == 0.0
+    assert cfg.model.fusion.beta_schedule == "linear"
+    assert cfg.model.fusion.tau == 1.0
+    assert cfg.model.adapter.name == "none"
+    assert cfg.training.vision_training == "feature_cache"
+
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    assert "transformers==4.44.2" in pyproject["project"]["optional-dependencies"]["mvpruner"]
+
+
+def test_rejects_invalid_mvpruner_budget(tmp_path: Path):
+    source = Path("configs/repvit_t5_efficient_mini_kaggle_2gpu_router.yaml").read_text(encoding="utf-8")
+    source = source.replace("name: question_guided_router", "name: mvpruner_two_stage")
+    source = source.replace("top_k: 49", "stage1_top_k: 20\n    stage2_top_k: 21")
+    path = tmp_path / "bad_mvpruner.yaml"
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="stage2_top_k"):
+        load_config(path)
+
+
 def test_rejects_non_canonical_view_order(tmp_path: Path):
     config_path = tmp_path / "bad.yaml"
     config_path.write_text(

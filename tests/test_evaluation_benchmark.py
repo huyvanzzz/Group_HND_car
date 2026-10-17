@@ -1,6 +1,6 @@
 import json
 
-from efficient_vlm_ad.benchmarking import summarize_latencies
+from efficient_vlm_ad.benchmarking import summarize_component_events, summarize_latencies
 from efficient_vlm_ad.evaluation import generation_diagnostics, metric_display_values, write_generation_diagnostics, write_predictions
 
 
@@ -39,6 +39,23 @@ def test_summarize_latencies_computes_generation_ms_per_output_token():
     assert summary["e2e_mean_ms"] == 300.0
     assert summary["generation_mean_ms"] == 200.0
     assert summary["average_generation_ms_per_output_token"] == 20.0
+
+
+def test_summarize_component_events_reports_per_iteration_cpu_and_cuda_time():
+    event = type(
+        "Event",
+        (),
+        {
+            "key": "mvpruner.stage1_dra_ccts",
+            "cpu_time_total": 4000.0,
+            "device_time_total": 2000.0,
+        },
+    )()
+
+    summary = summarize_component_events([event], iterations=2)
+
+    assert summary["mvpruner.stage1_dra_ccts"]["cpu_mean_ms"] == 2.0
+    assert summary["mvpruner.stage1_dra_ccts"]["cuda_mean_ms"] == 1.0
 
 
 def test_metric_display_values_scales_caption_metrics():

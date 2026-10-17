@@ -291,6 +291,107 @@ generation:
     assert all(forbidden_progress_keys.isdisjoint(row) for row in progress_rows)
 
 
+def test_mvpruner_offline_smoke_cli_sequence(tmp_path: Path):
+    data_root = tmp_path / "dataset"
+    _make_fake_data(data_root, rows_per_split=2)
+    output_dir = tmp_path / "outputs"
+    cfg = tmp_path / "mvpruner_config.yaml"
+    cfg.write_text(
+        f"""
+project:
+  output_dir: {output_dir.as_posix()}
+data:
+  hf_repo_id: local/fake
+  local_dir: {data_root.as_posix()}
+  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
+  expected_counts: {{train: 2, val: 2, test: 2}}
+model:
+  profile: offline_mvpruner
+  vision: {{name: fake_vision, model_id: fake, output_dim: 12, seq_len: 4, image_size: 16}}
+  text: {{model_id: fake_t5, d_model: 8}}
+  adapter: {{name: none}}
+  fusion:
+    name: mvpruner_two_stage
+    stage1_top_k: 12
+    stage2_top_k: 6
+    stage2_layer: 2
+    min_tokens_per_camera: 1
+    stage1_relevance_mode: shifted_max_cosine
+    beta_start: 0.2
+    beta_end: 0.0
+    beta_schedule: linear
+    tau: 1.0
+cache:
+  dir: {str(output_dir / "cache").replace(chr(92), "/")}
+runtime:
+  device: cpu
+  precision: fp32
+training:
+  vision_training: feature_cache
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 1
+  align_epochs: 1
+  finetune_epochs: 1
+  gpa_hidden_size: 4
+generation:
+  max_new_tokens: 2
+  num_beams: 1
+evaluation:
+  eval_batch_size: 2
+  benchmark_max_samples: 1
+""",
+        encoding="utf-8",
+    )
+
+    commands = [
+        ["prepare-data", "--config", str(cfg), "--subset", "smoke"],
+        ["prepare-features", "--config", str(cfg), "--subset", "smoke"],
+        ["train", "--config", str(cfg), "--stage", "align", "--max-steps", "1", "--debug", "--debug-samples", "1"],
+        [
+            "train",
+            "--config",
+            str(cfg),
+            "--stage",
+            "finetune",
+            "--resume",
+            str(output_dir / "checkpoints" / "align_best.pt"),
+            "--max-steps",
+            "1",
+        ],
+        [
+            "evaluate",
+            "--config",
+            str(cfg),
+            "--checkpoint",
+            str(output_dir / "checkpoints" / "finetune_latest.pt"),
+            "--max-samples",
+            "2",
+            "--batch-size",
+            "2",
+        ],
+        [
+            "benchmark",
+            "--config",
+            str(cfg),
+            "--checkpoint",
+            str(output_dir / "checkpoints" / "finetune_latest.pt"),
+            "--max-samples",
+            "1",
+        ],
+    ]
+    for command in commands:
+        subprocess.run([sys.executable, "-m", "efficient_vlm_ad", *command], check=True)
+
+    align = torch.load(output_dir / "checkpoints" / "align_latest.pt", map_location="cpu", weights_only=False)
+    assert align["metadata"]["mvpruner"]["stage1_top_k"] == 12
+    assert align["metadata"]["mvpruner"]["stage2_top_k"] == 6
+    assert align["metadata"]["mvpruner"]["beta_step"] == 1
+    assert (output_dir / "checkpoints" / "align_latest.pt.rng" / "rank_00000.pt").exists()
+    assert (output_dir / "predictions.jsonl").exists()
+    assert (output_dir / "benchmark.json").exists()
+
+
 def test_epoch_training_saves_latest_best_and_final_alias(tmp_path: Path):
     data_root = tmp_path / "dataset"
     _make_fake_data(data_root, rows_per_split=2)

@@ -5,6 +5,7 @@ from torch import nn
 
 from .adapters import DynamicInstructionAdapter
 from .router import QuestionGuidedTokenRouter
+from .mvpruner import MVPrunerTwoStage
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
 from ..tokenization import ensure_special_less_than_token
@@ -130,6 +131,24 @@ class FakeVisionEncoder(nn.Module):
 
 def build_text_and_tokenizer(cfg):
     if cfg.model.text.model_id == "fake_t5":
+        if cfg.model.fusion.name == "mvpruner_two_stage":
+            from transformers import T5Config, T5ForConditionalGeneration
+
+            heads = 2 if cfg.model.text.d_model % 2 == 0 else 1
+            config = T5Config(
+                vocab_size=4096,
+                d_model=cfg.model.text.d_model,
+                d_kv=cfg.model.text.d_model // heads,
+                d_ff=cfg.model.text.d_model * 2,
+                num_layers=4,
+                num_decoder_layers=2,
+                num_heads=heads,
+                dropout_rate=0.0,
+                decoder_start_token_id=0,
+                pad_token_id=0,
+                eos_token_id=1,
+            )
+            return T5ForConditionalGeneration(config), SimpleTokenizer()
         return TinySeq2Seq(cfg.model.text.d_model), SimpleTokenizer()
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -196,6 +215,21 @@ def build_visual_fusion(cfg):
             visual_self_attention_mlp_ratio=cfg.model.fusion.visual_self_attention_mlp_ratio,
             visual_self_attention_dropout=cfg.model.fusion.visual_self_attention_dropout,
             visual_self_attention_residual_scale=cfg.model.fusion.visual_self_attention_residual_scale,
+        )
+    if cfg.model.fusion.name == "mvpruner_two_stage":
+        return MVPrunerTwoStage(
+            d_model=cfg.model.text.d_model,
+            vision_dim=cfg.model.vision.output_dim,
+            num_views=len(cfg.data.view_order),
+            tokens_per_view=cfg.model.vision.seq_len,
+            stage1_top_k=cfg.model.fusion.stage1_top_k,
+            stage2_top_k=cfg.model.fusion.stage2_top_k,
+            min_tokens_per_camera=cfg.model.fusion.min_tokens_per_camera,
+            relevance_mode=cfg.model.fusion.stage1_relevance_mode,
+            beta_start=cfg.model.fusion.beta_start,
+            beta_end=cfg.model.fusion.beta_end,
+            tau=cfg.model.fusion.tau,
+            eps=cfg.model.fusion.eps,
         )
     raise ValueError(f"Unknown fusion: {cfg.model.fusion.name}")
 

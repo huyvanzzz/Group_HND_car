@@ -6,6 +6,7 @@ from efficient_vlm_ad.modeling.gpa import GatedPoolingAttention
 from efficient_vlm_ad.modeling.factory import FakeVisionEncoder, build_end_to_end_vlm_model, build_vlm_model
 from efficient_vlm_ad.modeling.multimodal import MultiModalProjector, set_trainable_for_stage
 from efficient_vlm_ad.modeling.router import QuestionGuidedTokenRouter, VisualSelfAttentionBlock, compute_tau_decay
+from efficient_vlm_ad.modeling.mvpruner import MVPrunerTwoStage
 
 
 def test_gpa_preserves_token_grid_and_returns_view_weights():
@@ -351,6 +352,70 @@ def test_router_model_forward_reports_router_numerics():
     assert report["router"]["selected_tokens_after_norm"]["finite"] is True
     assert report["router"]["hard_khot_sum"] == [4.0]
     assert report["router"]["camera_histogram"][0] and sum(report["router"]["camera_histogram"][0]) == 4
+
+
+def test_mvpruner_model_runs_offline_forward_and_generation():
+    from efficient_vlm_ad.config import (
+        AdapterConfig,
+        CacheConfig,
+        DataConfig,
+        ExperimentConfig,
+        FusionConfig,
+        GenerationConfig,
+        ModelConfig,
+        ProjectConfig,
+        RuntimeConfig,
+        TextConfig,
+        TrainingConfig,
+        VisionConfig,
+        CAMERA_ORDER,
+    )
+    from efficient_vlm_ad.modeling.factory import build_vlm_model
+
+    cfg = ExperimentConfig(
+        project=ProjectConfig(output_dir="outputs/test"),
+        data=DataConfig(hf_repo_id="fake", view_order=CAMERA_ORDER),
+        model=ModelConfig(
+            profile="offline_mvpruner",
+            vision=VisionConfig(name="fake_vision", model_id="fake", output_dim=12, seq_len=2, image_size=8),
+            text=TextConfig(model_id="fake_t5", d_model=8),
+            adapter=AdapterConfig(name="none"),
+            fusion=FusionConfig(
+                name="mvpruner_two_stage",
+                stage1_top_k=8,
+                stage2_top_k=6,
+                stage2_layer=2,
+                min_tokens_per_camera=1,
+                beta_start=0.0,
+                beta_end=0.0,
+                tau=1.0,
+            ),
+        ),
+        training=TrainingConfig(batch_size=2, gradient_accumulation_steps=1, vision_training="feature_cache"),
+        cache=CacheConfig(dir="outputs/cache"),
+        runtime=RuntimeConfig(device="cpu", precision="fp32"),
+        generation=GenerationConfig(max_new_tokens=3),
+    )
+    model, _ = build_vlm_model(cfg)
+    assert isinstance(model.visual_fusion, MVPrunerTwoStage)
+    visual = torch.randn(2, 6, 2, 12)
+    input_ids = torch.tensor([[2, 3, 0], [4, 5, 6]])
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+    labels = torch.tensor([[2, 1], [3, 1]])
+
+    output = model(input_ids=input_ids, attention_mask=mask, visual_features=visual, labels=labels)
+    output.loss.backward()
+    generated = model.generate_from_features(
+        input_ids=input_ids,
+        attention_mask=mask,
+        visual_features=visual,
+        max_new_tokens=3,
+    )
+
+    assert torch.isfinite(output.loss)
+    assert generated.shape[0] == 2
+    assert model.visual_token_len == 6
+    assert model.projector.proj.weight.grad is not None
 
 
 def test_end_to_end_model_forward_runs_vision_encoder_and_reports_numerics():

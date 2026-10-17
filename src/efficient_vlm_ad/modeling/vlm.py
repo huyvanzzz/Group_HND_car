@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.profiler import record_function
 
 from .gpa import GatedPoolingAttention
 from .multimodal import MultiModalProjector
 from .router import QuestionGuidedTokenRouter, router_debug_payload
+from .mvpruner import MVPrunerTwoStage
+from .t5_split_encoder import T5SplitEncoder
 
 
 def _stats(name: str, tensor: torch.Tensor) -> dict:
@@ -46,17 +49,69 @@ class EfficientVLMForAD(nn.Module):
         self.visual_fusion = visual_fusion
         self.seq_len = seq_len
         self.gpa = GatedPoolingAttention(seq_len=seq_len, input_dim=vision_dim, hidden_size=gpa_hidden_size)
-        projector_seq_len = visual_fusion.top_k if isinstance(visual_fusion, QuestionGuidedTokenRouter) else seq_len
+        if isinstance(visual_fusion, QuestionGuidedTokenRouter):
+            projector_seq_len = visual_fusion.top_k
+        elif isinstance(visual_fusion, MVPrunerTwoStage):
+            projector_seq_len = visual_fusion.num_views * visual_fusion.tokens_per_view
+        else:
+            projector_seq_len = seq_len
         self.projector = MultiModalProjector(input_dim=vision_dim, d_model=d_model, seq_len=projector_seq_len)
         self.modal_embeddings = nn.Embedding(2, d_model)
         side = int(seq_len**0.5)
         self.row_embeddings = nn.Embedding(side, vision_dim) if side * side == seq_len else None
         self.col_embeddings = nn.Embedding(side, vision_dim) if side * side == seq_len else None
         self.last_gpa_weights: torch.Tensor | None = None
+        self.t5_split_encoder = (
+            T5SplitEncoder(text_model.encoder, visual_fusion, split_layer=2)
+            if isinstance(visual_fusion, MVPrunerTwoStage)
+            else None
+        )
 
     @property
     def visual_token_len(self) -> int:
+        if isinstance(self.visual_fusion, MVPrunerTwoStage):
+            return self.visual_fusion.stage2_top_k
         return self.projector.seq_len
+
+    def _mvpruner_encode(
+        self,
+        *,
+        visual_features: torch.Tensor,
+        text_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        training: bool | None = None,
+    ):
+        assert isinstance(self.visual_fusion, MVPrunerTwoStage)
+        assert self.t5_split_encoder is not None
+        with record_function("mvpruner.spatial_camera_projector"):
+            enriched = self.visual_fusion.add_camera_embeddings(visual_features)
+            flat = enriched.reshape(enriched.shape[0], -1, enriched.shape[-1])
+            projected = self.projector(flat)
+        with record_function("mvpruner.stage1_dra_ccts"):
+            selected, _stage1_indices, camera_ids, stage1_debug = self.visual_fusion.stage1(
+                projected, text_tokens, attention_mask
+            )
+        visual_tokens = selected + self.modal_embeddings(
+            torch.ones((selected.shape[0], selected.shape[1]), dtype=torch.long, device=selected.device)
+        )
+        text_with_modal = text_tokens + self.modal_embeddings(torch.zeros_like(input_ids))
+        inputs_embeds = torch.cat([visual_tokens, text_with_modal], dim=1)
+        visual_mask = torch.ones(
+            (attention_mask.shape[0], selected.shape[1]), dtype=attention_mask.dtype, device=attention_mask.device
+        )
+        combined_mask = torch.cat([visual_mask, attention_mask], dim=1)
+        split = self.t5_split_encoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=combined_mask,
+            visual_count=selected.shape[1],
+            visual_camera_ids=camera_ids,
+            question_mask=attention_mask,
+            training=training,
+        )
+        split.debug.update(stage1_debug)
+        self.visual_fusion.last_debug = split.debug
+        return split
 
     def add_spatial_embeddings(self, visual_features: torch.Tensor) -> torch.Tensor:
         if self.row_embeddings is None or self.col_embeddings is None:
@@ -80,6 +135,18 @@ class EfficientVLMForAD(nn.Module):
         if self.visual_adapter is not None:
             visual_features = self.visual_adapter(visual_features, text_tokens, attention_mask)
         visual_features = self.add_spatial_embeddings(visual_features)
+        if isinstance(self.visual_fusion, MVPrunerTwoStage):
+            split = self._mvpruner_encode(
+                visual_features=visual_features,
+                text_tokens=text_tokens,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            return self.text_model(
+                encoder_outputs=split.encoder_outputs,
+                attention_mask=split.attention_mask,
+                labels=labels,
+            )
         if self.visual_fusion is not None:
             fused = self.visual_fusion(
                 visual_features,
@@ -127,6 +194,32 @@ class EfficientVLMForAD(nn.Module):
             report["adapter_output_visual_features"] = _stats("adapter_output_visual_features", visual_features)
         visual_features = self.add_spatial_embeddings(visual_features)
         report["spatial_visual_features"] = _stats("spatial_visual_features", visual_features)
+        if isinstance(self.visual_fusion, MVPrunerTwoStage):
+            split = self._mvpruner_encode(
+                visual_features=visual_features,
+                text_tokens=text_tokens,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            output = self.text_model(
+                encoder_outputs=split.encoder_outputs,
+                attention_mask=split.attention_mask,
+                labels=labels,
+            )
+            report["mvpruner_encoder_output"] = _stats(
+                "mvpruner_encoder_output", split.encoder_outputs.last_hidden_state
+            )
+            report["mvpruner_attention_mask"] = _stats("mvpruner_attention_mask", split.attention_mask)
+            report["mvpruner"] = {
+                "beta": self.visual_fusion.current_beta(),
+                "stage1_budgets": split.debug["stage1_budgets"].detach().cpu().tolist(),
+                "stage2_budgets": split.debug["stage2_budgets"].detach().cpu().tolist(),
+                "stage1_indices": split.debug["stage1_indices"].detach().cpu().tolist(),
+                "stage2_indices": split.debug["stage2_indices"].detach().cpu().tolist(),
+            }
+            report["logits"] = _stats("logits", output.logits)
+            report["loss"] = _stats("loss", output.loss.detach().reshape(1))
+            return report
         if self.visual_fusion is not None:
             fused, _router_report = self.visual_fusion(
                 visual_features,
@@ -197,6 +290,22 @@ class EfficientVLMForAD(nn.Module):
         if self.visual_adapter is not None:
             visual_features = self.visual_adapter(visual_features, text_tokens, attention_mask)
         visual_features = self.add_spatial_embeddings(visual_features)
+        if isinstance(self.visual_fusion, MVPrunerTwoStage):
+            split = self._mvpruner_encode(
+                visual_features=visual_features,
+                text_tokens=text_tokens,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                training=False,
+            )
+            return self.text_model.generate(
+                encoder_outputs=split.encoder_outputs,
+                attention_mask=split.attention_mask,
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+                early_stopping=early_stopping,
+                length_penalty=length_penalty,
+            )
         if self.visual_fusion is not None:
             was_training = self.visual_fusion.training
             self.visual_fusion.eval()
