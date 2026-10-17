@@ -257,16 +257,48 @@ def prepare_data(
         if subset == "smoke":
             root, files = _download_smoke_subset(cfg, token=token)
         else:
-            root = Path(
-                snapshot_download(
-                    cfg.data.hf_repo_id,
-                    repo_type="dataset",
-                    revision=cfg.data.revision,
-                    token=token,
-                    allow_patterns=["*.json", "nuscenes/samples/**", "multi_frame/**", "QA_dataset_nus/**"],
-                )
-            )
-            files = [str(p.relative_to(root)).replace("\\", "/") for p in root.rglob("*.json")]
+            max_retries = 20
+
+            for attempt in range(max_retries):
+                try:
+                    root = Path(
+                        snapshot_download(
+                            cfg.data.hf_repo_id,
+                            repo_type="dataset",
+                            revision=cfg.data.revision,
+                            token=token,
+                            allow_patterns=[
+                                "*.json",
+                                "nuscenes/samples/**",
+                                "multi_frame/**",
+                                "QA_dataset_nus/**",
+                            ],
+                            max_workers=2,
+                        )
+                    )
+                    break
+
+                except HfHubHTTPError as e:
+                    if e.response is None or e.response.status_code != 429:
+                        raise
+
+                    if attempt == max_retries - 1:
+                        raise RuntimeError(
+                            "Hugging Face rate limit 429 vẫn tiếp diễn sau nhiều lần retry."
+                        ) from e
+
+                    print(
+                        f"[HF 429] Rate limit. "
+                        f"Chờ 300 giây rồi tải tiếp "
+                        f"(lần {attempt + 1}/{max_retries}).",
+                        flush=True,
+                    )
+                    time.sleep(300)
+
+            files = [
+                str(p.relative_to(root)).replace("\\", "/")
+                for p in root.rglob("*.json")
+            ]
 
     candidates = split_file_candidates(files)
     all_records: dict[str, list[DatasetRecord]] = {}

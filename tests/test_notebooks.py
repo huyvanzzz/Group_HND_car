@@ -292,6 +292,20 @@ def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resum
     assert '"$PROFILE/cache/features.dat"' not in source
     assert "train --config \"$CONFIG\" --stage finetune $RESUME" in source
     assert "finetune_latest.pt" in source
+    assert "FINETUNE_CHECKPOINT_HF_REPO_ID = ''" in source
+    assert "FINETUNE_CHECKPOINT_HF_REPO_TYPE = 'model'" in source
+    assert "FINETUNE_CHECKPOINT_FILENAME = 'finetune_latest.pt'" in source
+    assert 'os.environ[\'FINETUNE_CHECKPOINT_HF_REPO_ID\']' in source
+    assert (
+        '--include "$FINETUNE_CHECKPOINT_FILENAME" "$FINETUNE_CHECKPOINT_FILENAME.rng/**"'
+        in source
+    )
+    assert 'if [ ! -f "$RESUME_PATH.rng/manifest.json" ]; then' in source
+    assert 'Distributed RNG manifest is missing' in source
+    assert source.index('hf download "$FINETUNE_CHECKPOINT_HF_REPO_ID"') < source.index(
+        "verify-resume-checkpoint"
+    )
+    assert source.index("verify-resume-checkpoint") < source.index("accelerate launch")
     assert "verify-resume-checkpoint" in source
     assert "--mixed_precision no" in source
     assert "--max-steps" not in source
