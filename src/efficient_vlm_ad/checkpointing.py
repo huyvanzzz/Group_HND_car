@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from .verification import assert_tied_weights_ok, retie_text_model_weights
-
+from .modeling.dnd import adapt_state_dict_for_dnd, non_dnd_missing_keys
 
 def _rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {
@@ -65,7 +65,12 @@ def load_checkpoint(
     map_location: str | torch.device = "cpu",
 ) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
-    model.load_state_dict(payload["model"])
+    result = model.load_state_dict(adapt_state_dict_for_dnd(model, payload["model"]), strict=False)
+    bad_missing = non_dnd_missing_keys(list(result.missing_keys))
+    if bad_missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint load failed: missing={bad_missing}, unexpected={list(result.unexpected_keys)}"
+        )
     retie_report = retie_text_model_weights(model)
     assert_tied_weights_ok(model)
     if optimizer is not None and retie_report["changed_parameter_objects"]:

@@ -33,6 +33,15 @@ def set_trainable_for_stage(modules: nn.ModuleDict, cfg, stage: str) -> None:
     _set_module_trainable(modules["vision"], train_vision)
     _set_module_trainable(modules["text"], stage == "finetune")
 
+    if hasattr(cfg.model, 'dnd') and cfg.model.dnd.enabled:
+        text = modules["text"]
+        if hasattr(text, "encoder"):
+            for block in text.encoder.block:
+                if hasattr(block, 'router'):  # là DNDT5Block
+                    _set_module_trainable(block.router, stage == "finetune")
+                    block.beta.requires_grad = (stage == "finetune")
+                    block.enabled = (stage == "finetune")
+
     for name in ("gpa", "projector", "spatial_pos", "modal_embeddings", "visual_adapter"):
         if name in modules:
             _set_module_trainable(modules[name], True)

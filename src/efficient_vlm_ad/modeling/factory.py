@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .dnd import DNDT5Block, DNDRouter, DNDScoreDispersionLoss
 from .adapters import DynamicInstructionAdapter
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
@@ -133,6 +134,28 @@ def build_text_and_tokenizer(cfg):
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
     model = AutoModelForSeq2SeqLM.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
+
+    if cfg.model.dnd.enabled:
+        num_blocks = len(model.encoder.block)  # = 4 với t5-efficient-mini
+        L_s = cfg.model.dnd.L_s
+        L_e = cfg.model.dnd.L_e if cfg.model.dnd.L_e > 0 else num_blocks + cfg.model.dnd.L_e
+        d_model = cfg.model.text.d_model  # = 384
+
+        if not (0 <= L_s < L_e <= num_blocks):
+            raise ValueError(
+                f"DND range không hợp lệ: [{L_s}, {L_e}) với {num_blocks} block encoder. "
+                f"Kiểm tra cfg.model.dnd.L_s/L_e."
+        )
+        
+        for i in range(L_s, L_e):
+            original_block = model.encoder.block[i]
+            model.encoder.block[i] = DNDT5Block(
+                original_block=original_block,
+                d_model=d_model,
+                k_target=cfg.model.dnd.k_target,
+                beta_init=cfg.model.dnd.beta_init,
+            )
+
     return model, tokenizer
 
 

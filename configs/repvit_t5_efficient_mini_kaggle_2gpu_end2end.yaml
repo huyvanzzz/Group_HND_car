@@ -23,6 +23,13 @@ model:
     model_id: google/t5-efficient-mini
     revision: af3816c2dbd386f7786f7757c536f0314084ff8b
     d_model: 384
+  dnd:
+    enabled: true
+    L_s: 1
+    L_e: -1
+    k_target: 0.2
+    beta_init: 0.1
+    lambda_sd: 3e-4
 training:
   vision_training: end_to_end
   batch_size: 8

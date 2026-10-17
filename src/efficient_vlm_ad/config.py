@@ -66,6 +66,15 @@ class AdapterConfig:
     dropout: float = 0.1
     residual_scale: float = 0.1
 
+@dataclass(frozen=True)
+class DNDConfig:
+    enabled: bool = False
+    L_s: int = 2          # Bỏ qua 2 block đầu của Encoder
+    L_e: int = -2         # Bỏ qua 2 block cuối (-2 nghĩa là len - 2)
+    k_target: float = 0.2 # Chọn top 20% token khó nhất
+    beta_init: float = 0.1
+    lambda_sd: float = 3e-4
+    lambda_dp: float = 0.02  # Mất mát phân tán điểm độ khó (không dùng nếu = 0)
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -73,7 +82,7 @@ class ModelConfig:
     vision: VisionConfig
     text: TextConfig
     adapter: AdapterConfig = field(default_factory=AdapterConfig)
-
+    dnd: DNDConfig = field(default_factory=DNDConfig)
 
 @dataclass(frozen=True)
 class TrainingConfig:
@@ -83,6 +92,7 @@ class TrainingConfig:
     vision_learning_rate: float | None = None
     text_learning_rate: float | None = None
     head_learning_rate: float | None = None
+    router_learning_rate: float | None = None
     weight_decay: float = 0.05
     scheduler_gamma: float = 0.9
     align_epochs: int = 6
@@ -149,6 +159,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     vision_raw = _require(model_raw, "vision")
     text_raw = _require(model_raw, "text")
     adapter_raw = model_raw.get("adapter", {})
+    dnd_raw = model_raw.get("dnd", {})
     train_raw = _require(raw, "training")
     cache_raw = raw.get("cache", {})
     runtime_raw = raw.get("runtime", {})
@@ -195,6 +206,15 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 dropout=float(adapter_raw.get("dropout", 0.1)),
                 residual_scale=float(adapter_raw.get("residual_scale", 0.1)),
             ),
+            dnd=DNDConfig(
+                enabled=bool(dnd_raw.get("enabled", False)),
+                L_s=int(dnd_raw.get("L_s", 2)),
+                L_e=int(dnd_raw.get("L_e", -2)),
+                k_target=float(dnd_raw.get("k_target", 0.2)),
+                beta_init=float(dnd_raw.get("beta_init", 0.1)),
+                lambda_sd=float(dnd_raw.get("lambda_sd", 3e-4)),
+                lambda_dp=float(dnd_raw.get("lambda_dp", 0.02)),
+            ),
         ),
         training=TrainingConfig(
             batch_size=int(_require(train_raw, "batch_size")),
@@ -203,6 +223,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             vision_learning_rate=float(train_raw["vision_learning_rate"]) if train_raw.get("vision_learning_rate") is not None else None,
             text_learning_rate=float(train_raw["text_learning_rate"]) if train_raw.get("text_learning_rate") is not None else None,
             head_learning_rate=float(train_raw["head_learning_rate"]) if train_raw.get("head_learning_rate") is not None else None,
+            router_learning_rate=float(train_raw["router_learning_rate"]) if train_raw.get("router_learning_rate") is not None else None,
             weight_decay=float(train_raw.get("weight_decay", 0.05)),
             scheduler_gamma=float(train_raw.get("scheduler_gamma", 0.9)),
             align_epochs=int(train_raw.get("align_epochs", 6)),

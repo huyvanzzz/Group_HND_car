@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import platform
 import shutil
 import time
@@ -13,6 +14,14 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
+from .modeling.dnd import (
+    DNDScoreDispersionLoss,
+    adapt_state_dict_for_dnd,
+    clear_dnd_scores,
+    collect_dnd_scores,
+    exclude_dnd_from_weight_decay,
+    non_dnd_missing_keys,
+)
 from .benchmarking import summarize_latencies
 from .cache import FeatureCacheManifest, create_memmap, validate_manifest
 from .checkpointing import _restore_rng_state, load_checkpoint, read_checkpoint_metadata, save_checkpoint
@@ -94,7 +103,6 @@ def _build_accelerator(cfg: ExperimentConfig):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     return Accelerator(
         mixed_precision=mixed_precision,
-        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
         kwargs_handlers=[ddp_kwargs],
     )
 
@@ -589,6 +597,14 @@ def _optimizer_param_groups(model: torch.nn.Module, cfg: ExperimentConfig) -> li
     return dedupe_optimizer_param_groups(groups)
 
 
+def _build_optimizer(model: torch.nn.Module, cfg: ExperimentConfig) -> torch.optim.Optimizer:
+    groups = _optimizer_param_groups(model, cfg)
+    if cfg.model.dnd.enabled:
+        router_lr = getattr(cfg.training, "router_learning_rate", None)
+        groups = exclude_dnd_from_weight_decay(model, groups, cfg.training.weight_decay, router_lr=router_lr)
+    return torch.optim.AdamW(groups, lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+
+
 def _module_has_parameters(module: torch.nn.Module) -> bool:
     return any(True for _ in module.parameters())
 
@@ -637,18 +653,17 @@ def _module_grad_norm(module: torch.nn.Module) -> float | None:
 
 def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
-    result = model.load_state_dict(payload["model"], strict=False)
+    result = model.load_state_dict(adapt_state_dict_for_dnd(model, payload["model"]), strict=False)
     retie_text_model_weights(model)
     assert_tied_weights_ok(model)
     unexpected = list(result.unexpected_keys)
-    missing_not_vision = [key for key in result.missing_keys if not key.startswith("vision_encoder.")]
+    missing_not_vision = non_dnd_missing_keys([key for key in result.missing_keys if not key.startswith("vision_encoder.")])
     if unexpected or missing_not_vision:
         raise RuntimeError(
             "Checkpoint is not compatible with the end-to-end model: "
             f"missing_non_vision={missing_not_vision}, unexpected={unexpected}"
         )
     return dict(payload.get("metadata", {}))
-
 
 def train_stage(
     cfg: ExperimentConfig,
@@ -724,7 +739,7 @@ def train_stage(
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_load_done", metadata=metadata)
 
-    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer = _build_optimizer(model, cfg)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
     if resume_training_payload is not None:
         try:
@@ -757,7 +772,7 @@ def train_stage(
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "dataloader_done", split=split, batches=len(loader))
         _heartbeat(dbg, started_at, "accelerator_prepare_start")
-    model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "accelerator_prepare_done")
     step_limit = _stage_step_limit(cfg, stage, max_steps)
@@ -769,6 +784,7 @@ def train_stage(
     optimizer.zero_grad(set_to_none=True)
     progress_interval = max(1, int(progress_log_every_steps or cfg.training.progress_log_every_steps))
     progress_writer = ProgressEventWriter(cfg.project.output_dir, enabled=bool(accelerator.is_main_process))
+    dnd_loss_fn = DNDScoreDispersionLoss(lambda_sd = cfg.model.dnd.lambda_sd, lambda_dp = cfg.model.dnd.lambda_dp) if cfg.model.dnd.enabled and stage == "finetune" else None
 
     for epoch in range(start_epoch, total_epochs):
         epoch_number = epoch + 1
@@ -808,11 +824,28 @@ def train_stage(
                 dbg.log("BATCH", _debug_batch_payload(batch, cfg, device))
             if isinstance(accelerator, _SingleProcessAccelerator):
                 batch = _move_training_batch(batch, device, cfg)
+            raw_model = accelerator.unwrap_model(model)            
+
             with accelerator.autocast():
                 output = model(**_batch_model_inputs(batch, cfg))
                 raw_loss = output.loss
-                loss = raw_loss / cfg.training.gradient_accumulation_steps
-            if not torch.isfinite(raw_loss.detach()).item():
+                dnd_loss = raw_loss.new_zeros(())
+                if dnd_loss_fn is not None:
+                    dnd_scores, dnd_masks = collect_dnd_scores(raw_model)
+                    if dnd_scores:
+                        dnd_loss = dnd_loss_fn(dnd_scores, dnd_masks)
+                loss = (raw_loss + dnd_loss) / cfg.training.gradient_accumulation_steps
+
+            loss_value = float(raw_loss.detach())
+            dnd_loss_value = float(dnd_loss.detach())
+            step_metrics = {
+                "loss": loss_value,
+                "dnd_loss": dnd_loss_value,
+                "total_loss": loss_value + dnd_loss_value,
+                "lr": _optimizer_lr(optimizer),
+                "finite_loss": math.isfinite(loss_value + dnd_loss_value),
+            }
+            if not step_metrics["finite_loss"]:
                 if accelerator.is_main_process:
                     progress_writer.write(
                         "train_step",
@@ -821,34 +854,25 @@ def train_stage(
                         global_step=global_step,
                         step_in_epoch=epoch_batches,
                         total_steps_epoch=bar_total,
-                        loss=float(raw_loss.detach().cpu().item()),
-                        lr=_optimizer_lr(optimizer),
-                        finite_loss=False,
                         elapsed_seconds=round(time.perf_counter() - epoch_started_at, 3),
                         steps_per_second=0.0,
                         estimated_epoch_remaining_seconds=None,
+                        **step_metrics,
                         **_cuda_memory_payload(device),
                     )
                     numerics = {}
-                    debug_model = accelerator.unwrap_model(model)
-                    if debug_numerics and hasattr(debug_model, "forward_debug"):
+                    if debug_numerics and hasattr(raw_model, "forward_debug"):
                         with torch.no_grad():
-                            numerics = debug_model.forward_debug(
-                                **_batch_model_inputs(batch, cfg),
-                            )
+                            numerics = raw_model.forward_debug(**_batch_model_inputs(batch, cfg))
                     dbg.log(
                         "NUMERICS",
-                        {
-                            "stage": "non_finite_loss",
-                            "step": global_step,
-                            "epoch": epoch_number,
-                            "loss": float(raw_loss.detach().cpu().item()),
-                            **numerics,
-                        },
+                        {"stage": "non_finite_loss", "step": global_step, "epoch": epoch_number,
+                         **step_metrics, **numerics},
                     )
-                raise FloatingPointError(f"Non-finite loss at step {global_step}: {raw_loss.detach().cpu().item()}")
+                raise FloatingPointError(f"Non-finite loss at step {global_step}: {step_metrics}")
             accelerator.backward(loss)
-            loss_value = float(raw_loss.detach().cpu().item())
+            if cfg.model.dnd.enabled:
+                clear_dnd_scores(raw_model)
             epoch_loss += loss_value
             epoch_batches += 1
             if debug and accelerator.is_main_process and global_step < start_step + dbg.samples:
@@ -856,6 +880,7 @@ def train_stage(
                     "step": global_step,
                     "epoch": epoch_number,
                     "loss": loss_value,
+                    "dnd_loss": dnd_loss_value,
                     "finite_loss": bool(torch.isfinite(raw_loss.detach()).item()),
                     "lr": _optimizer_lr(optimizer),
                 }
@@ -886,6 +911,7 @@ def train_stage(
                     step_in_epoch=epoch_batches,
                     total_steps_epoch=bar_total,
                     loss=loss_value,
+                    dnd_loss=dnd_loss_value,
                     lr=_optimizer_lr(optimizer),
                     finite_loss=True,
                     elapsed_seconds=round(elapsed, 3),
@@ -894,7 +920,7 @@ def train_stage(
                     **_cuda_memory_payload(device),
                 )
             if accelerator.is_main_process and hasattr(bar, "set_postfix"):
-                bar.set_postfix(loss=f"{loss_value:.4f}", lr=_optimizer_lr(optimizer), global_step=global_step)
+                bar.set_postfix(loss=f"{loss_value:.4f}", dnd_loss=f"{dnd_loss_value:.4f}", lr=_optimizer_lr(optimizer), global_step=global_step)
         if epoch_batches == 0:
             raise ValueError("Training dataloader was empty")
         if global_step % cfg.training.gradient_accumulation_steps != 0:
@@ -1137,9 +1163,9 @@ def diagnose_train(
     mark("dataloader", begin)
 
     begin = time.perf_counter()
-    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer = _build_optimizer(model, cfg)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
-    model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
     mark("accelerator_prepare", begin)
 
     begin = time.perf_counter()
@@ -1221,7 +1247,7 @@ def verify_align_checkpoint(
     trainable_policy_ok = not missing_trainable and not unexpected_trainable
 
     t5_report = t5_tied_weight_report(model.text_model)
-    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer = _build_optimizer(model, cfg)
     optimizer_report = optimizer_storage_duplicate_report(optimizer)
 
     if not t5_report["ok"]:
@@ -1270,6 +1296,7 @@ def verify_align_checkpoint(
         raise FloatingPointError(f"Finetune forward loss is not finite: {raw_loss.detach().cpu().item()}")
 
     raw_loss.backward()
+    clear_dnd_scores(model)
     if cfg.training.max_grad_norm is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
     optimizer.step()
@@ -1392,7 +1419,7 @@ def verify_resume_checkpoint(
     if not t5_report["ok"]:
         raise RuntimeError(f"T5 tied weights are not sharing storage: {t5_report}")
 
-    optimizer = torch.optim.AdamW(_optimizer_param_groups(model, cfg), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    optimizer = _build_optimizer(model, cfg)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
     optimizer.load_state_dict(payload["optimizer"])
     scheduler_state_loaded = payload.get("scheduler") is not None
@@ -1441,6 +1468,7 @@ def verify_resume_checkpoint(
         raise FloatingPointError(f"Resume forward loss is not finite: {raw_loss.detach().cpu().item()}")
 
     raw_loss.backward()
+    clear_dnd_scores(model)
     if cfg.training.max_grad_norm is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
     optimizer.step()
