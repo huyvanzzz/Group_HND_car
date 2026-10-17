@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -55,3 +56,33 @@ def caption_metrics(rows: list[dict], skip_meteor: bool = False) -> dict[str, fl
 def metric_display_values(metrics: dict[str, float]) -> dict[str, float]:
     scaled = {"BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr"}
     return {name: round(value * 100, 6) if name in scaled else value for name, value in metrics.items()}
+
+
+import re  # <-- Thêm vào đầu file cùng với json, Path, etc.
+
+
+def clean_prediction_text(text: str) -> str:
+    """Hậu xử lý văn bản dự đoán của T5 về đúng định dạng tag của DriveLM.
+    
+    Xử lý các trường hợp:
+    1. Bỏ khoảng trắng sau '<' và trước '>' (ví dụ: '< c1' -> '<c1', '10.0 >' -> '10.0>')
+    2. Bổ sung '<' nếu bị thiếu ở đầu tag (ví dụ: 'c2,CAM_FRONT...' -> '<c2,CAM_FRONT...')
+    3. Thêm dấu cách trước '<' nếu bị dính liền với từ phía trước (ví dụ: 'that<c1' -> 'that <c1')
+    """
+    if not text:
+        return text
+
+    # 1. Bỏ khoảng trắng sau dấu '<' và trước dấu '>'
+    text = re.sub(r'<\s+', '<', text)
+    text = re.sub(r'\s+>', '>', text)
+
+    # 2. Bổ sung '<' nếu bị thiếu ở đầu tag kết thúc bằng '>'
+    text = re.sub(r'(?<!<)\b(c\d+,[^>\n]+>)', r'<\1', text)
+
+    # 3. Thêm dấu cách trước '<' nếu dính liền với từ phía trước
+    # (Không thêm nếu đứng ở đầu câu, hoặc sau khoảng trắng, sau dấu mở ngoặc / nháy kép)
+    text = re.sub(r'(?<=[^\s(\[{"\'<])<', r' <', text)
+
+    # 4. Chuẩn hóa khoảng trắng thừa
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text

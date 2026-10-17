@@ -28,7 +28,7 @@ from .checkpointing import _restore_rng_state, load_checkpoint, read_checkpoint_
 from .config import ExperimentConfig
 from .data import format_prompt, normalize_camera_paths
 from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats
-from .evaluation import caption_metrics, metric_display_values, write_predictions
+from .evaluation import caption_metrics, metric_display_values, write_predictions, clean_prediction_text
 from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
@@ -1567,6 +1567,7 @@ def evaluate_checkpoint(
                     batch[key] = batch[key].to(device)
             ids = _generate_batch(model, batch, cfg)
             preds = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            preds = [clean_prediction_text(pred) for pred in preds]
             for offset, pred in enumerate(preds):
                 sample_index = processed + offset
                 if sample_index < dbg.samples:
