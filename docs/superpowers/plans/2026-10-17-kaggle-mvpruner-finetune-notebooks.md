@@ -6,13 +6,13 @@
 
 **Architecture:** Both notebooks are self-contained Kaggle entrypoints built around the tracked MVPruner profile. The debug notebook isolates artifacts with a copied runtime config; the full notebook uses the tracked config and optionally resumes a same-stage finetune checkpoint.
 
-**Tech Stack:** Jupyter notebook JSON, Bash cells, Python, Accelerate, Transformers 4.44.2, pytest.
+**Tech Stack:** Jupyter notebook JSON, Bash cells, Python, Accelerate, Transformers 4.46.3, pytest.
 
 ## Global Constraints
 
 - Keep `runtime.precision: fp32` and launch Accelerate with `--mixed_precision no`.
 - Never run `--stage align` or require an align checkpoint.
-- Install `.[mvpruner]` and fail fast unless Transformers is exactly 4.44.2.
+- Install `.[mvpruner]` and fail fast unless Transformers is exactly 4.46.3.
 - Load `HF_TOKEN` only from Kaggle Secrets.
 
 ---

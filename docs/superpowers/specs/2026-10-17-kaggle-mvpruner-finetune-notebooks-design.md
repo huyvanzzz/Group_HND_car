@@ -10,7 +10,7 @@ Tạo hai notebook Kaggle self-contained cho profile
   train `finetune` từ pretrained khi chưa có checkpoint, hoặc resume
   `finetune_latest.pt` cùng stage khi checkpoint tồn tại. Không chạy align và
   không yêu cầu align checkpoint.
-- Cả hai cài extra `.[mvpruner]`, kiểm tra Transformers 4.44.2, dùng hai GPU với
+- Cả hai cài extra `.[mvpruner]`, kiểm tra Transformers 4.46.3, dùng hai GPU với
   `--mixed_precision no`, lấy `HF_TOKEN` từ Kaggle Secrets và in các artifact cần
   thiết để debug/tải về.
 

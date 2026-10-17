@@ -260,8 +260,10 @@ def test_mvpruner_debug_notebook_runs_finetune_only_fp32_smoke():
     source = _notebook_source("notebooks/kaggle_debug_mvpruner_finetune.ipynb")
 
     assert "repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml" in source
-    assert 'transformers.__version__ == "4.44.2"' in source
+    assert 'transformers.__version__ == "4.46.3"' in source
     assert 'pip install -q -e ".[mvpruner]"' in source
+    assert "PYO3_USE_ABI3_FORWARD_COMPATIBILITY" not in source
+    assert "rustup.rs" not in source
     assert "prepare-data --config \"$RUNTIME_CONFIG\" --subset smoke" in source
     assert "prepare-features --config \"$RUNTIME_CONFIG\" --subset smoke" in source
     assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
@@ -276,8 +278,10 @@ def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resum
     source = _notebook_source("notebooks/kaggle_train_mvpruner_finetune.ipynb")
 
     assert "repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml" in source
-    assert 'transformers.__version__ == "4.44.2"' in source
+    assert 'transformers.__version__ == "4.46.3"' in source
     assert 'pip install -q -e ".[mvpruner]"' in source
+    assert "PYO3_USE_ABI3_FORWARD_COMPATIBILITY" not in source
+    assert "rustup.rs" not in source
     assert "prepare-data --config \"$CONFIG\" --subset full" in source
     assert "prepare-features --config \"$CONFIG\" --subset full" in source
     assert "train --config \"$CONFIG\" --stage finetune $RESUME" in source

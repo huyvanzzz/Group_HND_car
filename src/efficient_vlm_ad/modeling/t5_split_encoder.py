@@ -10,7 +10,7 @@ from torch.profiler import record_function
 from .mvpruner import MVPrunerTwoStage, gather_position_bias, validate_attention_numerics
 
 
-SUPPORTED_TRANSFORMERS = {"4.44.2"}
+SUPPORTED_TRANSFORMERS = {"4.46.3"}
 
 
 def require_supported_transformers() -> None:
@@ -33,7 +33,7 @@ class SplitEncoderResult:
 
 
 class T5SplitEncoder(nn.Module):
-    """Runs a Transformers 4.44.2 T5 encoder around an MVPruner Stage-2 boundary."""
+    """Runs a Transformers 4.46.3 T5 encoder around an MVPruner Stage-2 boundary."""
 
     def __init__(self, encoder: nn.Module, pruner: MVPrunerTwoStage, *, split_layer: int = 2) -> None:
         super().__init__()
@@ -62,6 +62,7 @@ class T5SplitEncoder(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_bias: torch.Tensor | None,
+        cache_position: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if getattr(self.encoder, "gradient_checkpointing", False) and self.training:
             output = self.encoder._gradient_checkpointing_func(
@@ -77,6 +78,8 @@ class T5SplitEncoder(nn.Module):
                 None,
                 False,
                 False,
+                False,
+                cache_position,
             )
         else:
             output = block(
@@ -85,8 +88,10 @@ class T5SplitEncoder(nn.Module):
                 position_bias=position_bias,
                 use_cache=False,
                 output_attentions=False,
+                return_dict=False,
+                cache_position=cache_position,
             )
-        # In Transformers 4.44.2 encoder blocks omit the cache slot when use_cache=False.
+        # In Transformers 4.46.3 encoder blocks omit the cache slot when use_cache=False.
         return output[0], output[1]
 
     @staticmethod
@@ -104,7 +109,7 @@ class T5SplitEncoder(nn.Module):
         key = attention.k(normed).view(batch, sequence, attention.n_heads, attention.key_value_proj_dim).transpose(1, 2)
         scaling = float(getattr(attention, "scaling", 1.0))
         logits = torch.matmul(query.float(), key.float().transpose(2, 3)) * scaling
-        # In Transformers 4.44.2 the position bias returned by block 0 already includes the additive padding mask.
+        # In Transformers 4.46.3 the position bias returned by block 0 already includes the additive padding mask.
         logits = logits + position_bias.float()
         probabilities = torch.softmax(logits, dim=-1)
         validate_attention_numerics(logits, probabilities, key_mask)
@@ -143,12 +148,17 @@ class T5SplitEncoder(nn.Module):
             raise ValueError("inputs_embeds length must equal visual_count + question length")
 
         extended_mask = self.encoder.get_extended_attention_mask(attention_mask, (batch, sequence))
+        cache_position = torch.arange(sequence, device=inputs_embeds.device)
         with record_function("mvpruner.t5_blocks_0_1"):
             hidden = self.encoder.dropout(inputs_embeds)
             position_bias = None
-            hidden, position_bias = self._run_block(self.encoder.block[0], hidden, extended_mask, position_bias)
+            hidden, position_bias = self._run_block(
+                self.encoder.block[0], hidden, extended_mask, position_bias, cache_position
+            )
             pre_dropout = self._pre_dropout_attention(self.encoder.block[1], hidden, position_bias, attention_mask)
-            hidden, position_bias = self._run_block(self.encoder.block[1], hidden, extended_mask, position_bias)
+            hidden, position_bias = self._run_block(
+                self.encoder.block[1], hidden, extended_mask, position_bias, cache_position
+            )
 
         with record_function("mvpruner.stage2_ira_gumbel"):
             scores = self._visual_relevance(pre_dropout, visual_count=visual_count, question_mask=question_mask)
@@ -163,11 +173,12 @@ class T5SplitEncoder(nn.Module):
         pruned_mask = torch.gather(attention_mask, 1, retained_indices)
         pruned_position_bias = gather_position_bias(position_bias, retained_indices)
         pruned_extended_mask = self.encoder.get_extended_attention_mask(pruned_mask, pruned_mask.shape)
+        pruned_cache_position = torch.arange(hidden.shape[1], device=hidden.device)
 
         with record_function("mvpruner.t5_blocks_2_3"):
             for block in self.encoder.block[self.split_layer :]:
                 hidden, pruned_position_bias = self._run_block(
-                    block, hidden, pruned_extended_mask, pruned_position_bias
+                    block, hidden, pruned_extended_mask, pruned_position_bias, pruned_cache_position
                 )
             hidden = self.encoder.final_layer_norm(hidden)
             hidden = self.encoder.dropout(hidden)

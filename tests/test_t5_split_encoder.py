@@ -35,8 +35,8 @@ def _identity_pruner() -> MVPrunerTwoStage:
 
 
 def test_requires_exact_tested_transformers_version(monkeypatch):
-    monkeypatch.setattr(transformers, "__version__", "4.45.0")
-    with pytest.raises(RuntimeError, match="4.44.2"):
+    monkeypatch.setattr(transformers, "__version__", "4.47.0")
+    with pytest.raises(RuntimeError, match="4.46.3"):
         require_supported_transformers()
 
 

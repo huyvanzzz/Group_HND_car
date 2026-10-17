@@ -28,7 +28,7 @@ modal embeddings đều được giữ. Loss baseline vẫn chỉ là T5 cross-e
 
 ## Chính sách số học và compatibility
 
-- Chỉ Transformers `4.44.2` đã được kiểm thử; phiên bản khác fail fast. Cài bằng
+- Chỉ Transformers `4.46.3` đã được kiểm thử; phiên bản khác fail fast. Cài bằng
   `pip install -e ".[mvpruner]"`.
 - T5 attention dùng scale 1.0. Stage 2 lấy probability trước attention dropout;
   dropout của nhánh hidden-state vẫn hoạt động bình thường.
@@ -36,10 +36,10 @@ modal embeddings đều được giữ. Loss baseline vẫn chỉ là T5 cross-e
   không hữu hạn ở key hợp lệ, relevance, allocation weight hoặc Gumbel score đều
   báo lỗi thay vì fallback âm thầm.
 - Position bias batch-size 1 được broadcast; bias batch-size B được gather riêng
-  từng sample. Mask đã nằm trong bias của Transformers 4.44.2 và không được cộng
+  từng sample. Mask đã nằm trong bias của Transformers 4.46.3 và không được cộng
   lần hai.
 - Custom split encoder hỗ trợ gradient checkpointing bằng đúng helper/interface
-  của T5 4.44.2.
+  của T5 4.46.3.
 
 ## Schedule và checkpoint
 
