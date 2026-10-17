@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 from .config import CAMERA_ORDER, ExperimentConfig
 from .data import normalize_camera_paths
@@ -109,6 +109,80 @@ def validate_split_counts(actual: dict[str, int], expected: dict[str, int], subs
         raise ValueError(f"Split count mismatch: {mismatches}")
 
 
+def _snapshot_root(downloaded_path: str | Path, repo_path: str) -> Path:
+    root = Path(downloaded_path)
+    for _ in Path(repo_path).parts:
+        root = root.parent
+    return root
+
+
+def _remote_camera_path(raw_path: str, repository_files: set[str]) -> str:
+    normalized = raw_path.replace("\\", "/").lstrip("./")
+    candidates = [normalized]
+    if normalized.startswith("data/"):
+        candidates.append(normalized.removeprefix("data/"))
+    for candidate in candidates:
+        if candidate in repository_files:
+            return candidate
+    raise FileNotFoundError(f"Camera file referenced by dataset metadata is absent from repository: {raw_path}")
+
+
+def _download_smoke_subset(
+    cfg: ExperimentConfig,
+    *,
+    token: str,
+    limit_per_split: int = 64,
+) -> tuple[Path, list[str]]:
+    api = HfApi()
+    repository_files = api.list_repo_files(
+        cfg.data.hf_repo_id,
+        repo_type="dataset",
+        revision=cfg.data.revision,
+        token=token,
+    )
+    split_candidates = split_file_candidates(repository_files)
+    if not split_candidates:
+        raise FileNotFoundError("No multi-frame train/val/test JSON files found in the Hugging Face dataset")
+
+    root: Path | None = None
+    selected_records: list[DatasetRecord] = []
+    for split, repo_path in split_candidates.items():
+        downloaded = hf_hub_download(
+            cfg.data.hf_repo_id,
+            filename=repo_path,
+            repo_type="dataset",
+            revision=cfg.data.revision,
+            token=token,
+        )
+        candidate_root = _snapshot_root(downloaded, repo_path)
+        if root is not None and candidate_root != root:
+            raise RuntimeError("Smoke metadata files resolved to different Hugging Face snapshot roots")
+        root = candidate_root
+        selected_records.extend(parse_dataset_json(downloaded, split)[:limit_per_split])
+
+    repository_file_set = set(repository_files)
+    image_paths = {
+        _remote_camera_path(camera_path, repository_file_set)
+        for record in selected_records
+        for camera_path in record.camera_paths.values()
+    }
+    for repo_path in sorted(image_paths):
+        downloaded = hf_hub_download(
+            cfg.data.hf_repo_id,
+            filename=repo_path,
+            repo_type="dataset",
+            revision=cfg.data.revision,
+            token=token,
+        )
+        candidate_root = _snapshot_root(downloaded, repo_path)
+        if root is not None and candidate_root != root:
+            raise RuntimeError("Smoke image files resolved to a different Hugging Face snapshot root")
+
+    if root is None:
+        raise RuntimeError("Smoke download completed without resolving a snapshot root")
+    return root, list(split_candidates.values())
+
+
 def inspect_hf_dataset(cfg: ExperimentConfig, token: str | None, debug: DebugPrinter | None = None) -> dict[str, Any]:
     if cfg.data.local_dir:
         files = [str(p.relative_to(cfg.data.local_dir)).replace("\\", "/") for p in Path(cfg.data.local_dir).rglob("*")]
@@ -180,16 +254,19 @@ def prepare_data(
         token = os.getenv("HF_TOKEN")
         if not token:
             raise RuntimeError("HF_TOKEN is required to download the private Hugging Face dataset")
-        root = Path(
-            snapshot_download(
-                cfg.data.hf_repo_id,
-                repo_type="dataset",
-                revision=cfg.data.revision,
-                token=token,
-                allow_patterns=["*.json", "nuscenes/samples/**", "multi_frame/**", "QA_dataset_nus/**"],
+        if subset == "smoke":
+            root, files = _download_smoke_subset(cfg, token=token)
+        else:
+            root = Path(
+                snapshot_download(
+                    cfg.data.hf_repo_id,
+                    repo_type="dataset",
+                    revision=cfg.data.revision,
+                    token=token,
+                    allow_patterns=["*.json", "nuscenes/samples/**", "multi_frame/**", "QA_dataset_nus/**"],
+                )
             )
-        )
-        files = [str(p.relative_to(root)).replace("\\", "/") for p in root.rglob("*.json")]
+            files = [str(p.relative_to(root)).replace("\\", "/") for p in root.rglob("*.json")]
 
     candidates = split_file_candidates(files)
     all_records: dict[str, list[DatasetRecord]] = {}

@@ -264,6 +264,8 @@ def test_mvpruner_debug_notebook_runs_finetune_only_fp32_smoke():
     assert 'pip install -q -e ".[mvpruner]"' in source
     assert "PYO3_USE_ABI3_FORWARD_COMPATIBILITY" not in source
     assert "rustup.rs" not in source
+    assert "os.environ['HF_HUB_DISABLE_XET'] = '1'" in source
+    assert "os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'" in source
     assert "prepare-data --config \"$RUNTIME_CONFIG\" --subset smoke" in source
     assert "prepare-features --config \"$RUNTIME_CONFIG\" --subset smoke" in source
     assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
@@ -282,8 +284,12 @@ def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resum
     assert 'pip install -q -e ".[mvpruner]"' in source
     assert "PYO3_USE_ABI3_FORWARD_COMPATIBILITY" not in source
     assert "rustup.rs" not in source
+    assert "os.environ['HF_HUB_DISABLE_XET'] = '1'" in source
+    assert "os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'" in source
     assert "prepare-data --config \"$CONFIG\" --subset full" in source
     assert "prepare-features --config \"$CONFIG\" --subset full" in source
+    assert '"$PROFILE/cache/features.float16.memmap"' in source
+    assert '"$PROFILE/cache/features.dat"' not in source
     assert "train --config \"$CONFIG\" --stage finetune $RESUME" in source
     assert "finetune_latest.pt" in source
     assert "verify-resume-checkpoint" in source
