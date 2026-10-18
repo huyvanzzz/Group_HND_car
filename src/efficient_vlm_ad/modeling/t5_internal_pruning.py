@@ -80,8 +80,8 @@ class T5InternalPruningVLMForAD(nn.Module):
         num_views: int = 6,
     ) -> None:
         super().__init__()
-        if selection_policy not in {"global_topk", "per_view_uniform", "ira"}:
-            raise ValueError("selection_policy must be one of: global_topk, per_view_uniform, ira")
+        if selection_policy not in {"global_topk", "per_view_uniform", "ira", "per_view_diversity"}:
+            raise ValueError("Unknown pruning selection_policy")
         if layer_policy not in {"middle", "index"}:
             raise ValueError("layer_policy must be one of: middle, index")
         self.text_model = text_model
@@ -290,6 +290,46 @@ class T5InternalPruningVLMForAD(nn.Module):
             budget_rows.append(budgets)
         return torch.stack(selected_rows), torch.stack(budget_rows)
 
+    @torch.no_grad()
+    def _select_diverse(self, scores: torch.Tensor, visual_hidden: torch.Tensor):
+        batch = scores.shape[0]
+        features = torch.nn.functional.normalize(
+            visual_hidden.detach().float().reshape(batch, self.num_views, self.seq_len, -1), dim=-1
+        )
+        distances = (1 - features @ features.transpose(-1, -2)).clamp(0, 2)
+        relevance = scores.detach().float().reshape(batch, self.num_views, self.seq_len)
+        # Exclude self-distance so nearest-neighbor uniqueness measures redundancy.
+        diagonal = torch.eye(self.seq_len, dtype=torch.bool, device=scores.device)
+        if self.seq_len > 1:
+            diversity = distances.masked_fill(diagonal, torch.inf).amin(dim=-1).mean(dim=-1)
+        else:
+            diversity = torch.ones((batch, self.num_views), device=scores.device)
+        selected_rows, budget_rows = [], []
+        for row in range(batch):
+            budgets = _largest_remainder(
+                self._keep_count(), diversity[row], self.min_keep_per_view, self.seq_len,
+            )
+            pieces = []
+            for view in range(self.num_views):
+                count = int(budgets[view].item())
+                if count == 0:
+                    continue
+                chosen = torch.zeros(self.seq_len, dtype=torch.bool, device=scores.device)
+                index = relevance[row, view].argmax()
+                selected = [index]
+                chosen[index] = True
+                uniqueness = distances[row, view, index]
+                for _ in range(1, count):
+                    merit = (uniqueness * relevance[row, view]).masked_fill(chosen, -torch.inf)
+                    index = merit.argmax()
+                    selected.append(index)
+                    chosen[index] = True
+                    uniqueness = torch.minimum(uniqueness, distances[row, view, index])
+                pieces.append(torch.stack(selected) + view * self.seq_len)
+            selected_rows.append(torch.cat(pieces).sort().values)
+            budget_rows.append(budgets)
+        return torch.stack(selected_rows), torch.stack(budget_rows)
+
     def _select_indices(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.selection_policy == "global_topk":
             return self._select_global_topk(scores)
@@ -303,7 +343,10 @@ class T5InternalPruningVLMForAD(nn.Module):
         attention_mask: torch.Tensor,
         scores: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        selected, budgets = self._select_indices(scores)
+        if self.selection_policy == "per_view_diversity":
+            selected, budgets = self._select_diverse(scores, hidden_states[:, : self.visual_token_count])
+        else:
+            selected, budgets = self._select_indices(scores)
         batch, _, width = hidden_states.shape
         visual_hidden = hidden_states[:, : self.visual_token_count, :]
         text_hidden = hidden_states[:, self.visual_token_count :, :]

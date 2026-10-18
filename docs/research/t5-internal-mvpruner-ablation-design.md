@@ -1,5 +1,23 @@
 # T5 Internal MVPruner-Style Ablation Design
 
+## A4: Diversity-aware quota and token selection
+
+Config: `configs/repvit_t5_efficient_mini_internal_pruning_a4_per_view_diversity.yaml`.
+All settings match A1 except output directory, profile and selection policy.
+The policy `per_view_diversity` allocates the 147-token budget per sample using
+each view's mean nearest-neighbor cosine distance (excluding self-pairs).
+Higher diversity receives more tokens, subject to the same minimum and capacity.
+All-zero diversity falls back to uniform weights. Within each view, initialize with the highest text-to-visual attention
+token. Repeatedly select the candidate maximizing minimum cosine distance to the
+selected set times its attention relevance. Distances use encoder hidden states
+at the pruning layer. Selected indices are sorted before sequence compaction.
+This is CCTS-inspired: relevance uses attention rather than the original paper's
+instruction cosine similarity. Allocation is DRA-inspired; a second pruning
+stage and IRA compensation are not included. Comparing A2 or A1 versus A4
+changes both allocation and selection. No trainable parameters are added.
+
+In the Kaggle notebook choose `ABLATION = "a4_per_view_diversity"`.
+
 Ngay cap nhat: 2026-10-05
 
 Branch thuc hien: `nguyet-t5-internal-mvpruner`

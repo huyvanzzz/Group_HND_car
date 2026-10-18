@@ -260,5 +260,6 @@ def test_diagnose_train_cli_reports_numerics_when_requested(tmp_path):
 
     debug_events = (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8")
     assert "[DEBUG][NUMERICS]" in result.stdout
-    assert '"inputs_embeds"' in debug_events
+    assert '"raw_visual_features"' in debug_events
+    assert '"pruning_scores"' in debug_events
     assert '"loss"' in debug_events

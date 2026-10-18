@@ -11,7 +11,7 @@ def test_runtime_cache_and_generation_config_loaded():
 
     assert cfg.cache.dir.endswith("cache")
     assert cfg.runtime.precision == "auto"
-    assert cfg.generation.max_new_tokens == 64
+    assert cfg.generation.max_new_tokens == 512
     assert cfg.training.batch_size == 16
     assert cfg.data.expected_counts["train"] == 341381
 
@@ -19,9 +19,9 @@ def test_runtime_cache_and_generation_config_loaded():
 def test_full_generation_config_loaded():
     cfg = load_config("configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml")
 
-    assert cfg.generation.max_new_tokens == 64
-    assert cfg.generation.num_beams == 1
-    assert cfg.generation.early_stopping is False
+    assert cfg.generation.max_new_tokens == 512
+    assert cfg.generation.num_beams == 3
+    assert cfg.generation.early_stopping is True
     assert cfg.generation.length_penalty == 1.0
 
 

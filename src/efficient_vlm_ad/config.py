@@ -151,8 +151,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("model.architecture must be: t5_internal_pruning")
     pruning_raw = model_raw.get("pruning") or {}
     pruning_selection_policy = str(pruning_raw.get("selection_policy", "global_topk"))
-    if pruning_selection_policy not in {"global_topk", "per_view_uniform", "ira"}:
-        raise ValueError("model.pruning.selection_policy must be one of: global_topk, per_view_uniform, ira")
+    if pruning_selection_policy not in {"global_topk", "per_view_uniform", "ira", "per_view_diversity"}:
+        raise ValueError("model.pruning.selection_policy must be one of: global_topk, per_view_uniform, ira, per_view_diversity")
     pruning_layer_policy = str(pruning_raw.get("layer_policy", "middle"))
     if pruning_layer_policy not in {"middle", "index"}:
         raise ValueError("model.pruning.layer_policy must be one of: middle, index")

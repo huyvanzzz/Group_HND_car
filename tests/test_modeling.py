@@ -27,6 +27,51 @@ def test_projector_maps_repvit_tokens_to_t5_mini_dimension():
     assert out.shape == (2, 49, 384)
 
 
+def test_diversity_selection_avoids_duplicate_features():
+    from efficient_vlm_ad.modeling.t5_internal_pruning import T5InternalPruningVLMForAD
+
+    model = T5InternalPruningVLMForAD(
+        text_model=torch.nn.Identity(), vision_dim=2, d_model=2,
+        seq_len=4, num_views=1, keep_ratio=0.5, min_keep_per_view=0,
+        selection_policy="per_view_diversity",
+    )
+    scores = torch.tensor([[0.9, 0.8, 0.7, 0.1]])
+    features = torch.tensor([[[1., 0.], [1., 0.], [0., 1.], [-1., 0.]]])
+    indices, budgets = model._select_diverse(scores, features)
+    assert indices.tolist() == [[0, 2]]
+    assert budgets.tolist() == [[2]]
+
+
+def test_diversity_quota_tracks_each_samples_diverse_camera():
+    from efficient_vlm_ad.modeling.t5_internal_pruning import T5InternalPruningVLMForAD
+
+    model = T5InternalPruningVLMForAD(
+        text_model=torch.nn.Identity(), vision_dim=2, d_model=2,
+        seq_len=4, num_views=2, keep_ratio=0.5, min_keep_per_view=1,
+        selection_policy="per_view_diversity",
+    )
+    duplicate = torch.tensor([[1., 0.]]).repeat(4, 1)
+    diverse = torch.tensor([[1., 0.], [0., 1.], [-1., 0.], [0., -1.]])
+    features = torch.stack([torch.cat([duplicate, diverse]), torch.cat([diverse, duplicate])])
+    indices, budgets = model._select_diverse(torch.ones(2, 8), features)
+    assert budgets.tolist() == [[1, 3], [3, 1]]
+    assert indices.shape == (2, 4)
+    assert all(len(set(row.tolist())) == 4 for row in indices)
+    _, fallback_budgets = model._select_diverse(torch.ones(2, 8), duplicate.repeat(2, 2, 1))
+    assert fallback_budgets.tolist() == [[2, 2], [2, 2]]
+
+
+def test_a4_matches_a1_except_identity_and_selection():
+    from dataclasses import asdict
+
+    a1 = asdict(load_config("configs/repvit_t5_efficient_mini_internal_pruning_a1_global_topk.yaml"))
+    a4 = asdict(load_config("configs/repvit_t5_efficient_mini_internal_pruning_a4_per_view_diversity.yaml"))
+    a4["project"]["output_dir"] = a1["project"]["output_dir"]
+    a4["model"]["profile"] = a1["model"]["profile"]
+    a4["model"]["pruning"]["selection_policy"] = a1["model"]["pruning"]["selection_policy"]
+    assert a4 == a1
+
+
 def test_legacy_profile_uses_identity_projector():
     projector = MultiModalProjector(input_dim=768, d_model=768, seq_len=49)
 
