@@ -18,6 +18,36 @@ changes both allocation and selection. No trainable parameters are added.
 
 In the Kaggle notebook choose `ABLATION = "a4_per_view_diversity"`.
 
+### Direct finetuning without alignment
+
+Set `RUN_ALIGN_STAGE = False`, `RUN_FINETUNE_STAGE = True` and
+`FINETUNE_FROM_PRETRAINED = True` in the notebook settings cell, then rerun it.
+Run the finetune cell without `--resume`: T5 starts from pretrained weights,
+visual adapters start fresh, and optimizer/scheduler start at epoch 1.
+This mode ignores all resume paths and existing checkpoints. Use a separate
+output directory for this experiment to avoid overwriting aligned-run results.
+For later continuation, set `FINETUNE_FROM_PRETRAINED = False` and provide the
+new run's `finetune_latest.pt` as `RESUME_FINETUNE_CHECKPOINT`.
+The optional diagnose/probe cell still uses align; skip that cell for a strictly
+finetune-only run. Prepared data and feature cache can be reused.
+
+### Less-than token handling in huy-router
+
+Inspected local branch `huy-router`, especially `tokenization.py`, the factory,
+and checkpoint/decode call sites in `pipeline.py`.
+That branch adds `<` as a normal vocabulary token, resizes embeddings when
+needed, and initializes a newly added row from the existing `>` token in both
+input and output embeddings. Checkpoint metadata records the token identity.
+After loading older checkpoints without matching metadata it copies the row
+again. Decoding keeps the normal `<` token with `skip_special_tokens=True` and
+normalizes spacing around tags such as `<c1, CAM_FRONT...>`.
+The fix is now ported to this branch: factory initialization, training resume,
+evaluation and benchmark checkpoint loading, metadata saving, and decoding.
+Tests cover initialization, untied output embeddings, legacy repair and
+preservation of learned rows with matching metadata. Legacy checkpoints without
+token metadata are repaired by copying the `>` row; this may overwrite an old
+learned `<` row whose provenance cannot be identified from metadata.
+
 Ngay cap nhat: 2026-10-05
 
 Branch thuc hien: `nguyet-t5-internal-mvpruner`

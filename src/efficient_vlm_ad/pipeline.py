@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from .benchmarking import summarize_latencies
 from .cache import FeatureCacheManifest, create_memmap, validate_manifest
 from .checkpointing import load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from .tokenization import decode_generated_predictions, less_than_token_metadata, repair_less_than_token_after_checkpoint
 from .config import ExperimentConfig
 from .data import format_prompt, normalize_camera_paths
 from .debugging import DebugPrinter, default_debug_jsonl, model_param_summary, path_status, safe_preview, tensor_stats, unique_named_parameters
@@ -534,6 +535,7 @@ def train_stage(
             best_epoch = int(metadata.get("best_epoch", best_epoch))
         else:
             metadata = load_checkpoint(resume, model=model, map_location=device)
+        repair_less_than_token_after_checkpoint(tokenizer, model.text_model, metadata)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_load_done", metadata=metadata)
 
@@ -765,6 +767,7 @@ def train_stage(
                 best_val_loss = val_loss
                 best_epoch = epoch_number
             metadata = {
+                "tokenizer": {"less_than_token": less_than_token_metadata(tokenizer)},
                 "stage": stage,
                 "epoch": epoch_number,
                 "completed_epochs": epoch_number,
@@ -1001,6 +1004,7 @@ def evaluate_checkpoint(
     model, tokenizer = build_vlm_model(cfg)
     model.to(device)
     metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    repair_less_than_token_after_checkpoint(tokenizer, model.text_model, metadata)
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
@@ -1029,7 +1033,7 @@ def evaluate_checkpoint(
                 early_stopping=cfg.generation.early_stopping,
                 length_penalty=cfg.generation.length_penalty,
             )
-            preds = tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            preds = decode_generated_predictions(tokenizer, ids.detach().cpu())
             for offset, pred in enumerate(preds):
                 sample_index = processed + offset
                 if sample_index < dbg.samples:
@@ -1081,6 +1085,7 @@ def benchmark_checkpoint(
     model, tokenizer = build_vlm_model(cfg)
     model.to(device)
     metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    repair_less_than_token_after_checkpoint(tokenizer, model.text_model, metadata)
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
     model.eval()
@@ -1115,7 +1120,7 @@ def benchmark_checkpoint(
             if device.type == "cuda":
                 torch.cuda.synchronize()
             gen.append(time.perf_counter() - gen_start)
-            tokenizer.batch_decode(ids.detach().cpu(), skip_special_tokens=True)
+            decode_generated_predictions(tokenizer, ids.detach().cpu())
             e2e.append(time.perf_counter() - start)
             token_counts.append(int((ids != getattr(tokenizer, "pad_token_id", 0)).sum().item()))
             if idx < dbg.samples:

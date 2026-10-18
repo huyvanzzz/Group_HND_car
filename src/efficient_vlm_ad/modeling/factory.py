@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from ..tokenization import ensure_special_less_than_token
 
 from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .t5_internal_pruning import T5InternalPruningVLMForAD
@@ -143,6 +144,7 @@ def build_text_and_tokenizer(cfg):
             model.config._attn_implementation = "eager"
         if hasattr(model.config, "attn_implementation"):
             model.config.attn_implementation = "eager"
+    ensure_special_less_than_token(tokenizer, model)
     return model, tokenizer
 
 
