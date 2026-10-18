@@ -288,7 +288,21 @@ def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resum
     assert "os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'" in source
     assert "prepare-data --config \"$CONFIG\" --subset full" in source
     assert "prepare-features --config \"$CONFIG\" --subset full" in source
+    assert "PREPARED_DATA_HF_REPO_ID = ''" in source
+    assert "PREPARED_DATA_HF_REPO_TYPE = 'dataset'" in source
+    assert "os.environ['PREPARED_DATA_HF_REPO_ID']" in source
+    assert 'hf download "$CACHE_HF_REPO_ID"' in source
+    assert '--include "cache/*"' in source
+    assert 'hf download "$PREPARED_DATA_HF_REPO_ID"' in source
+    assert '--include "prepared_data/*"' in source
+    assert '"$PROFILE/prepared_data/manifest.json"' in source
+    assert '"$PROFILE/prepared_data/train.jsonl"' in source
+    assert '"$PROFILE/prepared_data/val.jsonl"' in source
+    assert '"$PROFILE/prepared_data/test.jsonl"' in source
+    assert "Prepared data is not a full subset" in source
+    assert "Using existing full prepared data." in source
     assert '"$PROFILE/cache/features.float16.memmap"' in source
+    assert '"$PROFILE/cache/index.json"' in source
     assert '"$PROFILE/cache/features.dat"' not in source
     assert "train --config \"$CONFIG\" --stage finetune $RESUME" in source
     assert "finetune_latest.pt" in source
