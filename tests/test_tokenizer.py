@@ -148,6 +148,19 @@ def test_decode_generated_predictions_keeps_non_tag_less_than_spaced():
     assert decode_generated_predictions(tokenizer, [[1, 2]]) == ["speed < 10 km/h and <c2,CAM_BACK,1,2>"]
 
 
+def test_decode_generated_predictions_separates_attached_full_and_partial_tags():
+    tokenizer = DummyTokenizer()
+    tokenizer.batch_decode = lambda rows, skip_special_tokens=True: [
+        "that< c1", "that<c1", "that< c1,CAM_FRONT,100.0,200.0>",
+        "that< c12, CAM_BACK,1,2>", "speed< 10 km/h",
+    ]
+
+    assert decode_generated_predictions(tokenizer, []) == [
+        "that <c1", "that <c1", "that <c1,CAM_FRONT,100.0,200.0>",
+        "that <c12, CAM_BACK,1,2>", "speed < 10 km/h",
+    ]
+
+
 def test_build_text_and_tokenizer_adds_less_than_token_for_hf_models(monkeypatch):
     class FakeAutoTokenizer:
         @staticmethod

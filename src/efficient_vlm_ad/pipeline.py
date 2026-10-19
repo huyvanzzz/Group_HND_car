@@ -26,6 +26,7 @@ from .modeling.factory import build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
+from .time_limits import EpochTimeBudget, archive_epoch
 
 
 class _SingleProcessAccelerator:
@@ -475,7 +476,7 @@ def train_stage(
     debug_numerics: bool = False,
     disable_progress: bool = False,
     progress_log_every_steps: int | None = None,
-) -> Path:
+) -> Path | None:
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     started_at = time.perf_counter()
     _heartbeat(dbg, started_at, "train_stage_start", train_stage=stage, resume=bool(resume), max_steps=max_steps)
@@ -570,9 +571,25 @@ def train_stage(
     optimizer.zero_grad(set_to_none=True)
     progress_interval = max(1, int(progress_log_every_steps or cfg.training.progress_log_every_steps))
     progress_writer = ProgressEventWriter(cfg.project.output_dir, enabled=bool(accelerator.is_main_process))
+    time_budget = EpochTimeBudget(cfg.project.output_dir, stage)
 
     for epoch in range(start_epoch, total_epochs):
         epoch_number = epoch + 1
+        budget = time_budget.check() if accelerator.is_main_process else None
+        stop = torch.tensor(int(budget["stop"]) if budget else 0, device=device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(stop, src=0)
+        if stop.item():
+            if accelerator.is_main_process:
+                progress_writer.write("time_limit_stop", stage=stage, epoch=epoch_number, **budget)
+                print(
+                    f"[time-limit] Stop before {stage} epoch {epoch_number}. "
+                    f"Remaining: {budget['remaining_seconds'] / 60:.1f} min; "
+                    f"estimated epoch: {budget['estimated_epoch_seconds'] / 60:.1f} min; "
+                    f"reserve: {budget['reserve_seconds'] / 60:.1f} min",
+                    flush=True,
+                )
+            break
         epoch_loss = 0.0
         epoch_batches = 0
         epoch_started_at = time.perf_counter()
@@ -842,6 +859,9 @@ def train_stage(
                 )
                 if stage == "finetune":
                     shutil.copy2(best_ckpt, Path(cfg.project.output_dir) / "checkpoints" / "best_model.pt")
+            archive_epoch(latest_ckpt, cfg.project.output_dir, stage, epoch_number)
+            duration = time.perf_counter() - epoch_started_at
+            time_budget.durations.append(duration)
             progress_writer.write(
                 "epoch_end",
                 stage=stage,
@@ -852,12 +872,12 @@ def train_stage(
                 val_loss=val_loss,
                 best_val_loss=best_val_loss,
                 best_epoch=best_epoch,
-                elapsed_seconds=round(time.perf_counter() - epoch_started_at, 3),
+                elapsed_seconds=round(duration, 3),
                 **_cuda_memory_payload(device),
             )
         accelerator.wait_for_everyone()
 
-    return latest_ckpt
+    return latest_ckpt if latest_ckpt.exists() else None
 
 
 def _batch_debug_summary(batch: dict[str, Any], device: torch.device | None = None) -> dict[str, Any]:

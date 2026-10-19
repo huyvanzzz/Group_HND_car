@@ -80,7 +80,7 @@ def train(args: argparse.Namespace) -> None:
         progress_log_every_steps=args.progress_log_every_steps,
     )
     if is_main_process():
-        print(json.dumps({"checkpoint": str(ckpt), "stage": args.stage}, indent=2))
+        print(json.dumps({"checkpoint": str(ckpt) if ckpt else None, "stage": args.stage}, indent=2))
 
 
 def diagnose_train(args: argparse.Namespace) -> None:

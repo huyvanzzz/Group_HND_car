@@ -55,3 +55,36 @@ Only `selection_policy` changes across A1/A2/A3. See `docs/research/t5-internal-
 ```bash
 python -m pytest tests -q
 ```
+
+## Kaggle: giới hạn thời gian theo epoch
+
+Notebook `notebooks/kaggle_train_t5_internal_mvpruner_ablations.ipynb` đặt một
+deadline chung khi chạy cell cấu hình, trước bước chuẩn bị dữ liệu. Chỉnh
+`SESSION_TIME_LIMIT_HOURS` theo thời gian còn lại của session. Chạy lại cell không
+gia hạn deadline; session mới cần kernel mới hoặc xóa biến môi trường
+`TRAINING_DEADLINE_MONOTONIC` trước khi đặt lại.
+
+Đầu mỗi epoch, training chỉ chạy tiếp khi thời gian còn lại lớn hơn
+`reserve + estimated_epoch_duration`. Epoch đầu dùng `INITIAL_EPOCH_MINUTES`;
+các epoch tiếp theo dùng thời lượng lớn nhất đã đo cho stage, nhân
+`EPOCH_SAFETY_FACTOR`. Thời lượng gồm train, validation, lưu checkpoint và ZIP.
+Lịch sử trong `debug/train_progress.jsonl` được dùng lại khi resume cùng profile.
+Chỉnh ước lượng epoch đầu cho phù hợp dữ liệu và GPU, nhất là khi đổi cấu hình.
+
+Cuối mỗi epoch, process chính hoàn tất checkpoint và ZIP trước khi mọi GPU cùng
+bắt đầu epoch mới. `CHECKPOINT_ZIP_DIR` bật tạo ZIP; `MAX_CHECKPOINT_ZIPS` mặc định
+giữ 2 ZIP mới nhất cho profile. Không chạy watcher cũ đồng thời với cơ chế này.
+Nếu không đặt deadline, training vẫn chạy đủ số epoch như trước.
+
+Notebook gọi `scripts/run_training_stage.py` cho cả align và finetune. Launcher
+chỉ gửi SIGTERM tại `deadline - TRAINING_EMERGENCY_RESERVE_SECONDS` (mặc định 2
+phút), sau đó SIGKILL nếu process chưa thoát. Mốc này sát deadline hơn reserve
+của training (mặc định 15 phút). Dừng khẩn cấp có thể cắt ngang epoch nếu thời
+lượng thực tế vượt ước lượng; checkpoint và ZIP của epoch đã hoàn tất vẫn được giữ.
+
+Các biến môi trường tương ứng cho lệnh train trực tiếp:
+`TRAINING_DEADLINE_MONOTONIC` (deadline tuyệt đối từ `time.monotonic()` trên cùng
+máy/session), `TRAINING_RESERVE_SECONDS`, `TRAINING_INITIAL_EPOCH_SECONDS`,
+`TRAINING_EPOCH_SAFETY_FACTOR`. Launcher dùng thêm
+`TRAINING_EMERGENCY_RESERVE_SECONDS`. Ngân sách notebook mặc định là 11 giờ tính
+từ cell cấu hình, không tự suy ra giờ session Kaggle bắt đầu.

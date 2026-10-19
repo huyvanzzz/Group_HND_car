@@ -189,7 +189,7 @@ generation:
     assert len(index) == 6
 
 
-def test_epoch_training_saves_latest_best_and_final_alias(tmp_path: Path):
+def test_epoch_training_saves_latest_best_and_final_alias(tmp_path: Path, monkeypatch):
     data_root = tmp_path / "dataset"
     _make_fake_data(data_root, rows_per_split=2)
     output_dir = tmp_path / "outputs"
@@ -249,6 +249,28 @@ generation:
     assert (output_dir / "checkpoints" / "finetune_latest.pt").exists()
     assert (output_dir / "checkpoints" / "finetune_best.pt").exists()
     assert (output_dir / "checkpoints" / "best_model.pt").exists()
+
+    # Resume, complete one whole epoch (including ZIP), then refuse the next.
+    from dataclasses import replace
+    from efficient_vlm_ad import pipeline
+    from efficient_vlm_ad.config import load_config
+
+    config = load_config(cfg)
+    config = replace(config, training=replace(config.training, align_epochs=4))
+    zip_dir = tmp_path / "zips"
+    monkeypatch.setenv("CHECKPOINT_ZIP_DIR", str(zip_dir))
+    decisions = iter([False, True])
+    monkeypatch.setattr(pipeline.EpochTimeBudget, "check", lambda self: {
+        "stop": next(decisions), "remaining_seconds": 100,
+        "estimated_epoch_seconds": 200, "reserve_seconds": 60,
+    })
+    result = pipeline.train_stage(config, "align", resume=str(output_dir / "checkpoints" / "align_latest.pt"), disable_progress=True)
+    metadata = torch.load(result, map_location="cpu", weights_only=False)["metadata"]
+    assert metadata["completed_epochs"] == 3
+    assert len(list(zip_dir.glob("*.zip"))) == 1
+    events = [json.loads(line) for line in (output_dir / "debug" / "train_progress.jsonl").read_text().splitlines()]
+    assert events[-1]["event"] == "time_limit_stop"
+    assert events[-1]["epoch"] == 4
 
 
 def test_train_stage_raises_on_nan_loss_without_saving_checkpoint(tmp_path: Path, monkeypatch):
