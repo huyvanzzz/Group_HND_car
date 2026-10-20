@@ -54,6 +54,9 @@ def test_notebook_install_precision_models_and_finetune_only(kind):
 def test_notebook_uses_kernel_python_for_install_and_cli(kind):
     text = source(kind)
     assert "os.environ['PYTHON_EXECUTABLE'] = sys.executable" in text
+    assert "REPO_SRC = '/kaggle/working/Efficient_VLM_For_Autonomous_Driving/src'" in text
+    assert "sys.path.insert(0, REPO_SRC)" in text
+    assert "os.environ['PYTHONPATH'] = REPO_SRC" in text
     assert '"$PYTHON_EXECUTABLE" -m pip install --only-binary=:all: tokenizers==0.20.4' in text
     assert '"$PYTHON_EXECUTABLE" -m pip install --only-binary=tokenizers -e ".[mvpruner]"' in text
     assert '"$PYTHON_EXECUTABLE" -m efficient_vlm_ad' in text
