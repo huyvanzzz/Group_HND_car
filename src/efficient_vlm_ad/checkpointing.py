@@ -21,7 +21,9 @@ def architecture_signature(cfg: Any) -> dict[str, Any]:
         "projector.type": model.projector.type,
         **{f"text.{key}": value for key, value in asdict(model.text).items()},
         **{f"fusion.{key}": getattr(model.fusion, key)
-           for key in ("name", "stage1_top_k", "stage2_top_k", "stage2_layer")},
+           for key in ("name", "stage1_top_k", "stage2_top_k", "stage2_layer",
+                       "min_tokens_per_camera", "stage1_relevance_mode", "beta_start",
+                       "beta_end", "beta_schedule", "tau", "eps")},
     }
 
 

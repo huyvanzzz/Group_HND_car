@@ -35,6 +35,13 @@ def test_signature_contains_exact_architecture_and_ignores_training_settings():
         "text.revision": cfg.model.text.revision, "text.d_model": cfg.model.text.d_model,
         "fusion.name": cfg.model.fusion.name, "fusion.stage1_top_k": cfg.model.fusion.stage1_top_k,
         "fusion.stage2_top_k": cfg.model.fusion.stage2_top_k, "fusion.stage2_layer": cfg.model.fusion.stage2_layer,
+        "fusion.min_tokens_per_camera": cfg.model.fusion.min_tokens_per_camera,
+        "fusion.stage1_relevance_mode": cfg.model.fusion.stage1_relevance_mode,
+        "fusion.beta_start": cfg.model.fusion.beta_start,
+        "fusion.beta_end": cfg.model.fusion.beta_end,
+        "fusion.beta_schedule": cfg.model.fusion.beta_schedule,
+        "fusion.tau": cfg.model.fusion.tau,
+        "fusion.eps": cfg.model.fusion.eps,
     }
     changed = replace(cfg, training=replace(cfg.training, learning_rate=0.123))
     assert checkpointing.architecture_signature(changed) == signature
@@ -93,6 +100,8 @@ def test_factory_attaches_signature_without_loading_dino_backbone():
     "vision.name", "vision.model_id", "vision.revision", "vision.output_dim", "vision.seq_len",
     "vision.image_size", "vision.feature_extraction", "projector.type", "text.model_id",
     "text.revision", "text.d_model", "fusion.name", "fusion.stage1_top_k", "fusion.stage2_top_k", "fusion.stage2_layer",
+    "fusion.min_tokens_per_camera", "fusion.stage1_relevance_mode", "fusion.beta_start", "fusion.beta_end",
+    "fusion.beta_schedule", "fusion.tau", "fusion.eps",
 ])
 def test_each_signature_field_is_validated(field):
     signature = checkpointing.architecture_signature(_cfg())
@@ -101,6 +110,34 @@ def test_each_signature_field_is_validated(field):
     wrong = {**signature, field: "different"}
     with pytest.raises(ValueError, match=field):
         checkpointing.validate_checkpoint_signature({"architecture_signature": wrong}, model=model)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("min_tokens_per_camera", 2),
+    ("stage1_relevance_mode", "diversity_only"),
+    ("beta_start", 0.4),
+    ("beta_end", 0.1),
+    ("beta_schedule", "cosine"),
+    ("tau", 0.8),
+    ("eps", 1e-5),
+])
+def test_mvpruner_config_mismatch_rejected_before_weights_load(tmp_path, field, value):
+    from efficient_vlm_ad.pipeline import _strict_load_model_from_checkpoint
+
+    cfg = _cfg()
+    changed = replace(cfg, model=replace(
+        cfg.model, fusion=replace(cfg.model.fusion, **{field: value})))
+    model = torch.nn.Linear(2, 2)
+    model.architecture_signature = checkpointing.architecture_signature(cfg)
+    path = tmp_path / "mismatch.pt"
+    torch.save({"model": {}, "metadata": {
+        "architecture_signature": checkpointing.architecture_signature(changed),
+    }}, path)
+    model.load_state_dict = Mock(side_effect=AssertionError("weights must not load"))
+
+    with pytest.raises(ValueError, match=f"fusion.{field}"):
+        _strict_load_model_from_checkpoint(path, model, "cpu")
+    model.load_state_dict.assert_not_called()
 
 
 @pytest.mark.parametrize("entrypoint", ["train", "diagnose", "verify_resume", "evaluate", "benchmark"])

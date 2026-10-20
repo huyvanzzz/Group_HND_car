@@ -81,10 +81,11 @@ def _less_than_init_source_token_id(tokenizer: Any) -> int | None:
 def _copy_embedding_row(model: Any, target_id: int, source_id: int) -> None:
     import torch
 
+    embedding_model = model if hasattr(model, "get_input_embeddings") else model.text_model
     with torch.no_grad():
-        input_embeddings = model.get_input_embeddings()
+        input_embeddings = embedding_model.get_input_embeddings()
         input_embeddings.weight[target_id].copy_(input_embeddings.weight[source_id])
-        output_embeddings = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+        output_embeddings = embedding_model.get_output_embeddings() if hasattr(embedding_model, "get_output_embeddings") else None
         if output_embeddings is not None and output_embeddings.weight.shape[0] > max(target_id, source_id):
             output_embeddings.weight[target_id].copy_(output_embeddings.weight[source_id])
 

@@ -96,6 +96,23 @@ def test_repair_less_than_token_after_old_checkpoint_metadata():
     assert torch.equal(model.emb.weight[2], model.emb.weight[1])
 
 
+def test_repair_less_than_token_on_vlm_wrapper():
+    tokenizer = DummyTokenizer()
+    tokenizer.tokens[">"] = 1
+    tokenizer.tokens["<"] = 2
+    text_model = DummyModel(rows=4)
+    wrapper = torch.nn.Module()
+    wrapper.text_model = text_model
+    with torch.no_grad():
+        text_model.emb.weight[1].fill_(5.0)
+        text_model.emb.weight[2].fill_(99.0)
+
+    report = repair_less_than_token_after_checkpoint(tokenizer, wrapper, metadata={})
+
+    assert report["repaired"] is True
+    assert torch.equal(text_model.emb.weight[2], text_model.emb.weight[1])
+
+
 def test_decode_generated_predictions_keeps_object_tag_open_bracket():
     tokenizer = DummyTokenizer()
 

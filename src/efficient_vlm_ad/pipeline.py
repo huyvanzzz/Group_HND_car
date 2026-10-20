@@ -1308,6 +1308,7 @@ def diagnose_train(
         checkpoint_metadata = read_checkpoint_metadata(resume, map_location="cpu")
         validate_checkpoint_signature(checkpoint_metadata, cfg=cfg)
         checkpoint_metadata = _strict_load_model_from_checkpoint(resume, model, device)
+        repair_less_than_token_after_checkpoint(tokenizer, model, checkpoint_metadata)
         mark("checkpoint_metadata", begin)
         if accelerator.is_main_process:
             dbg.log(

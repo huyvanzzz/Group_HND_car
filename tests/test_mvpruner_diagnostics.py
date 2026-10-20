@@ -6,6 +6,7 @@ from transformers import T5Config, T5ForConditionalGeneration
 
 from efficient_vlm_ad.modeling.mvpruner import MVPrunerTwoStage
 from efficient_vlm_ad.modeling.vlm import EfficientVLMForAD
+from efficient_vlm_ad.verification import assert_tied_weights_ok
 
 
 def _model():
@@ -126,10 +127,17 @@ def test_diagnose_train_enables_capture_reports_paths_and_loads_resume(tmp_path,
                   runtime=replace(cfg.runtime, device="cpu", precision="fp32"),
                   model=replace(cfg.model, text=replace(cfg.model.text, model_id="fake_t5"),
                                 fusion=FusionConfig(name="mvpruner_two_stage", stage1_top_k=6, stage2_top_k=2)))
+    tokenizer = SimpleTokenizer()
+    tokenizer.add_tokens(">")
+    less_than_id = tokenizer.convert_tokens_to_ids("<")
+    greater_than_id = tokenizer.convert_tokens_to_ids(">")
+    with torch.no_grad():
+        model.text_model.get_input_embeddings().weight[less_than_id].fill_(99.0)
+        model.text_model.get_input_embeddings().weight[greater_than_id].fill_(5.0)
     path = tmp_path / "resume.pt"
     torch.save({"model": model.state_dict(), "metadata": {"stage": stage}}, path)
     model.load_state_dict = Mock(wraps=model.load_state_dict)
-    monkeypatch.setattr(pipeline, "_build_train_model", lambda _: (model, SimpleTokenizer(), None))
+    monkeypatch.setattr(pipeline, "_build_train_model", lambda _: (model, tokenizer, None))
 
     class Dataset(torch.utils.data.Dataset):
         def __len__(self):
@@ -146,5 +154,8 @@ def test_diagnose_train_enables_capture_reports_paths_and_loads_resume(tmp_path,
     assert report["mvpruner_gradients"]["ok"]
     assert report["mvpruner_gradients"]["dropped_values"]["required"] is False
     model.load_state_dict.assert_called_once()
+    assert torch.equal(model.text_model.get_input_embeddings().weight[less_than_id],
+                       model.text_model.get_input_embeddings().weight[greater_than_id])
+    assert assert_tied_weights_ok(model)["ok"]
     assert not model.visual_fusion.diagnostics_enabled
     assert not hasattr(model.visual_fusion, "_diagnostic_tensors")
