@@ -41,13 +41,25 @@ def test_notebook_install_precision_models_and_finetune_only(kind):
                      'validate_manifest', 'dinov2_manifest_fields', '[6, 64, 384]', "manifest['version'] == 2"]:
         assert expected in text
     assert '--stage align' not in text and '--mixed_precision fp16' not in text
-    assert text.index('diagnose-train') < text.index('accelerate launch')
+    assert text.index('diagnose-train') < text.index('accelerate.commands.launch')
     for cell in nb['cells']:
         if cell['cell_type'] == 'code':
             code = ''.join(cell['source'])
             assert cell['outputs'] == [] and cell['execution_count'] is None
             if not code.startswith('%%bash'):
                 ast.parse(code)
+
+
+@pytest.mark.parametrize('kind', ['debug', 'train'])
+def test_notebook_uses_kernel_python_for_install_and_cli(kind):
+    text = source(kind)
+    assert "os.environ['PYTHON_EXECUTABLE'] = sys.executable" in text
+    assert '"$PYTHON_EXECUTABLE" -m pip install --only-binary=:all: tokenizers==0.20.4' in text
+    assert '"$PYTHON_EXECUTABLE" -m pip install --only-binary=tokenizers -e ".[mvpruner]"' in text
+    assert '"$PYTHON_EXECUTABLE" -m efficient_vlm_ad' in text
+    assert '"$PYTHON_EXECUTABLE" -m accelerate.commands.launch' in text
+    assert '\npython -m pip ' not in text
+    assert '\npython -m efficient_vlm_ad ' not in text
 
 
 def test_debug_smokes_real_models_and_limits_optimizer_steps():
@@ -78,7 +90,7 @@ def test_full_download_resume_and_archive_contract():
     assert 'prepared_data/*' not in text and 'cache/*' not in text
     assert '--max-steps' not in text and '--max-samples' not in text
     assert text.index('if [ -f "$LOCAL_LATEST" ]') < text.index('elif [ -n "$FINETUNE_CHECKPOINT_HF_REPO_ID" ]')
-    assert text.index('verify-resume-checkpoint') < text.index('accelerate launch')
+    assert text.index('verify-resume-checkpoint') < text.index('accelerate.commands.launch')
     for artifact in ['checkpoints', 'metrics.json', 'benchmark.json', 'predictions.jsonl', 'debug']:
         assert f'"$PROFILE/{artifact}"' in text
 
