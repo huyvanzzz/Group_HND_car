@@ -2,161 +2,19 @@ from pathlib import Path
 import tomllib
 
 import pytest
+import yaml
+from config_helpers import fake_config, write_fake_config
+from dataclasses import asdict
 
 from efficient_vlm_ad.config import CAMERA_ORDER, load_config
 
 
-def test_loads_repvit_mini_profile():
-    cfg = load_config("configs/repvit_t5_efficient_mini.yaml")
-
-    assert cfg.model.vision.name == "repvit_m1_5"
-    assert cfg.model.text.model_id == "google/t5-efficient-mini"
-    assert cfg.model.text.d_model == 384
+def test_loads_self_contained_generic_config(tmp_path):
+    cfg = load_config(write_fake_config(tmp_path))
+    assert cfg.model.text.model_id == "fake_t5"
     assert cfg.data.view_order == CAMERA_ORDER
     assert cfg.training.effective_batch_size == 4
-
-
-def test_loads_kaggle_2gpu_profiles():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
-    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_safe.yaml")
-
-    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu"
-    assert cfg.runtime.precision == "fp32"
-    assert cfg.training.batch_size == 16
-    assert cfg.training.gradient_accumulation_steps == 2
-    assert cfg.training.effective_batch_size == 32
-    assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert cfg.training.align_epochs == 6
-    assert cfg.training.finetune_epochs == 10
-    assert cfg.training.align_max_steps is None
-    assert cfg.training.finetune_max_steps is None
-    assert cfg.training.progress_log_every_steps == 50
-    assert cfg.training.max_grad_norm == 1.0
-    assert cfg.generation.max_new_tokens == 512
-    assert cfg.generation.num_beams == 3
-    assert cfg.generation.early_stopping is True
-    assert cfg.generation.length_penalty == 1.0
-    removed_generation_keys = ["repetition" + "_penalty", "no_repeat" + "_ngram_size", "renormalize" + "_logits"]
-    assert not any(hasattr(cfg.generation, key) for key in removed_generation_keys)
-    assert cfg.evaluation.eval_batch_size == 16
-    assert cfg.evaluation.eval_progress_log_every_samples == 256
-    assert cfg.evaluation.benchmark_max_samples == 200
-    assert cfg.evaluation.benchmark_progress_log_every_samples == 20
-
-    assert safe_cfg.training.batch_size == 8
-    assert safe_cfg.runtime.precision == "fp32"
-    assert safe_cfg.training.gradient_accumulation_steps == 4
-    assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
-    assert safe_cfg.training.align_epochs == 6
-    assert safe_cfg.training.finetune_epochs == 6
-    assert safe_cfg.generation.max_new_tokens == 512
-    assert safe_cfg.generation.num_beams == 3
-    assert safe_cfg.evaluation.eval_batch_size == 16
-    assert safe_cfg.evaluation.benchmark_max_samples == 200
-
-
-def test_loads_kaggle_di_adapter_profiles():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_di_adapter.yaml")
-    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_di_adapter_safe.yaml")
-
-    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter"
-    assert cfg.model.adapter.name == "minidrive_di"
-    assert cfg.model.adapter.num_heads == 8
-    assert cfg.model.adapter.dropout == 0.1
-    assert cfg.model.adapter.residual_scale == 0.1
-    assert cfg.training.vision_training == "feature_cache"
-    assert cfg.training.batch_size == 16
-    assert cfg.training.gradient_accumulation_steps == 2
-    assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert cfg.training.align_epochs == 8
-    assert cfg.training.finetune_epochs == 10
-    assert cfg.runtime.precision == "fp32"
-    assert cfg.generation.max_new_tokens == 512
-    assert cfg.generation.num_beams == 3
-
-    assert safe_cfg.model.adapter.name == "minidrive_di"
-    assert safe_cfg.training.batch_size == 8
-    assert safe_cfg.training.gradient_accumulation_steps == 4
-    assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
-    assert safe_cfg.training.align_epochs == 8
-    assert safe_cfg.training.finetune_epochs == 8
-
-
-def test_loads_kaggle_router_profile():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router.yaml")
-
-    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router_k49"
-    assert cfg.model.fusion.name == "question_guided_router"
-    assert cfg.model.fusion.top_k == 49
-    assert cfg.model.fusion.diversity_weight == 0.001
-    assert cfg.model.fusion.tau_start == 2.0
-    assert cfg.model.fusion.tau_min == 0.5
-    assert cfg.model.fusion.score_norm is False
-    assert cfg.model.fusion.selected_norm is False
-    assert cfg.model.fusion.norm_eps == 1.0e-5
-    assert cfg.model.fusion.visual_self_attention_layers == 0
-    assert cfg.model.fusion.visual_self_attention_heads == 4
-    assert cfg.model.fusion.visual_self_attention_mlp_ratio == 2.0
-    assert cfg.model.fusion.visual_self_attention_dropout == 0.0
-    assert cfg.model.fusion.visual_self_attention_residual_scale == 1.0e-2
-    assert cfg.training.vision_training == "feature_cache"
-    assert cfg.training.batch_size == 16
-    assert cfg.training.gradient_accumulation_steps == 2
-    assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert cfg.training.align_epochs == 8
-    assert cfg.training.finetune_epochs == 10
-    assert cfg.runtime.precision == "fp32"
-    assert cfg.generation.max_new_tokens == 512
-    assert cfg.generation.num_beams == 3
-
-
-def test_loads_kaggle_router_vsa_profile():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml")
-    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_safe.yaml")
-
-    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49"
-    assert cfg.model.fusion.name == "question_guided_router"
-    assert cfg.model.fusion.top_k == 49
-    assert cfg.model.fusion.score_norm is True
-    assert cfg.model.fusion.selected_norm is False
-    assert cfg.model.fusion.visual_self_attention_layers == 1
-    assert cfg.model.fusion.visual_self_attention_heads == 4
-    assert cfg.model.fusion.visual_self_attention_mlp_ratio == 2.0
-    assert cfg.model.fusion.visual_self_attention_dropout == 0.0
-    assert cfg.model.fusion.visual_self_attention_residual_scale == 1.0e-2
-    assert cfg.training.batch_size == 16
-    assert cfg.training.gradient_accumulation_steps == 2
-    assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert safe_cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_safe"
-    assert safe_cfg.training.batch_size == 8
-    assert safe_cfg.training.gradient_accumulation_steps == 4
-
-
-def test_loads_kaggle_router_vsa_nonorm_profile():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml")
-    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_safe.yaml")
-
-    assert cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49"
-    assert cfg.model.fusion.name == "question_guided_router"
-    assert cfg.model.fusion.top_k == 49
-    assert cfg.model.fusion.score_norm is False
-    assert cfg.model.fusion.selected_norm is False
-    assert cfg.model.fusion.visual_self_attention_layers == 1
-    assert cfg.model.fusion.visual_self_attention_heads == 4
-    assert cfg.model.fusion.visual_self_attention_mlp_ratio == 2.0
-    assert cfg.model.fusion.visual_self_attention_dropout == 0.0
-    assert cfg.model.fusion.visual_self_attention_residual_scale == 1.0e-2
-    assert cfg.training.batch_size == 16
-    assert cfg.training.gradient_accumulation_steps == 2
-    assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert safe_cfg.model.profile == "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_safe"
-    assert safe_cfg.training.batch_size == 8
-    assert safe_cfg.training.gradient_accumulation_steps == 4
-
-
-def test_default_fusion_config_keeps_visual_self_attention_off():
-    cfg = load_config("configs/repvit_t5_efficient_mini.yaml")
-
+    assert cfg.training.effective_batch_size_for_processes(2) == 8
     assert cfg.model.fusion.visual_self_attention_layers == 0
     assert cfg.model.fusion.visual_self_attention_heads == 4
     assert cfg.model.fusion.visual_self_attention_mlp_ratio == 2.0
@@ -164,34 +22,17 @@ def test_default_fusion_config_keeps_visual_self_attention_off():
     assert cfg.model.fusion.visual_self_attention_residual_scale == 1.0e-2
 
 
-def test_loads_kaggle_end_to_end_profile():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_end2end.yaml")
-    safe_cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_end2end_safe.yaml")
-
-    assert cfg.training.vision_training == "end_to_end"
-    assert cfg.training.batch_size == 8
-    assert cfg.training.gradient_accumulation_steps == 4
-    assert cfg.training.effective_batch_size_for_processes(2) == 64
-    assert cfg.training.align_epochs == 8
-    assert cfg.training.finetune_epochs == 8
-    assert cfg.training.vision_learning_rate == 1e-5
-    assert cfg.training.text_learning_rate == 5e-5
-    assert cfg.training.head_learning_rate == 1e-4
-    assert safe_cfg.training.vision_training == "end_to_end"
-    assert safe_cfg.training.batch_size == 4
-    assert safe_cfg.training.gradient_accumulation_steps == 8
-    assert safe_cfg.training.effective_batch_size_for_processes(2) == 64
+def test_accelerate_and_exact_mvpruner_dependencies():
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert "accelerate" in project["dependencies"]
+    assert "transformers==4.46.3" in project["optional-dependencies"]["mvpruner"]
+    assert "tokenizers==0.20.4" in project["optional-dependencies"]["mvpruner"]
 
 
-def test_accelerate_is_declared_dependency():
-    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
-
-    assert "accelerate" in pyproject["project"]["dependencies"]
-
-
-def test_loads_mvpruner_profile_and_exact_transformers_extra():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml")
-
+def test_loads_dino_mvpruner_profile():
+    cfg = load_config("configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml")
+    assert cfg.model.vision.name == "dinov2_small_avgpool"
+    assert cfg.model.vision.output_dim == cfg.model.text.d_model == 384
     assert cfg.model.fusion.name == "mvpruner_two_stage"
     assert cfg.model.fusion.stage1_top_k == 196
     assert cfg.model.fusion.stage2_top_k == 49
@@ -204,19 +45,14 @@ def test_loads_mvpruner_profile_and_exact_transformers_extra():
     assert cfg.model.fusion.tau == 1.0
     assert cfg.model.adapter.name == "none"
     assert cfg.training.vision_training == "feature_cache"
-
-    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
-    assert "transformers==4.46.3" in pyproject["project"]["optional-dependencies"]["mvpruner"]
-    assert "tokenizers==0.20.4" in pyproject["project"]["optional-dependencies"]["mvpruner"]
+    assert cfg.runtime.precision == "fp32"
 
 
-def test_rejects_invalid_mvpruner_budget(tmp_path: Path):
-    source = Path("configs/repvit_t5_efficient_mini_kaggle_2gpu_router.yaml").read_text(encoding="utf-8")
-    source = source.replace("name: question_guided_router", "name: mvpruner_two_stage")
-    source = source.replace("top_k: 49", "stage1_top_k: 20\n    stage2_top_k: 21")
+def test_rejects_invalid_mvpruner_budget(tmp_path):
+    raw = asdict(fake_config())
+    raw["model"]["fusion"].update(name="mvpruner_two_stage", stage1_top_k=20, stage2_top_k=21)
     path = tmp_path / "bad_mvpruner.yaml"
-    path.write_text(source, encoding="utf-8")
-
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="stage2_top_k"):
         load_config(path)
 

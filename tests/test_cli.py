@@ -1,10 +1,11 @@
+from config_helpers import write_fake_config
 import json
 import os
 import subprocess
 import sys
 
 
-def test_inspect_data_cli_outputs_safe_metadata():
+def test_inspect_data_cli_outputs_safe_metadata(tmp_path):
     env = os.environ.copy()
     env["HF_TOKEN"] = "hf_should_not_be_printed"
     result = subprocess.run(
@@ -14,7 +15,7 @@ def test_inspect_data_cli_outputs_safe_metadata():
             "efficient_vlm_ad",
             "inspect-data",
             "--config",
-            "configs/repvit_t5_efficient_tiny_smoke.yaml",
+            str(write_fake_config(tmp_path)),
         ],
         check=True,
         capture_output=True,
@@ -24,6 +25,6 @@ def test_inspect_data_cli_outputs_safe_metadata():
 
     payload = json.loads(result.stdout)
 
-    assert payload["hf_repo_id"] == "minhdang0901/drivelm-nuscenes-v1-0"
+    assert payload["hf_repo_id"] == "local/fake"
     assert payload["token_present"] is True
     assert "hf_should_not_be_printed" not in result.stdout

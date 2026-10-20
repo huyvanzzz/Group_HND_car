@@ -1,3 +1,4 @@
+from config_helpers import fake_config
 import pytest
 import torch
 from dataclasses import replace
@@ -121,7 +122,7 @@ def test_diagnose_train_enables_capture_reports_paths_and_loads_resume(tmp_path,
     from efficient_vlm_ad.modeling.factory import SimpleTokenizer
 
     model = _model()
-    cfg = load_config("configs/repvit_t5_efficient_tiny_smoke.yaml")
+    cfg = fake_config()
     cfg = replace(cfg, project=replace(cfg.project, output_dir=str(tmp_path)),
                   training=replace(cfg.training, batch_size=2, num_workers=0),
                   runtime=replace(cfg.runtime, device="cpu", precision="fp32"),

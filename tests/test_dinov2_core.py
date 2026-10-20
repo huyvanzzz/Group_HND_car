@@ -24,9 +24,12 @@ def test_dinov2_profile_has_explicit_extraction_and_learned_projector():
         'source_grid': [16, 16], 'pooling': 'avg_pool2d', 'kernel_size': 2,
         'stride': 2, 'output_grid': [8, 8],
     }
-    baseline = load_config('configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml')
-    assert cfg.training == baseline.training
-    assert cfg.generation == baseline.generation
+    assert cfg.training.batch_size == 16
+    assert cfg.training.gradient_accumulation_steps == 2
+    assert cfg.training.finetune_epochs == 10
+    assert cfg.training.progress_log_every_steps == 500
+    assert cfg.generation.max_new_tokens == 512
+    assert cfg.generation.num_beams == 3
 
 
 @pytest.mark.parametrize('key,value', [('output_dim', 768), ('seq_len', 256), ('image_size', 518)])

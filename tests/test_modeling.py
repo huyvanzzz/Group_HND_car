@@ -1,3 +1,5 @@
+from dataclasses import replace
+from config_helpers import fake_config
 import torch
 
 from efficient_vlm_ad.config import AdapterConfig, CacheConfig, DataConfig, ExperimentConfig, FusionConfig, GenerationConfig, ModelConfig, ProjectConfig, RuntimeConfig, TextConfig, TrainingConfig, VisionConfig, load_config
@@ -36,7 +38,7 @@ def test_legacy_profile_uses_identity_projector():
 
 
 def test_stage_freeze_policy_for_repvit_mini():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_end2end.yaml")
+    cfg = replace(fake_config(), training=replace(fake_config().training, vision_training="end_to_end"))
     modules = torch.nn.ModuleDict(
         {
             "vision": torch.nn.Linear(2, 2),
@@ -62,7 +64,7 @@ def test_stage_freeze_policy_for_repvit_mini():
 
 
 def test_feature_cache_stage_policy_keeps_vision_frozen():
-    cfg = load_config("configs/repvit_t5_efficient_mini.yaml")
+    cfg = fake_config()
     modules = torch.nn.ModuleDict(
         {
             "vision": torch.nn.Linear(2, 2),
@@ -81,7 +83,7 @@ def test_feature_cache_stage_policy_keeps_vision_frozen():
 
 
 def test_stage_freeze_policy_trains_visual_adapter_when_present():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_di_adapter.yaml")
+    cfg = replace(fake_config(), model=replace(fake_config().model, adapter=AdapterConfig(name="minidrive_di")))
     modules = torch.nn.ModuleDict(
         {
             "vision": torch.nn.Linear(2, 2),
@@ -107,7 +109,7 @@ def test_stage_freeze_policy_trains_visual_adapter_when_present():
 
 
 def test_stage_policy_trains_router_instead_of_gpa_when_present():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_router.yaml")
+    cfg = replace(fake_config(), model=replace(fake_config().model, fusion=FusionConfig(name="question_guided_router")))
     modules = torch.nn.ModuleDict(
         {
             "vision": torch.nn.Linear(2, 2),

@@ -1,328 +1,168 @@
+import ast
 import json
 from pathlib import Path
 
+import pytest
+from dataclasses import replace
+from efficient_vlm_ad.cache import FeatureCacheManifest, dinov2_manifest_fields
+from efficient_vlm_ad.config import load_config
+from efficient_vlm_ad.modeling.vision import dinov2_processor_policy
 
-def _notebook_source(path: str) -> str:
-    notebook = json.loads(Path(path).read_text(encoding="utf-8"))
-    return "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
-
-
-def test_smoke_notebook_is_debug_only():
-    source = _notebook_source("notebooks/kaggle_smoke_debug.ipynb")
-
-    assert "repvit_t5_efficient_tiny_smoke.yaml" in source
-    assert "--max-steps 20" in source
-    assert "--debug --debug-samples" in source
-    assert "accelerate launch" in source
+CONFIG = 'configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml'
+NAMES = {f'kaggle_{kind}_dinov2_mvpruner_finetune.ipynb' for kind in ('debug', 'train')}
 
 
-def test_full_train_notebook_has_no_smoke_limits_by_default():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu.yaml" in source
-    assert "diagnose-train" in source
-    assert "--max-steps 1" in source
-    assert "--debug-numerics" in source
-    assert "--debug --debug-samples 1" in source
-    assert "--mixed_precision no" in source
-    assert "--mixed_precision fp16" not in source
-    assert "PYTHONUNBUFFERED=1 accelerate launch" in source
-    assert "train_progress.jsonl" in source
-    assert "eval_progress.jsonl" in source
-    assert "benchmark_progress.jsonl" in source
-    assert "--batch-size 16" in source
-    assert "tail -n 20" in source
-    assert "nvidia-smi" in source
-    assert "RUN_FULL_2GPU = False" not in source
-    assert "--max-samples" not in source
-    assert "align_best.pt" in source
-    assert "verify-align-checkpoint" in source
-    assert "align_checkpoint_verify.json" in source
-    assert "best_model.pt" in source
+def notebook(kind):
+    return json.loads(Path(f'notebooks/kaggle_{kind}_dinov2_mvpruner_finetune.ipynb').read_text(encoding='utf-8'))
 
 
-def test_refactor_notebook_was_removed_to_avoid_stale_entrypoint():
-    assert not Path("notebooks/kaggle_run_em_vlm4ad_refactor.ipynb").exists()
+def source(kind):
+    return '\n'.join(''.join(cell['source']) for cell in notebook(kind)['cells'])
 
 
-def test_router_base_notebooks_are_no_norm_entrypoints():
-    debug_source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router.ipynb")
-    full_source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router.yaml" in debug_source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_safe.yaml" in full_source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_k49" in debug_source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_k49" in full_source
-    assert "router_norm_k49" not in debug_source
-    assert "router_norm_k49" not in full_source
+def test_only_dino_entrypoint_artifacts_remain():
+    assert {p.name for p in Path('notebooks').glob('*.ipynb')} == NAMES
+    assert {p.name for p in Path('configs').glob('*.yaml')} == {Path(CONFIG).name, 'legacy_vit_t5_base.yaml'}
 
 
-def test_end_to_end_debug_notebook_exercises_raw_image_training_path():
-    source = _notebook_source("notebooks/kaggle_e2e_debug_repvit_t5_efficient_mini_2gpu.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_end2end.yaml" in source
-    assert "diagnose-train" in source
-    assert "--debug-numerics" in source
-    assert "--max-steps 1" in source
-    assert "prepare-features" not in source
-    assert "train_progress.jsonl" in source
-    assert "nvidia-smi" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
-
-
-def test_end_to_end_full_notebook_runs_full_epochs_without_smoke_limits():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_end2end.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_end2end.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_end2end_safe.yaml" in source
-    assert "prepare-data --config" in source
-    assert "prepare-features" not in source
-    assert "accelerate launch" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "finetune_best.pt" in source
-    assert "train_progress.jsonl" in source
-    assert "eval_progress.jsonl" in source
-    assert "benchmark_progress.jsonl" in source
-    assert "--batch-size 16" in source
+@pytest.mark.parametrize('kind', ['debug', 'train'])
+def test_notebook_install_precision_models_and_finetune_only(kind):
+    nb = notebook(kind)
+    text = source(kind)
+    assert CONFIG in text and "'huy-dinov2'" in text
+    assert text.index('--only-binary=:all:') < text.index('".[mvpruner]"')
+    for expected in ['tokenizers==0.20.4', 'tokenizers.__version__ == "0.20.4"',
+                     'transformers.__version__ == "4.46.3"', 'torch.cuda.device_count() >= 2',
+                     "cfg.runtime.precision == 'fp32'", "cfg.model.vision.name == 'dinov2_small_avgpool'",
+                     "cfg.model.text.model_id == 'google/t5-efficient-mini'", '--stage finetune',
+                     '--num_processes 2', '--mixed_precision no', 'diagnose-train', '--debug-numerics',
+                     "os.environ['HF_HUB_DISABLE_XET'] = '1'", "os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'",
+                     'validate_manifest', 'dinov2_manifest_fields', '[6, 64, 384]', "manifest['version'] == 2"]:
+        assert expected in text
+    assert '--stage align' not in text and '--mixed_precision fp16' not in text
+    assert text.index('diagnose-train') < text.index('accelerate launch')
+    for cell in nb['cells']:
+        if cell['cell_type'] == 'code':
+            code = ''.join(cell['source'])
+            assert cell['outputs'] == [] and cell['execution_count'] is None
+            if not code.startswith('%%bash'):
+                ast.parse(code)
 
 
-def test_di_adapter_debug_notebook_exercises_cached_feature_adapter_path():
-    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_di_adapter.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter.yaml" in source
-    assert "prepare-features" in source
-    assert "diagnose-train" in source
-    assert "--debug-numerics" in source
-    assert "--max-steps 20" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
-    assert "train_progress.jsonl" in source
-    assert "nvidia-smi" in source
+def test_debug_smokes_real_models_and_limits_optimizer_steps():
+    text = source('debug')
+    assert 'fake_t5' not in text and 'fake_vision' not in text
+    for expected in ['prepare-data --config "$CONFIG" --subset smoke',
+                     'prepare-features --config "$CONFIG" --subset smoke', '--max-steps 20',
+                     'evaluate --config', 'benchmark --config', '--max-samples 8']:
+        assert expected in text
+    assert "raw['training']['gradient_accumulation_steps'] = 1" in text
+    assert "raw['training']['finetune_max_steps'] = 20" in text
+    assert 'assert cfg.training.gradient_accumulation_steps == 1' in text
+    assert 'assert cfg.training.finetune_max_steps == 20' in text
 
 
-def test_di_adapter_full_notebook_runs_full_epochs_without_smoke_limits():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_di_adapter.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter_safe.yaml" in source
-    assert "prepare-data --config" in source
-    assert "prepare-features --config" in source
-    assert "accelerate launch" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "finetune_latest.pt" in source
-    assert "align_best.pt" in source
-    assert "verify-align-checkpoint" in source
-    assert "align_checkpoint_verify.json" in source
-    assert "train_progress.jsonl" in source
-    assert "eval_progress.jsonl" in source
-    assert "benchmark_progress.jsonl" in source
-    assert "--batch-size 16" in source
+def test_full_download_resume_and_archive_contract():
+    text = source('train')
+    for expected in ["PREPARED_DATA_HF_REPO_ID = ''", "CACHE_HF_REPO_ID = ''", "FINETUNE_CHECKPOINT_HF_REPO_ID = ''",
+                     "download_exact(PREPARED_DATA_HF_REPO_ID, 'dataset', prepared",
+                     "download_exact(CACHE_HF_REPO_ID, 'dataset', cache",
+                     "'features.float16.memmap', 'index.json', 'manifest.json'",
+                     'validate_prepared(prepared, full=True', 'expected_counts=cfg.data.expected_counts',
+                     'validate_cache(cfg)', "'--subset', 'full'",
+                     '--include "$FINETUNE_CHECKPOINT_FILENAME" "$FINETUNE_CHECKPOINT_FILENAME.rng/**"',
+                     '$RESUME_PATH.rng/manifest.json', 'rank_00000.pt', 'rank_00001.pt',
+                     'verify-resume-checkpoint', 'No finetune checkpoint configured']:
+        assert expected in text
+    assert 'prepared_data/*' not in text and 'cache/*' not in text
+    assert '--max-steps' not in text and '--max-samples' not in text
+    assert text.index('if [ -f "$LOCAL_LATEST" ]') < text.index('elif [ -n "$FINETUNE_CHECKPOINT_HF_REPO_ID" ]')
+    assert text.index('verify-resume-checkpoint') < text.index('accelerate launch')
+    for artifact in ['checkpoints', 'metrics.json', 'benchmark.json', 'predictions.jsonl', 'debug']:
+        assert f'"$PROFILE/{artifact}"' in text
 
 
-def test_router_debug_notebook_exercises_cached_feature_router_path():
-    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router_vsa_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
-    assert "prepare-features" in source
-    assert "diagnose-train" in source
-    assert "--debug-numerics" in source
-    assert "--max-steps 20" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
-    assert "train_progress.jsonl" in source
-    assert "nvidia-smi" in source
+def helpers():
+    cell = next(c for c in notebook('train')['cells'] if 'def download_exact' in ''.join(c['source']))
+    tree = ast.parse(''.join(cell['source']))
+    namespace = {}
+    definitions = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef))]
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), '<notebook-helpers>', 'exec'), namespace)
+    return namespace
 
 
-def test_router_vsa_nonorm_debug_notebook_uses_nonorm_config():
-    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router_vsa_nonorm_k49.ipynb")
+def test_direct_download_copies_exact_files_without_cache_nesting(tmp_path):
+    namespace = helpers()
+    hub_file = tmp_path / 'hub-blob'
+    hub_file.write_text('payload')
+    calls = []
 
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml" in source
-    assert "diagnose-train" in source
-    assert "--debug-numerics" in source
-    assert "--max-steps 20" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
+    def download(**kwargs):
+        calls.append(kwargs)
+        return str(hub_file)
 
-
-def test_router_full_notebook_runs_full_epochs_without_smoke_limits():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router_vsa_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_safe.yaml" in source
-    assert "prepare-data --config" in source
-    assert "prepare-features --config" in source
-    assert "accelerate launch" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "finetune_latest.pt" in source
-    assert "align_best.pt" in source
-    assert "verify-align-checkpoint" in source
+    namespace['hf_hub_download'] = download
+    destination = tmp_path / 'profile' / 'cache'
+    namespace['download_exact']('owner/dino-cache', 'dataset', destination, ('manifest.json', 'index.json'))
+    assert sorted(p.name for p in destination.iterdir()) == ['index.json', 'manifest.json']
+    assert [call['filename'] for call in calls] == ['manifest.json', 'index.json']
+    assert all(call['repo_id'] == 'owner/dino-cache' and call['repo_type'] == 'dataset' for call in calls)
 
 
-def test_router_vsa_nonorm_full_notebook_uses_nonorm_config():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router_vsa_nonorm_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_safe.yaml" in source
-    assert "prepare-data --config" in source
-    assert "prepare-features --config" in source
-    assert "accelerate launch" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "verify-align-checkpoint" in source
-    assert "align_checkpoint_verify.json" in source
-    assert "train_progress.jsonl" in source
-    assert "eval_progress.jsonl" in source
-    assert "benchmark_progress.jsonl" in source
-    assert "--batch-size 16" in source
+def test_prepared_validation_rejects_smoke_reuse_in_full_notebook(tmp_path):
+    namespace = helpers()
+    (tmp_path / 'manifest.json').write_text(json.dumps({'subset': 'smoke', 'counts': {'train': 1, 'val': 1, 'test': 1}}))
+    for split in ('train', 'val', 'test'):
+        (tmp_path / f'{split}.jsonl').write_text('{"id": 0}\n')
+    with pytest.raises(ValueError, match='full'):
+        namespace['validate_prepared'](tmp_path, full=True)
 
 
-def test_router_vsa_nonorm_finetune_only_notebook_has_debug_and_no_align_train():
-    source = _notebook_source("notebooks/kaggle_finetune_only_router_vsa_nonorm_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_finetune_only" in source
-    assert "decode_generated_predictions" in source
-    assert "tag decoded" in source
-    assert "speed decoded" in source
-    assert "generation_diagnostics.json" in source
-    assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune --max-steps 20" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "verify-resume-checkpoint" in source
-    assert "finetune_resume_checkpoint_verify.json" in source
-    assert "--batch-size 16" in source
-    assert "--stage align" not in source
-    assert "verify-align-checkpoint" not in source
-    assert "align_best.pt" not in source
+def test_full_prepared_validation_checks_expected_counts(tmp_path):
+    namespace = helpers()
+    (tmp_path / 'manifest.json').write_text(json.dumps({'subset': 'full', 'counts': {'train': 1, 'val': 1, 'test': 1}}))
+    for split in ('train', 'val', 'test'):
+        (tmp_path / f'{split}.jsonl').write_text('{"id": 0}\n')
+    with pytest.raises(ValueError, match='expected'):
+        namespace['validate_prepared'](tmp_path, full=True, expected_counts={'train': 2, 'val': 1, 'test': 1})
 
 
-def test_router_vsa_finetune_only_notebook_targets_score_norm_vsa_config():
-    source = _notebook_source("notebooks/kaggle_finetune_only_router_vsa_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_safe.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_finetune_only" in source
-    assert "decode_generated_predictions" in source
-    assert "tag decoded" in source
-    assert "speed decoded" in source
-    assert "generation_diagnostics.json" in source
-    assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune --max-steps 20" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "verify-resume-checkpoint" in source
-    assert "--batch-size 16" in source
-    assert "--stage align" not in source
-    assert "verify-align-checkpoint" not in source
-    assert "align_best.pt" not in source
-    assert "router_vsa_nonorm" not in source
-
-
-def test_resume_verify_notebook_checks_same_stage_resume_cases():
-    source = _notebook_source("notebooks/kaggle_verify_resume_checkpoints.ipynb")
-
-    assert "verify-resume-checkpoint" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu.yaml" in source
-    assert "CACHE_HF_REPO_ID" in source
-    assert "FINETUNE_CHECKPOINT_HF_REPO_ID" in source
-    assert "FINETUNE_CHECKPOINT_FILENAME = \"finetune_latest.pt\"" in source
-    assert "RUN_HF_FINETUNE_CHECKPOINT_VERIFY = False" in source
-    assert "Skipping optional HF finetune checkpoint verify" in source
-    assert "UserSecretsClient" in source
-    assert "HF_TOKEN" in source
-    assert "--stage align" in source
-    assert "--checkpoint \"$ALIGN_VERIFY_PROFILE/checkpoints/align_latest.pt\"" in source
-    assert "--stage finetune" in source
-    assert "--checkpoint \"$PROFILE/checkpoints/finetune_latest.pt\"" in source
-    assert "resume_verify_finetune_tmp" in source
-    assert "--checkpoint \"$FINETUNE_VERIFY_PROFILE/checkpoints/finetune_latest.pt\"" in source
-    assert "align_resume_checkpoint_verify.json" in source
-    assert "finetune_resume_checkpoint_verify.json" in source
-    assert "sha256sum" in source
+@pytest.mark.parametrize('mutation', [None, 'model_revision', 'bytes', 'coverage'])
+def test_notebook_cache_validation_rejects_stale_or_incomplete_cache(tmp_path, mutation):
+    namespace = helpers()
+    cfg = load_config(CONFIG)
+    cfg = replace(cfg, project=replace(cfg.project, output_dir=str(tmp_path)),
+                  cache=replace(cfg.cache, dir=str(tmp_path / 'cache')))
+    prepared = tmp_path / 'prepared_data'
+    prepared.mkdir()
+    (prepared / 'manifest.json').write_text(json.dumps({'subset': 'full', 'root': '/data'}))
+    record = {'camera_paths': {camera: f'{camera}.jpg' for camera in cfg.data.view_order}}
+    for split in ('train', 'val', 'test'):
+        (prepared / f'{split}.jsonl').write_text(json.dumps(record) + '\n')
+    cache = tmp_path / 'cache'
+    cache.mkdir()
+    key = '|'.join(record['camera_paths'][c] for c in sorted(record['camera_paths']))
+    if mutation == 'coverage':
+        key = 'missing-sample'
+    (cache / 'index.json').write_text(json.dumps({key: 0}))
+    fields = dinov2_manifest_fields(cfg, [1, 6, 64, 384], dinov2_processor_policy())
+    if mutation == 'model_revision':
+        fields['model_revision'] = 'wrong-sha'
+    FeatureCacheManifest(**fields).write(cache / 'manifest.json')
+    (cache / 'features.float16.memmap').write_bytes(bytes(1 if mutation == 'bytes' else 6 * 64 * 384 * 2))
+    if mutation is None:
+        assert namespace['validate_cache'](cfg).version == 2
+    else:
+        with pytest.raises(ValueError):
+            namespace['validate_cache'](cfg)
 
 
-def test_mvpruner_debug_notebook_runs_finetune_only_fp32_smoke():
-    source = _notebook_source("notebooks/kaggle_debug_mvpruner_finetune.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml" in source
-    assert 'transformers.__version__ == "4.46.3"' in source
-    assert 'pip install -q -e ".[mvpruner]"' in source
-    assert "PYO3_USE_ABI3_FORWARD_COMPATIBILITY" not in source
-    assert "rustup.rs" not in source
-    assert "os.environ['HF_HUB_DISABLE_XET'] = '1'" in source
-    assert "os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'" in source
-    assert "prepare-data --config \"$RUNTIME_CONFIG\" --subset smoke" in source
-    assert "prepare-features --config \"$RUNTIME_CONFIG\" --subset smoke" in source
-    assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune --max-steps 20" in source
-    assert "--mixed_precision no" in source
-    assert "--max-samples 32" in source
-    assert "--stage align" not in source
-    assert "align_best.pt" not in source
-
-
-def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resume():
-    source = _notebook_source("notebooks/kaggle_train_mvpruner_finetune.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml" in source
-    assert 'transformers.__version__ == "4.46.3"' in source
-    assert 'pip install -q -e ".[mvpruner]"' in source
-    assert "PYO3_USE_ABI3_FORWARD_COMPATIBILITY" not in source
-    assert "rustup.rs" not in source
-    assert "os.environ['HF_HUB_DISABLE_XET'] = '1'" in source
-    assert "os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'" in source
-    assert "prepare-data --config \"$CONFIG\" --subset full" in source
-    assert "prepare-features --config \"$CONFIG\" --subset full" in source
-    assert "PREPARED_DATA_HF_REPO_ID = ''" in source
-    assert "PREPARED_DATA_HF_REPO_TYPE = 'dataset'" in source
-    assert "os.environ['PREPARED_DATA_HF_REPO_ID']" in source
-    assert 'hf download "$CACHE_HF_REPO_ID"' in source
-    assert '--include "cache/*"' in source
-    assert 'hf download "$PREPARED_DATA_HF_REPO_ID"' in source
-    assert '--include "prepared_data/*"' in source
-    assert '"$PROFILE/prepared_data/manifest.json"' in source
-    assert '"$PROFILE/prepared_data/train.jsonl"' in source
-    assert '"$PROFILE/prepared_data/val.jsonl"' in source
-    assert '"$PROFILE/prepared_data/test.jsonl"' in source
-    assert "Prepared data is not a full subset" in source
-    assert "Using existing full prepared data." in source
-    assert '"$PROFILE/cache/features.float16.memmap"' in source
-    assert '"$PROFILE/cache/index.json"' in source
-    assert '"$PROFILE/cache/features.dat"' not in source
-    assert "train --config \"$CONFIG\" --stage finetune $RESUME" in source
-    assert "finetune_latest.pt" in source
-    assert "FINETUNE_CHECKPOINT_HF_REPO_ID = ''" in source
-    assert "FINETUNE_CHECKPOINT_HF_REPO_TYPE = 'model'" in source
-    assert "FINETUNE_CHECKPOINT_FILENAME = 'finetune_latest.pt'" in source
-    assert 'os.environ[\'FINETUNE_CHECKPOINT_HF_REPO_ID\']' in source
-    assert (
-        '--include "$FINETUNE_CHECKPOINT_FILENAME" "$FINETUNE_CHECKPOINT_FILENAME.rng/**"'
-        in source
-    )
-    assert 'if [ ! -f "$RESUME_PATH.rng/manifest.json" ]; then' in source
-    assert 'Distributed RNG manifest is missing' in source
-    assert source.index('hf download "$FINETUNE_CHECKPOINT_HF_REPO_ID"') < source.index(
-        "verify-resume-checkpoint"
-    )
-    assert source.index("verify-resume-checkpoint") < source.index("accelerate launch")
-    assert "verify-resume-checkpoint" in source
-    assert "--mixed_precision no" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "--stage align" not in source
-    assert "align_best.pt" not in source
+def test_bootstrap_uses_active_config_binary_install_and_two_gpu_finetune():
+    text = Path('scripts/kaggle_bootstrap.py').read_text(encoding='utf-8')
+    for expected in [CONFIG, '"huy-dinov2"', '--only-binary=:all:', 'tokenizers==0.20.4',
+                     '"--num_processes", "2"', '"--mixed_precision", "no"', '"diagnose-train"']:
+        assert expected in text
+    assert '"align"' not in text
+    assert 'raw["training"]["gradient_accumulation_steps"] = 1' in text
+    assert 'raw["training"]["finetune_max_steps"] = 20' in text
+    assert 'raw["project"]["output_dir"] += "_debug"' in text

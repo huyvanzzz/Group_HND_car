@@ -1,3 +1,4 @@
+from config_helpers import write_fake_config
 import sys
 from types import ModuleType
 
@@ -6,8 +7,8 @@ import pytest
 from efficient_vlm_ad.config import load_config
 
 
-def test_runtime_cache_and_generation_config_loaded():
-    cfg = load_config("configs/repvit_t5_efficient_tiny_smoke.yaml")
+def test_runtime_cache_and_generation_config_loaded(tmp_path):
+    cfg = load_config(write_fake_config(tmp_path))
 
     assert cfg.cache.dir.endswith("cache")
     assert cfg.runtime.precision == "auto"
@@ -17,7 +18,7 @@ def test_runtime_cache_and_generation_config_loaded():
 
 
 def test_full_generation_config_loaded():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
+    cfg = load_config("configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml")
 
     assert cfg.generation.max_new_tokens == 512
     assert cfg.generation.num_beams == 3
@@ -69,7 +70,7 @@ def test_accelerator_enables_unused_parameter_detection(monkeypatch):
     fake_accelerate.DistributedDataParallelKwargs = FakeDistributedDataParallelKwargs
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
 
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
+    cfg = load_config("configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml")
     pipeline._build_accelerator(cfg)
 
     assert captured["ddp_kwargs"] == {"find_unused_parameters": True}

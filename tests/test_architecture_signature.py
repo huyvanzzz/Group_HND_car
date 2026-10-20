@@ -1,3 +1,4 @@
+from config_helpers import fake_config
 from dataclasses import asdict, replace
 from unittest.mock import Mock
 
@@ -9,7 +10,7 @@ from efficient_vlm_ad.config import ProjectorConfig, VisionConfig, load_config
 
 
 def _cfg(dino=True):
-    cfg = load_config("configs/repvit_t5_efficient_tiny_smoke.yaml")
+    cfg = fake_config()
     cfg = replace(cfg, model=replace(cfg.model, text=replace(cfg.model.text, model_id="fake_t5")))
     if dino:
         cfg = replace(cfg, model=replace(cfg.model, vision=VisionConfig(

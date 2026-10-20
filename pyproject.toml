@@ -1,7 +1,7 @@
 [project]
 name = "efficient-vlm-ad"
 version = "0.1.0"
-description = "Refactored EM-VLM4AD pipeline for Kaggle, RepViT, and T5-Efficient experiments."
+description = "DINOv2-S and T5-Efficient-Mini MVPruner finetuning pipeline for Kaggle."
 requires-python = ">=3.10"
 dependencies = [
   "datasets",
