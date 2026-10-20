@@ -30,7 +30,7 @@ Beta decreases linearly from 0.2 to 0 by optimizer step; tau is 1.0. Checkpoints
 
 The full notebook prefers local `finetune_latest.pt`. Otherwise it downloads the requested model-repo checkpoint and all `<filename>.rng/**` sidecars. It checks both rank files and world size 2, then invokes `verify-resume-checkpoint --stage finetune` before training. Its final archive includes checkpoints with RNG directories, metrics, predictions, benchmark and debug logs.
 
-Prepared-data and DINO-cache dataset repos are separate. Required files live at repository root and are copied directly into `PROFILE/prepared_data` and `PROFILE/cache`, without nested `cache/cache` paths. Missing unconfigured artifacts trigger full preparation. Full prepared-data counts must match the configured dataset.
+Prepared-data and DINO-cache dataset repos are separate. Required files live at repository root and are copied directly into `PROFILE/prepared_data` and `PROFILE/cache`, without nested `cache/cache` paths. When cache files are missing and no cache repo is configured, full data preparation always runs before feature extraction to materialize raw images and refresh the manifest root. Prepared JSON downloaded from another machine is reused only when cache files are already present. Configured cache repositories missing required files fail explicitly. Full prepared-data counts must match the configured dataset.
 
 ## Validation and benchmarks
 

@@ -23,7 +23,7 @@ For reuse, set separate dataset repositories for prepared data and the DINO cach
 | Prepared data | `manifest.json`, `train.jsonl`, `val.jsonl`, `test.jsonl` | `PROFILE/prepared_data/` |
 | DINO cache | `manifest.json`, `index.json`, `features.float16.memmap` | `PROFILE/cache/` |
 
-The notebook validates full split counts and DINO manifest v2 provenance, shape, index coverage and memmap length before reuse. An incompatible cache fails validation. If files are absent and no dataset repo is configured, the notebook prepares the full data/cache.
+The notebook validates full split counts and DINO manifest v2 provenance, shape, index coverage and memmap length before reuse. An incompatible cache fails validation. If the cache is absent and no cache repo is configured, the notebook first runs full data preparation to materialize raw images and refresh prepared JSON, then extracts features. Prepared JSON from another machine cannot supply the images required for extraction; its dataset repo is reused when cache files are already available.
 
 The optional model repository must contain a finetune checkpoint and `<filename>.rng/**`, including the RNG manifest and both rank files. Local `finetune_latest.pt` takes priority; resume is verified before training. With no checkpoint, finetuning starts from pretrained T5 and new multimodal modules. The notebooks run only the finetune stage.
 

@@ -1,6 +1,7 @@
 import ast
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from dataclasses import replace
@@ -89,6 +90,101 @@ def helpers():
     definitions = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef))]
     exec(compile(ast.Module(body=definitions, type_ignores=[]), '<notebook-helpers>', 'exec'), namespace)
     return namespace
+
+
+def preparation_cell():
+    return next(''.join(c['source']) for c in notebook('train')['cells']
+                if "prepared_files = ('manifest.json'" in ''.join(c['source']))
+
+
+@pytest.mark.parametrize('existing_prepared', [False, True])
+def test_missing_cache_materializes_raw_dataset_before_features(tmp_path, existing_prepared, capsys, monkeypatch):
+    namespace = helpers()
+    cfg = load_config(CONFIG)
+    cfg = replace(cfg, project=replace(cfg.project, output_dir=str(tmp_path)),
+                  cache=replace(cfg.cache, dir=str(tmp_path / 'cache')))
+    prepared = tmp_path / 'prepared_data'
+    prepared.mkdir()
+    raw_root = tmp_path / 'materialized_raw_images'
+    if existing_prepared:
+        (prepared / 'manifest.json').write_text(json.dumps({'root': '/another-machine/raw'}))
+        for split in ('train', 'val', 'test'):
+            (prepared / f'{split}.jsonl').write_text('{}\n')
+    commands, downloads = [], []
+
+    def download(*args):
+        downloads.append(args)
+        (prepared / 'manifest.json').write_text(json.dumps({'root': '/another-machine/raw'}))
+        for split in ('train', 'val', 'test'):
+            (prepared / f'{split}.jsonl').write_text('{}\n')
+
+    def run(command, check):
+        assert check is True
+        commands.append(command)
+        if 'prepare-data' in command:
+            raw_root.mkdir()
+            (raw_root / 'camera.jpg').write_bytes(b'local raw asset')
+            (prepared / 'manifest.json').write_text(json.dumps({'root': str(raw_root)}))
+            for split in ('train', 'val', 'test'):
+                (prepared / f'{split}.jsonl').write_text('{}\n')
+        elif 'prepare-features' in command:
+            manifest = json.loads((prepared / 'manifest.json').read_text())
+            assert (Path(manifest['root']) / 'camera.jpg').is_file(), 'raw images must be materialized first'
+
+    namespace.update(cfg=cfg, PREPARED_DATA_HF_REPO_ID='owner/prepared', CACHE_HF_REPO_ID='',
+                     subprocess=SimpleNamespace(run=run),
+                     download_exact=download,
+                     validate_prepared=lambda *args, **kwargs: None,
+                     validate_cache=lambda *args: None)
+    monkeypatch.setenv('CONFIG', CONFIG)
+    exec(compile(preparation_cell(), '<notebook-preparation>', 'exec'), namespace)
+    assert [command[3] for command in commands] == ['prepare-data', 'prepare-features']
+    assert all(command[-2:] == ['--subset', 'full'] for command in commands)
+    assert downloads == []
+    assert 'raw images' in capsys.readouterr().out
+
+
+def test_configured_cache_download_failure_does_not_start_raw_preparation(tmp_path):
+    namespace = helpers()
+    cfg = load_config(CONFIG)
+    cfg = replace(cfg, project=replace(cfg.project, output_dir=str(tmp_path)),
+                  cache=replace(cfg.cache, dir=str(tmp_path / 'cache')))
+    calls = []
+
+    def download(repo_id, *_args):
+        calls.append(('download', repo_id))
+        raise FileNotFoundError('configured HF repo is missing required files')
+
+    namespace.update(cfg=cfg, PREPARED_DATA_HF_REPO_ID='owner/prepared', CACHE_HF_REPO_ID='owner/dino-cache',
+                     download_exact=download, subprocess=SimpleNamespace(run=lambda *_a, **_kw: calls.append(('run', None))))
+    with pytest.raises(FileNotFoundError):
+        exec(compile(preparation_cell(), '<notebook-preparation>', 'exec'), namespace)
+    assert calls == [('download', 'owner/dino-cache')]
+
+
+def test_existing_cache_can_reuse_prepared_repo_without_raw_download(tmp_path):
+    namespace = helpers()
+    cfg = load_config(CONFIG)
+    cfg = replace(cfg, project=replace(cfg.project, output_dir=str(tmp_path)),
+                  cache=replace(cfg.cache, dir=str(tmp_path / 'cache')))
+    cache = tmp_path / 'cache'
+    cache.mkdir()
+    for name in ('manifest.json', 'index.json', 'features.float16.memmap'):
+        (cache / name).touch()
+    downloads, commands = [], []
+
+    def download(repo_id, repo_type, destination, filenames):
+        downloads.append(repo_id)
+        destination.mkdir()
+        for name in filenames:
+            (destination / name).touch()
+
+    namespace.update(cfg=cfg, PREPARED_DATA_HF_REPO_ID='owner/prepared', CACHE_HF_REPO_ID='',
+                     download_exact=download, subprocess=SimpleNamespace(run=lambda *a, **kw: commands.append(a)),
+                     validate_prepared=lambda *a, **kw: None, validate_cache=lambda *a: None)
+    exec(compile(preparation_cell(), '<notebook-preparation>', 'exec'), namespace)
+    assert downloads == ['owner/prepared']
+    assert commands == []
 
 
 def test_direct_download_copies_exact_files_without_cache_nesting(tmp_path):
