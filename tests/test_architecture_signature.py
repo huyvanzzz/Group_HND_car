@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from unittest.mock import Mock
 
 import pytest
@@ -33,15 +33,9 @@ def test_signature_contains_exact_architecture_and_ignores_training_settings():
         },
         "projector.type": "linear", "text.model_id": cfg.model.text.model_id,
         "text.revision": cfg.model.text.revision, "text.d_model": cfg.model.text.d_model,
-        "fusion.name": cfg.model.fusion.name, "fusion.stage1_top_k": cfg.model.fusion.stage1_top_k,
-        "fusion.stage2_top_k": cfg.model.fusion.stage2_top_k, "fusion.stage2_layer": cfg.model.fusion.stage2_layer,
-        "fusion.min_tokens_per_camera": cfg.model.fusion.min_tokens_per_camera,
-        "fusion.stage1_relevance_mode": cfg.model.fusion.stage1_relevance_mode,
-        "fusion.beta_start": cfg.model.fusion.beta_start,
-        "fusion.beta_end": cfg.model.fusion.beta_end,
-        "fusion.beta_schedule": cfg.model.fusion.beta_schedule,
-        "fusion.tau": cfg.model.fusion.tau,
-        "fusion.eps": cfg.model.fusion.eps,
+        **{f"adapter.{key}": value for key, value in asdict(cfg.model.adapter).items()},
+        **{f"fusion.{key}": value for key, value in asdict(cfg.model.fusion).items()},
+        "training.gpa_hidden_size": cfg.training.gpa_hidden_size,
     }
     changed = replace(cfg, training=replace(cfg.training, learning_rate=0.123))
     assert checkpointing.architecture_signature(changed) == signature
@@ -136,6 +130,40 @@ def test_mvpruner_config_mismatch_rejected_before_weights_load(tmp_path, field, 
     model.load_state_dict = Mock(side_effect=AssertionError("weights must not load"))
 
     with pytest.raises(ValueError, match=f"fusion.{field}"):
+        _strict_load_model_from_checkpoint(path, model, "cpu")
+    model.load_state_dict.assert_not_called()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("adapter.dropout", 0.3),
+    ("fusion.top_k", 11),
+    ("fusion.visual_self_attention_layers", 2),
+    ("training.gpa_hidden_size", 64),
+])
+def test_adapter_router_and_gpa_config_mismatch_rejected_before_weights_load(tmp_path, field, value):
+    from efficient_vlm_ad.pipeline import _strict_load_model_from_checkpoint
+
+    cfg = _cfg()
+    cfg = replace(cfg, model=replace(
+        cfg.model,
+        adapter=replace(cfg.model.adapter, name="minidrive_di"),
+        fusion=replace(cfg.model.fusion, name="question_guided_router"),
+    ))
+    section, key = field.split(".", 1)
+    if section == "training":
+        changed = replace(cfg, training=replace(cfg.training, **{key: value}))
+    else:
+        changed_section = replace(getattr(cfg.model, section), **{key: value})
+        changed = replace(cfg, model=replace(cfg.model, **{section: changed_section}))
+    model = torch.nn.Linear(2, 2)
+    model.architecture_signature = checkpointing.architecture_signature(cfg)
+    path = tmp_path / "mismatch.pt"
+    torch.save({"model": {}, "metadata": {
+        "architecture_signature": checkpointing.architecture_signature(changed),
+    }}, path)
+    model.load_state_dict = Mock(side_effect=AssertionError("weights must not load"))
+
+    with pytest.raises(ValueError, match=field):
         _strict_load_model_from_checkpoint(path, model, "cpu")
     model.load_state_dict.assert_not_called()
 
