@@ -156,6 +156,7 @@ class T5SplitEncoder(nn.Module):
                 self.encoder.block[0], hidden, extended_mask, position_bias, cache_position
             )
             pre_dropout = self._pre_dropout_attention(self.encoder.block[1], hidden, position_bias, attention_mask)
+            self.pruner.capture_tensor("attention", pre_dropout)
             hidden, position_bias = self._run_block(
                 self.encoder.block[1], hidden, extended_mask, position_bias, cache_position
             )

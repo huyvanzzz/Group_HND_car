@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -138,6 +139,75 @@ class MVPrunerTwoStage(nn.Module):
         self.register_buffer("beta_step", torch.tensor(0, dtype=torch.long))
         self.register_buffer("beta_target_steps", torch.tensor(1, dtype=torch.long))
         self.camera_embeddings = nn.Embedding(num_views, self.vision_dim)
+        self.diagnostics_enabled = False
+
+    @contextmanager
+    def capture_diagnostics(self):
+        """Retain backward probes only for the diagnose-train forward/backward."""
+        if self.diagnostics_enabled:
+            raise RuntimeError("MVPruner diagnostic capture is already active")
+        self.diagnostics_enabled = True
+        self._diagnostic_tensors = {}
+        try:
+            yield self
+        finally:
+            self._diagnostic_tensors.clear()
+            del self._diagnostic_tensors
+            self.diagnostics_enabled = False
+
+    def capture_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if self.diagnostics_enabled:
+            if tensor.requires_grad:
+                tensor.retain_grad()
+            self._diagnostic_tensors[name] = tensor
+
+    def diagnostic_report(self, projector: nn.Module) -> dict[str, Any]:
+        if not self.diagnostics_enabled:
+            raise RuntimeError("MVPruner diagnostic capture is not active")
+        refs = self._diagnostic_tensors
+
+        def gradient(name: str, tensor: torch.Tensor, mask: torch.Tensor | None = None,
+                     *, required: bool = True) -> dict[str, Any]:
+            grad = tensor.grad if tensor.requires_grad else None
+            if grad is not None:
+                _require_finite(f"{name} gradient", grad)
+                if mask is not None:
+                    grad = grad[mask]
+            count = int(grad.numel()) if grad is not None else 0
+            ratio = float((grad != 0).float().mean().item()) if count else 0.0
+            required = required and (mask is None or bool(mask.any()))
+            return {"present": grad is not None, "finite": grad is not None,
+                    "nonzero_ratio": ratio, "required": required,
+                    "ok": not required or (grad is not None and ratio > 0)}
+
+        scores = refs["stage2_scores"]
+        selected = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, self.last_debug["stage2_indices"], True)
+        pruning = bool((~selected).any())
+        report = {
+            "projector": {name: gradient(f"projector.{name}", parameter, required=parameter.requires_grad)
+                          for name, parameter in projector.proj.named_parameters()},
+            "projector_output": gradient("projector_output", refs["projector_output"]),
+            "selected_scores": gradient("stage2_scores", scores, selected, required=pruning),
+            "dropped_scores": gradient("stage2_scores", scores, ~selected, required=pruning),
+            "attention_path": gradient("attention", refs["attention"], required=pruning),
+            "input_path": gradient("stage2_values", refs["stage2_values"]),
+            "selected_values": gradient("stage2_values", refs["stage2_values"], selected),
+            # STE has hard forward values. Dropped-value gradients are observation only.
+            "dropped_values": gradient("stage2_values", refs["stage2_values"], ~selected, required=False),
+        }
+        stage1 = self.last_debug["raw_relevance"]
+        report["stage1"] = {
+            "selection": "hard", "relevance_negative_ratio": float((stage1 < 0).float().mean().item()),
+            "raw_relevance_range": [float(stage1.min()), float(stage1.max())],
+            "shifted_relevance_range": [float(self.last_debug["shifted_relevance"].min()),
+                                        float(self.last_debug["shifted_relevance"].max())],
+            "budgets": self.last_debug["stage1_budgets"].cpu().tolist(),
+            "question_response": self.last_debug["question_response"],
+        }
+        report["stage2_budgets"] = self.last_debug["stage2_budgets"].cpu().tolist()
+        paths = [value for value in report.values() if isinstance(value, dict) and "ok" in value]
+        report["ok"] = all(value["ok"] for value in paths + list(report["projector"].values()))
+        return report
 
     def add_camera_embeddings(self, visual: torch.Tensor) -> torch.Tensor:
         if visual.ndim != 4 or visual.shape[1:3] != (self.num_views, self.tokens_per_view):
@@ -182,7 +252,9 @@ class MVPrunerTwoStage(nn.Module):
         base_indices = torch.arange(total, device=visual.device).expand(batch, -1)
         all_camera_ids = (base_indices // self.tokens_per_view).to(torch.long)
         if self.stage1_top_k == total:
-            debug = {"raw_relevance": visual.new_zeros(batch, total), "shifted_relevance": visual.new_ones(batch, total)}
+            debug = {"raw_relevance": visual.new_zeros(batch, total), "shifted_relevance": visual.new_ones(batch, total),
+                     "stage1_budgets": torch.full((batch, self.num_views), self.tokens_per_view, device=visual.device),
+                     "stage1_indices": base_indices}
             return visual, base_indices, all_camera_ids, debug
 
         per_view = visual.reshape(batch, self.num_views, self.tokens_per_view, dim)
@@ -252,11 +324,15 @@ class MVPrunerTwoStage(nn.Module):
         training: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         batch, count, dim = values.shape
+        _require_finite("stage2 values", values)
+        _require_finite("stage2 scores", scores)
+        self.capture_tensor("stage2_values", values)
+        self.capture_tensor("stage2_scores", scores)
         use_training = self.training if training is None else training
         if self.stage2_top_k == count:
             indices = torch.arange(count, device=values.device).expand(batch, -1)
-            return values, indices, camera_ids, {"stage2_indices": indices}
-        _require_finite("stage2 scores", scores)
+            budgets = torch.stack([(camera_ids == p).sum(1) for p in range(self.num_views)], dim=1)
+            return values, indices, camera_ids, {"stage2_indices": indices, "stage2_budgets": budgets}
         counts = torch.stack([(camera_ids == p).sum(dim=1) for p in range(self.num_views)], dim=1)
         camera_relevance = torch.stack(
             [

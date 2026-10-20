@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import json
 import os
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,48 @@ import numpy as np
 import torch
 
 from .verification import assert_tied_weights_ok, retie_text_model_weights
+
+
+def architecture_signature(cfg: Any) -> dict[str, Any]:
+    """Configuration identity, independent of training state and output paths."""
+    model = cfg.model
+    return {
+        **{f"vision.{key}": value for key, value in asdict(model.vision).items()},
+        "projector.type": model.projector.type,
+        **{f"text.{key}": value for key, value in asdict(model.text).items()},
+        **{f"fusion.{key}": getattr(model.fusion, key)
+           for key in ("name", "stage1_top_k", "stage2_top_k", "stage2_layer")},
+    }
+
+
+def validate_checkpoint_signature(metadata: dict[str, Any], *, model: torch.nn.Module | None = None,
+                                  cfg: Any | None = None) -> None:
+    expected = architecture_signature(cfg) if cfg is not None else getattr(model, "architecture_signature", None)
+    if expected is None:
+        return
+    actual = metadata.get("architecture_signature")
+    if actual is None:
+        if str(expected.get("vision.name", "")).startswith("dinov2"):
+            raise ValueError("DINOv2 checkpoint is missing metadata.architecture_signature")
+        return  # Historical non-DINO checkpoints did not record architecture identity.
+    if not isinstance(actual, dict):
+        raise ValueError("Checkpoint architecture_signature must be a mapping")
+
+    def differences(wanted: dict, stored: dict, prefix: str = "") -> list[str]:
+        result = []
+        for key in sorted(wanted.keys() | stored.keys()):
+            field = f"{prefix}{key}"
+            if key not in wanted or key not in stored:
+                result.append(f"{field}: checkpoint={stored.get(key)!r}, config={wanted.get(key)!r}")
+            elif isinstance(wanted[key], dict) and isinstance(stored[key], dict):
+                result.extend(differences(wanted[key], stored[key], field + "."))
+            elif wanted[key] != stored[key]:
+                result.append(f"{field}: checkpoint={stored[key]!r}, config={wanted[key]!r}")
+        return result
+
+    mismatches = differences(expected, actual)
+    if mismatches:
+        raise ValueError("Checkpoint architecture_signature mismatch: " + "; ".join(mismatches))
 
 
 def _rng_state() -> dict[str, Any]:
@@ -132,7 +175,8 @@ def save_checkpoint(
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
         "rng_state": _rng_state(),
-        "metadata": metadata,
+        "metadata": {**metadata, **({"architecture_signature": model.architecture_signature}
+                                  if hasattr(model, "architecture_signature") else {})},
     }
     torch.save(payload, target)
 
@@ -145,8 +189,10 @@ def load_checkpoint(
     scheduler: Any | None = None,
     scaler: Any | None = None,
     map_location: str | torch.device = "cpu",
+    cfg: Any | None = None,
 ) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    validate_checkpoint_signature(payload.get("metadata", {}), model=model, cfg=cfg)
     model.load_state_dict(payload["model"])
     retie_report = retie_text_model_weights(model)
     assert_tied_weights_ok(model)

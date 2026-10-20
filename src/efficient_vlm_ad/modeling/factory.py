@@ -9,6 +9,7 @@ from .mvpruner import MVPrunerTwoStage
 from .vision import Dinov2FeatureExtractor, ImageProcessorTransform, LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
 from ..tokenization import ensure_special_less_than_token
+from ..checkpointing import architecture_signature
 
 
 class SimpleTokenizer:
@@ -257,6 +258,7 @@ def build_vlm_model(cfg):
         gpa_hidden_size=cfg.training.gpa_hidden_size,
         projector_type=cfg.model.projector.type,
     )
+    model.architecture_signature = architecture_signature(cfg)
     return model, tokenizer
 
 
@@ -273,4 +275,5 @@ def build_end_to_end_vlm_model(cfg, vision_encoder: nn.Module):
         gpa_hidden_size=cfg.training.gpa_hidden_size,
         projector_type=cfg.model.projector.type,
     )
+    model.architecture_signature = architecture_signature(cfg)
     return model, tokenizer

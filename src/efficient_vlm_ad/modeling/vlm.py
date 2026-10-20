@@ -89,10 +89,23 @@ class EfficientVLMForAD(nn.Module):
             enriched = self.visual_fusion.add_camera_embeddings(visual_features)
             flat = enriched.reshape(enriched.shape[0], -1, enriched.shape[-1])
             projected = self.projector(flat)
+            self.visual_fusion.capture_tensor("projector_output", projected)
         with record_function("mvpruner.stage1_dra_ccts"):
             selected, _stage1_indices, camera_ids, stage1_debug = self.visual_fusion.stage1(
                 projected, text_tokens, attention_mask
             )
+        if self.visual_fusion.diagnostics_enabled:
+            # A deterministic counterfactual probe; it does not participate in selection/backward.
+            with torch.no_grad():
+                _, alternate_indices, _, alternate_debug = self.visual_fusion.stage1(
+                    projected.detach(), -text_tokens.detach(), attention_mask
+                )
+                stage1_debug["question_response"] = {
+                    "probe": "negated_question_embeddings",
+                    "relevance_mean_absolute_change": float((stage1_debug["raw_relevance"].detach()
+                                                             - alternate_debug["raw_relevance"]).abs().mean()),
+                    "selection_changed_ratio": float((alternate_indices != _stage1_indices).float().mean()),
+                }
         visual_tokens = selected + self.modal_embeddings(
             torch.ones((selected.shape[0], selected.shape[1]), dtype=torch.long, device=selected.device)
         )
@@ -111,7 +124,10 @@ class EfficientVLMForAD(nn.Module):
             training=training,
         )
         split.debug.update(stage1_debug)
-        self.visual_fusion.last_debug = split.debug
+        self.visual_fusion.last_debug = {
+            name: value.detach() if isinstance(value, torch.Tensor) else value
+            for name, value in split.debug.items()
+        }
         return split
 
     def add_spatial_embeddings(self, visual_features: torch.Tensor) -> torch.Tensor:

@@ -1,0 +1,151 @@
+from dataclasses import replace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from efficient_vlm_ad import checkpointing
+from efficient_vlm_ad.config import ProjectorConfig, VisionConfig, load_config
+
+
+def _cfg(dino=True):
+    cfg = load_config("configs/repvit_t5_efficient_tiny_smoke.yaml")
+    cfg = replace(cfg, model=replace(cfg.model, text=replace(cfg.model.text, model_id="fake_t5")))
+    if dino:
+        cfg = replace(cfg, model=replace(cfg.model, vision=VisionConfig(
+            name="dinov2_small_avgpool", model_id="facebook/dinov2-small", revision="vision-sha",
+            output_dim=384, seq_len=64, image_size=224,
+        ), projector=ProjectorConfig(type="linear")))
+    return cfg
+
+
+def test_signature_contains_exact_architecture_and_ignores_training_settings():
+    cfg = _cfg()
+    signature = checkpointing.architecture_signature(cfg)
+    assert signature == {
+        "vision.name": "dinov2_small_avgpool", "vision.model_id": "facebook/dinov2-small",
+        "vision.revision": "vision-sha", "vision.output_dim": 384, "vision.seq_len": 64,
+        "vision.image_size": 224,
+        "vision.feature_extraction": {
+            "output_layer": "last_hidden_state", "prefix_tokens_to_remove": 1,
+            "source_grid": [16, 16], "pooling": "avg_pool2d", "kernel_size": 2,
+            "stride": 2, "output_grid": [8, 8],
+        },
+        "projector.type": "linear", "text.model_id": cfg.model.text.model_id,
+        "text.revision": cfg.model.text.revision, "text.d_model": cfg.model.text.d_model,
+        "fusion.name": cfg.model.fusion.name, "fusion.stage1_top_k": cfg.model.fusion.stage1_top_k,
+        "fusion.stage2_top_k": cfg.model.fusion.stage2_top_k, "fusion.stage2_layer": cfg.model.fusion.stage2_layer,
+    }
+    changed = replace(cfg, training=replace(cfg.training, learning_rate=0.123))
+    assert checkpointing.architecture_signature(changed) == signature
+
+
+@pytest.mark.parametrize("helper", ["load", "strict", "new_vision"])
+@pytest.mark.parametrize("kind", ["missing", "mismatch"])
+def test_dino_rejected_before_any_model_or_optimizer_load(tmp_path, helper, kind):
+    from efficient_vlm_ad.pipeline import _strict_load_model_from_checkpoint, _load_model_weights_allowing_new_vision
+
+    cfg = _cfg()
+    model = torch.nn.Linear(2, 2)
+    model.architecture_signature = checkpointing.architecture_signature(cfg)
+    metadata = {}
+    if kind == "mismatch":
+        metadata["architecture_signature"] = {**model.architecture_signature, "vision.revision": "other-sha"}
+    path = tmp_path / "bad.pt"
+    torch.save({"model": {}, "metadata": metadata}, path)
+    model.load_state_dict = Mock(side_effect=AssertionError("model load must not happen"))
+    optimizer = Mock()
+    message = "architecture_signature" if kind == "missing" else "vision.revision"
+    with pytest.raises(ValueError, match=message):
+        if helper == "load":
+            checkpointing.load_checkpoint(path, model=model, optimizer=optimizer)
+        else:
+            fn = _strict_load_model_from_checkpoint if helper == "strict" else _load_model_weights_allowing_new_vision
+            fn(path, model, "cpu")
+    model.load_state_dict.assert_not_called()
+    optimizer.load_state_dict.assert_not_called()
+
+
+@pytest.mark.parametrize("dino", [True, False])
+def test_signature_round_trip_and_legacy_missing_compatibility(tmp_path, dino):
+    model = torch.nn.Linear(2, 2)
+    model.architecture_signature = checkpointing.architecture_signature(_cfg(dino))
+    optimizer = torch.optim.AdamW(model.parameters())
+    path = tmp_path / "ok.pt"
+    checkpointing.save_checkpoint(path, model=model, optimizer=optimizer, scheduler=None, scaler=None, metadata={})
+    payload = torch.load(path, weights_only=False)
+    assert payload["metadata"]["architecture_signature"] == model.architecture_signature
+    if not dino:
+        payload["metadata"].pop("architecture_signature")
+        torch.save(payload, path)
+    checkpointing.load_checkpoint(path, model=model, optimizer=optimizer)
+
+
+def test_factory_attaches_signature_without_loading_dino_backbone():
+    from efficient_vlm_ad.modeling.factory import build_vlm_model
+
+    cfg = _cfg()
+    model, _ = build_vlm_model(cfg)
+    assert model.architecture_signature == checkpointing.architecture_signature(cfg)
+
+
+@pytest.mark.parametrize("field", [
+    "vision.name", "vision.model_id", "vision.revision", "vision.output_dim", "vision.seq_len",
+    "vision.image_size", "vision.feature_extraction", "projector.type", "text.model_id",
+    "text.revision", "text.d_model", "fusion.name", "fusion.stage1_top_k", "fusion.stage2_top_k", "fusion.stage2_layer",
+])
+def test_each_signature_field_is_validated(field):
+    signature = checkpointing.architecture_signature(_cfg())
+    model = torch.nn.Linear(2, 2)
+    model.architecture_signature = signature
+    wrong = {**signature, field: "different"}
+    with pytest.raises(ValueError, match=field):
+        checkpointing.validate_checkpoint_signature({"architecture_signature": wrong}, model=model)
+
+
+@pytest.mark.parametrize("entrypoint", ["train", "diagnose", "verify_resume", "evaluate", "benchmark"])
+@pytest.mark.parametrize("kind", ["missing", "mismatch"])
+def test_real_entrypoints_reject_dino_before_load(tmp_path, monkeypatch, entrypoint, kind):
+    from efficient_vlm_ad import pipeline
+    from efficient_vlm_ad.modeling.factory import build_vlm_model
+
+    cfg = _cfg()
+    cfg = replace(cfg, project=replace(cfg.project, output_dir=str(tmp_path)),
+                  runtime=replace(cfg.runtime, device="cpu", precision="fp32"))
+    model, tokenizer = build_vlm_model(cfg)
+    metadata = {"stage": "align"}
+    if kind == "mismatch":
+        metadata["architecture_signature"] = {**model.architecture_signature, "fusion.stage2_top_k": -1}
+    path = tmp_path / "bad.pt"
+    torch.save({"model": {}, "optimizer": {}, "metadata": metadata}, path)
+    model.load_state_dict = Mock(side_effect=AssertionError("must validate before model load"))
+    monkeypatch.setattr(pipeline, "_build_train_model", lambda _: (model, tokenizer, None))
+    with pytest.raises(ValueError, match="architecture_signature" if kind == "missing" else "fusion.stage2_top_k"):
+        if entrypoint == "train":
+            pipeline.train_stage(cfg, "align", resume=str(path))
+        elif entrypoint == "diagnose":
+            pipeline.diagnose_train(cfg, "align", resume=str(path))
+        elif entrypoint == "verify_resume":
+            pipeline.verify_resume_checkpoint(cfg, str(path), "align")
+        elif entrypoint == "evaluate":
+            pipeline.evaluate_checkpoint(cfg, str(path))
+        else:
+            pipeline.benchmark_checkpoint(cfg, str(path))
+    model.load_state_dict.assert_not_called()
+
+
+@pytest.mark.parametrize("entrypoint", ["evaluate_checkpoint", "benchmark_checkpoint"])
+def test_evaluation_entrypoints_validate_cfg_even_if_custom_model_has_no_signature(tmp_path, monkeypatch, entrypoint):
+    from efficient_vlm_ad import pipeline
+
+    cfg = _cfg()
+    cfg = replace(cfg, project=replace(cfg.project, output_dir=str(tmp_path)),
+                  runtime=replace(cfg.runtime, device="cpu", precision="fp32"))
+    model = torch.nn.Linear(2, 2)
+    model.load_state_dict = Mock(side_effect=AssertionError("must validate config before load"))
+    path = tmp_path / "missing.pt"
+    torch.save({"model": {}, "metadata": {}}, path)
+    monkeypatch.setattr(pipeline, "_build_train_model", lambda _: (model, None, None))
+    with pytest.raises(ValueError, match="architecture_signature"):
+        getattr(pipeline, entrypoint)(cfg, str(path))
+    model.load_state_dict.assert_not_called()

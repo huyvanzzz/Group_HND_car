@@ -23,6 +23,7 @@ from .checkpointing import (
     save_checkpoint,
     save_rank_rng_state,
     write_rank_rng_manifest,
+    validate_checkpoint_signature,
 )
 from .config import ExperimentConfig
 from .data import format_prompt, normalize_camera_paths
@@ -725,6 +726,7 @@ def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, s
 
 def _strict_load_model_from_checkpoint(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    validate_checkpoint_signature(payload.get("metadata", {}), model=model)
     missing, unexpected = model.load_state_dict(payload["model"], strict=True)
     retie_text_model_weights(model)
     assert_tied_weights_ok(model)
@@ -746,6 +748,7 @@ def _module_grad_norm(module: torch.nn.Module) -> float | None:
 
 def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    validate_checkpoint_signature(payload.get("metadata", {}), model=model)
     result = model.load_state_dict(payload["model"], strict=False)
     retie_text_model_weights(model)
     assert_tied_weights_ok(model)
@@ -813,11 +816,13 @@ def train_stage(
             )
             _heartbeat(dbg, started_at, "checkpoint_metadata_start", path=resume)
         metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        validate_checkpoint_signature(metadata, cfg=cfg)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_metadata_done", metadata=metadata)
             _heartbeat(dbg, started_at, "checkpoint_load_start", path=resume, same_stage=metadata.get("stage") == stage)
         if metadata.get("stage") == stage:
             resume_training_payload = torch.load(resume_path, map_location=device, weights_only=False)
+            validate_checkpoint_signature(resume_training_payload.get("metadata", {}), model=model, cfg=cfg)
             model.load_state_dict(resume_training_payload["model"])
             retie_text_model_weights(model)
             assert_tied_weights_ok(model)
@@ -831,7 +836,7 @@ def train_stage(
             if _uses_end_to_end_vision(cfg):
                 metadata = _load_model_weights_allowing_new_vision(resume, model=model, map_location=device)
             else:
-                metadata = load_checkpoint(resume, model=model, map_location=device)
+                metadata = load_checkpoint(resume, model=model, map_location=device, cfg=cfg)
             repair_less_than_token_after_checkpoint(tokenizer, model, metadata)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_load_done", metadata=metadata)
@@ -1301,6 +1306,8 @@ def diagnose_train(
         resume_path = Path(resume)
         begin = time.perf_counter()
         checkpoint_metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        validate_checkpoint_signature(checkpoint_metadata, cfg=cfg)
+        checkpoint_metadata = _strict_load_model_from_checkpoint(resume, model, device)
         mark("checkpoint_metadata", begin)
         if accelerator.is_main_process:
             dbg.log(
@@ -1356,13 +1363,20 @@ def diagnose_train(
 
     begin = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
-    with accelerator.autocast():
-        diagnose_output = model(**_batch_model_inputs(batch, cfg))
-        diagnose_loss = diagnose_output.loss
-    loss_finite = bool(torch.isfinite(diagnose_loss.detach()).item())
-    if not loss_finite:
-        raise FloatingPointError(f"Diagnose forward loss is not finite: {diagnose_loss.detach().cpu().item()}")
-    accelerator.backward(diagnose_loss)
+    mvpruner = _mvpruner_module(debug_model)
+    mvpruner_gradients = None
+    with mvpruner.capture_diagnostics() if mvpruner is not None else nullcontext():
+        with accelerator.autocast():
+            diagnose_output = model(**_batch_model_inputs(batch, cfg))
+            diagnose_loss = diagnose_output.loss
+        loss_finite = bool(torch.isfinite(diagnose_loss.detach()).item())
+        if not loss_finite:
+            raise FloatingPointError(f"Diagnose forward loss is not finite: {diagnose_loss.detach().cpu().item()}")
+        accelerator.backward(diagnose_loss)
+        if mvpruner is not None:
+            mvpruner_gradients = mvpruner.diagnostic_report(debug_model.projector)
+            if not mvpruner_gradients["ok"]:
+                raise RuntimeError(f"Missing or zero gradients in MVPruner diagnose paths: {mvpruner_gradients}")
     gradient_report = trainable_gradient_finite_report(accelerator.unwrap_model(model))
     mark("backward", begin)
     if accelerator.is_main_process:
@@ -1372,6 +1386,7 @@ def diagnose_train(
                 "stage": "diagnose_backward",
                 "loss": float(diagnose_loss.detach().cpu().item()),
                 "gradients": gradient_report,
+                "mvpruner_gradients": mvpruner_gradients,
                 "optimizer_step_performed": False,
             },
         )
@@ -1394,6 +1409,7 @@ def diagnose_train(
         "loss": float(diagnose_loss.detach().cpu().item()),
         "loss_finite": loss_finite,
         "gradients": gradient_report,
+        "mvpruner_gradients": mvpruner_gradients,
         "optimizer_step_performed": False,
         "durations": durations,
     }
@@ -1593,6 +1609,7 @@ def verify_resume_checkpoint(
     assert_tied_weights_ok(model)
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    validate_checkpoint_signature(payload.get("metadata", {}), model=model, cfg=cfg)
     missing, unexpected = model.load_state_dict(payload["model"], strict=True)
     if missing or unexpected:
         raise RuntimeError(f"Strict checkpoint load failed: missing={list(missing)}, unexpected={list(unexpected)}")
@@ -1742,7 +1759,7 @@ def evaluate_checkpoint(
     device = resolve_device(cfg)
     model, tokenizer, transform = _build_train_model(cfg)
     model.to(device)
-    metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    metadata = load_checkpoint(checkpoint, model=model, map_location=device, cfg=cfg)
     repair_less_than_token_after_checkpoint(tokenizer, model, metadata)
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
@@ -1811,7 +1828,7 @@ def benchmark_checkpoint(
     device = resolve_device(cfg)
     model, tokenizer, transform = _build_train_model(cfg)
     model.to(device)
-    metadata = load_checkpoint(checkpoint, model=model, map_location=device)
+    metadata = load_checkpoint(checkpoint, model=model, map_location=device, cfg=cfg)
     repair_less_than_token_after_checkpoint(tokenizer, model, metadata)
     dbg.log("MODEL", {"device": str(device), "precision": str(resolve_precision(cfg))})
     dbg.log("CHECKPOINT", {"loaded": checkpoint, "metadata": metadata})
