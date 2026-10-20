@@ -39,6 +39,19 @@ def test_dinov2_config_rejects_wrong_geometry(tmp_path, key, value):
         load_config(target)
 
 
+@pytest.mark.parametrize('projector', [None, {'type': 'auto'}])
+def test_dinov2_config_requires_explicit_linear_projector(tmp_path, projector):
+    raw = yaml.safe_load(PROFILE.read_text())
+    if projector is None:
+        raw['model'].pop('projector')
+    else:
+        raw['model']['projector'] = projector
+    target = tmp_path / 'bad_projector.yaml'
+    target.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match=r'DINOv2 requires model\.projector\.type=linear'):
+        load_config(target)
+
+
 @pytest.mark.parametrize('key,value', [('output_layer', 'pooler_output'), ('prefix_tokens_to_remove', 0),
     ('source_grid', [14, 14]), ('pooling', 'max_pool2d'), ('kernel_size', 3),
     ('stride', 1), ('output_grid', [4, 4])])

@@ -131,6 +131,10 @@ class ModelConfig:
     fusion: FusionConfig = field(default_factory=FusionConfig)
     projector: ProjectorConfig = field(default_factory=ProjectorConfig)
 
+    def __post_init__(self) -> None:
+        if self.vision.name == "dinov2_small_avgpool" and self.projector.type != "linear":
+            raise ValueError("DINOv2 requires model.projector.type=linear")
+
 
 @dataclass(frozen=True)
 class TrainingConfig:
