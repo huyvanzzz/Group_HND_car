@@ -5,12 +5,14 @@ from torch import nn
 
 
 class MultiModalProjector(nn.Module):
-    def __init__(self, input_dim: int, d_model: int, seq_len: int) -> None:
+    def __init__(self, input_dim: int, d_model: int, seq_len: int, projector_type: str = "auto") -> None:
         super().__init__()
         self.seq_len = seq_len
         self.input_dim = input_dim
         self.d_model = d_model
-        self.proj: nn.Module = nn.Identity() if input_dim == d_model else nn.Linear(input_dim, d_model)
+        if projector_type not in {"auto", "linear"}:
+            raise ValueError("projector_type must be auto or linear")
+        self.proj: nn.Module = nn.Identity() if projector_type == "auto" and input_dim == d_model else nn.Linear(input_dim, d_model)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         if features.ndim != 3:
@@ -40,5 +42,5 @@ def set_trainable_for_stage(modules: nn.ModuleDict, cfg, stage: str) -> None:
         if name in modules:
             _set_module_trainable(modules[name], True)
 
-    if cfg.model.vision.name.startswith("repvit") and not train_vision:
+    if not train_vision:
         modules["vision"].eval()

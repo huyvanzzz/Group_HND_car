@@ -42,6 +42,7 @@ class EfficientVLMForAD(nn.Module):
         d_model: int,
         seq_len: int,
         gpa_hidden_size: int,
+        projector_type: str = "auto",
     ) -> None:
         super().__init__()
         self.text_model = text_model
@@ -55,7 +56,7 @@ class EfficientVLMForAD(nn.Module):
             projector_seq_len = visual_fusion.num_views * visual_fusion.tokens_per_view
         else:
             projector_seq_len = seq_len
-        self.projector = MultiModalProjector(input_dim=vision_dim, d_model=d_model, seq_len=projector_seq_len)
+        self.projector = MultiModalProjector(input_dim=vision_dim, d_model=d_model, seq_len=projector_seq_len, projector_type=projector_type)
         self.modal_embeddings = nn.Embedding(2, d_model)
         side = int(seq_len**0.5)
         self.row_embeddings = nn.Embedding(side, vision_dim) if side * side == seq_len else None
@@ -348,6 +349,7 @@ class EndToEndEfficientVLMForAD(EfficientVLMForAD):
         d_model: int,
         seq_len: int,
         gpa_hidden_size: int,
+        projector_type: str = "auto",
     ) -> None:
         super().__init__(
             text_model=text_model,
@@ -357,6 +359,7 @@ class EndToEndEfficientVLMForAD(EfficientVLMForAD):
             d_model=d_model,
             seq_len=seq_len,
             gpa_hidden_size=gpa_hidden_size,
+            projector_type=projector_type,
         )
         self.vision_encoder = vision_encoder
 

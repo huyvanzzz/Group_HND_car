@@ -6,7 +6,7 @@ from torch import nn
 from .adapters import DynamicInstructionAdapter
 from .router import QuestionGuidedTokenRouter
 from .mvpruner import MVPrunerTwoStage
-from .vision import LegacyVitPatchExtractor, RepVitFeatureExtractor
+from .vision import Dinov2FeatureExtractor, ImageProcessorTransform, LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
 from ..tokenization import ensure_special_less_than_token
 
@@ -159,6 +159,17 @@ def build_text_and_tokenizer(cfg):
 
 
 def build_vision_encoder(cfg):
+    if cfg.model.vision.name == "dinov2_small_avgpool":
+        from transformers import AutoImageProcessor, AutoModel
+
+        processor = AutoImageProcessor.from_pretrained(cfg.model.vision.model_id, revision=cfg.model.vision.revision)
+        transform = ImageProcessorTransform(processor)
+        backbone = AutoModel.from_pretrained(cfg.model.vision.model_id, revision=cfg.model.vision.revision)
+        encoder = Dinov2FeatureExtractor(backbone).float()
+        if cfg.training.vision_training == "feature_cache":
+            encoder.requires_grad_(False)
+            encoder.eval()
+        return encoder, transform
     if cfg.model.vision.name == "fake_vision":
         return FakeVisionEncoder(cfg.model.vision.seq_len, cfg.model.vision.output_dim), None
     if cfg.model.vision.name == "repvit_m1_5":
@@ -244,6 +255,7 @@ def build_vlm_model(cfg):
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
         gpa_hidden_size=cfg.training.gpa_hidden_size,
+        projector_type=cfg.model.projector.type,
     )
     return model, tokenizer
 
@@ -259,5 +271,6 @@ def build_end_to_end_vlm_model(cfg, vision_encoder: nn.Module):
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
         gpa_hidden_size=cfg.training.gpa_hidden_size,
+        projector_type=cfg.model.projector.type,
     )
     return model, tokenizer

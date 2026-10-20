@@ -207,7 +207,7 @@ def test_loads_mvpruner_profile_and_exact_transformers_extra():
 
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     assert "transformers==4.46.3" in pyproject["project"]["optional-dependencies"]["mvpruner"]
-    assert "tokenizers==0.20.3" in pyproject["project"]["optional-dependencies"]["mvpruner"]
+    assert "tokenizers==0.20.4" in pyproject["project"]["optional-dependencies"]["mvpruner"]
 
 
 def test_rejects_invalid_mvpruner_budget(tmp_path: Path):

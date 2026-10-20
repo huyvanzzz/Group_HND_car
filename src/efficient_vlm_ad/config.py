@@ -43,6 +43,17 @@ class GenerationConfig:
 
 
 @dataclass(frozen=True)
+class FeatureExtractionConfig:
+    output_layer: str = "last_hidden_state"
+    prefix_tokens_to_remove: int = 1
+    source_grid: list[int] = field(default_factory=lambda: [16, 16])
+    pooling: str = "avg_pool2d"
+    kernel_size: int = 2
+    stride: int = 2
+    output_grid: list[int] = field(default_factory=lambda: [8, 8])
+
+
+@dataclass(frozen=True)
 class VisionConfig:
     name: str
     model_id: str
@@ -50,6 +61,23 @@ class VisionConfig:
     seq_len: int
     image_size: int
     revision: str | None = None
+    feature_extraction: FeatureExtractionConfig = field(default_factory=FeatureExtractionConfig)
+
+    def __post_init__(self) -> None:
+        if self.name == "dinov2_small_avgpool":
+            if (self.output_dim, self.seq_len, self.image_size) != (384, 64, 224):
+                raise ValueError("DINOv2 requires output_dim=384, seq_len=64, image_size=224")
+            if self.feature_extraction != FeatureExtractionConfig():
+                raise ValueError("DINOv2 requires last_hidden_state, one CLS, 16x16 avg_pool2d(2,2) to 8x8")
+
+
+@dataclass(frozen=True)
+class ProjectorConfig:
+    type: str = "auto"
+
+    def __post_init__(self) -> None:
+        if self.type not in {"auto", "linear"}:
+            raise ValueError("model.projector.type must be auto or linear")
 
 
 @dataclass(frozen=True)
@@ -101,6 +129,7 @@ class ModelConfig:
     text: TextConfig
     adapter: AdapterConfig = field(default_factory=AdapterConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
+    projector: ProjectorConfig = field(default_factory=ProjectorConfig)
 
 
 @dataclass(frozen=True)
@@ -241,7 +270,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 output_dim=int(_require(vision_raw, "output_dim")),
                 seq_len=int(_require(vision_raw, "seq_len")),
                 image_size=int(_require(vision_raw, "image_size")),
+                feature_extraction=FeatureExtractionConfig(**vision_raw.get("feature_extraction", {})),
             ),
+            projector=ProjectorConfig(**model_raw.get("projector", {})),
             text=TextConfig(
                 model_id=str(_require(text_raw, "model_id")),
                 revision=text_raw.get("revision"),

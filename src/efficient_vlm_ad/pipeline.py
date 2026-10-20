@@ -14,7 +14,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from .benchmarking import summarize_latencies
-from .cache import FeatureCacheManifest, create_memmap, validate_manifest
+from .cache import FeatureCacheManifest, create_memmap, dinov2_manifest_fields, validate_manifest
 from .checkpointing import (
     _restore_rng_state,
     load_checkpoint,
@@ -31,6 +31,7 @@ from .evaluation import caption_metrics, metric_display_values, write_generation
 from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
+from .modeling.vision import dinov2_processor_policy
 from .modeling.router import QuestionGuidedTokenRouter, router_debug_payload
 from .modeling.mvpruner import MVPrunerTwoStage
 from .progress import progress, progress_bar
@@ -334,6 +335,8 @@ def prepare_features(
         view_order=cfg.data.view_order,
         shape=list(shape),
     )
+    if cfg.model.vision.name == "dinov2_small_avgpool":
+        cache_manifest = FeatureCacheManifest(**dinov2_manifest_fields(cfg, list(shape), transform.policy))
     cache_manifest.write(cache_dir / "manifest.json")
     report = {"feature_count": len(unique), "shape": list(shape), "cache_dir": str(cache_dir)}
     dbg.log("FEATURE", report)
@@ -346,14 +349,18 @@ class CachedVLMDataset(Dataset):
         self.records = load_prepared_records(cfg, split)
         if max_samples is not None:
             self.records = self.records[:max_samples]
-        manifest = validate_manifest(
-            Path(cfg.cache.dir) / "manifest.json",
-            {
-                "model_id": cfg.model.vision.model_id,
-                "image_size": cfg.model.vision.image_size,
-                "view_order": cfg.data.view_order,
-            },
-        )
+        expected = {
+            "model_id": cfg.model.vision.model_id,
+            "image_size": cfg.model.vision.image_size,
+            "view_order": cfg.data.view_order,
+        }
+        if cfg.model.vision.name == "dinov2_small_avgpool":
+            index = json.loads((Path(cfg.cache.dir) / "index.json").read_text(encoding="utf-8"))
+            expected = dinov2_manifest_fields(
+                cfg, [len(index), len(cfg.data.view_order), cfg.model.vision.seq_len, cfg.model.vision.output_dim],
+                dinov2_processor_policy(),
+            )
+        manifest = validate_manifest(Path(cfg.cache.dir) / "manifest.json", expected)
         self.features = np.memmap(
             Path(cfg.cache.dir) / "features.float16.memmap",
             mode="r",

@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
-mvpruner = ["transformers==4.46.3", "tokenizers==0.20.3"]
+mvpruner = ["transformers==4.46.3", "tokenizers==0.20.4"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
