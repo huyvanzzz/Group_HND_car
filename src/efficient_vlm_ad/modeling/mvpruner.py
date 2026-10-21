@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.profiler import record_function
 
 
 def _require_finite(name: str, value: torch.Tensor) -> None:
@@ -18,6 +19,7 @@ def _require_finite(name: str, value: torch.Tensor) -> None:
         )
 
 
+@torch.no_grad()
 def allocate_bounded_budget(
     weights: torch.Tensor,
     capacity: torch.Tensor,
@@ -44,25 +46,49 @@ def allocate_bounded_budget(
     allocation = torch.maximum(allocation, torch.full_like(allocation, minimum))
     allocation = torch.minimum(allocation, capacity.to(torch.long))
 
-    # Repair over-allocation caused by minimums/caps, then distribute every remainder.
-    for _ in range(total + weights.shape[1]):
-        excess = allocation.sum(dim=1) - total
-        removable = allocation > minimum
-        remove_priority = (allocation.to(quotas.dtype) - quotas).masked_fill(~removable, float("-inf"))
-        remove_idx = remove_priority.argmax(dim=1, keepdim=True)
-        remove = (excess > 0).to(torch.long).unsqueeze(1)
-        allocation.scatter_add_(1, remove_idx, -remove)
-
-    for _ in range(total):
-        need = total - allocation.sum(dim=1)
-        available = allocation < capacity
-        priority = (quotas - allocation.to(quotas.dtype)).masked_fill(~available, float("-inf"))
-        add_idx = priority.argmax(dim=1, keepdim=True)
-        add = (need > 0).to(torch.long).unsqueeze(1)
-        allocation.scatter_add_(1, add_idx, add)
+    # Each camera's next marginal priority drops by one per repaired unit.
+    # Stable ranking of all possible units is equivalent to sequential argmax,
+    # including its lowest-camera-index tie break, without O(total) launches.
+    units = torch.arange(total, device=weights.device)[None, None, :]
+    for removing in (True, False):
+        count = (allocation.sum(1) - total if removing else total - allocation.sum(1)).clamp_min(0)
+        room = allocation - minimum if removing else capacity - allocation
+        levels = allocation.unsqueeze(-1) - units if removing else allocation.unsqueeze(-1) + units
+        if removing:
+            marginal = levels.to(quotas.dtype) - quotas.unsqueeze(-1)
+        else:
+            marginal = quotas.unsqueeze(-1) - levels.to(quotas.dtype)
+        marginal = marginal.masked_fill(units >= room.unsqueeze(-1), -torch.inf)
+        ranked = marginal.flatten(1).argsort(dim=1, descending=True, stable=True)
+        chosen = torch.arange(ranked.shape[1], device=weights.device)[None, :] < count[:, None]
+        changes = torch.zeros_like(allocation).scatter_add_(1, ranked // total, chosen.long())
+        allocation = allocation - changes if removing else allocation + changes
     if bool((allocation.sum(dim=1) != total).any()):
         raise RuntimeError("bounded allocation failed to reach exact total")
     return allocation
+
+
+@torch.no_grad()
+def _ccts_selection(
+    distances: torch.Tensor, relevance: torch.Tensor, budgets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Algorithm 1, batched over samples/views; one scalar sync per call."""
+    selected = torch.zeros_like(relevance, dtype=torch.bool)
+    seed = relevance.argmax(-1)
+    selected.scatter_(-1, seed.unsqueeze(-1), (budgets > 0).unsqueeze(-1))
+    def distance_from(indices):
+        rows = indices[..., None, None].expand(*indices.shape, 1, relevance.shape[-1])
+        return distances.gather(-2, rows).squeeze(-2)
+
+    running = distance_from(seed)
+    for step in range(1, int(budgets.max().item())):
+        active = step < budgets
+        scores = (running * relevance).masked_fill(selected | ~active.unsqueeze(-1), -torch.inf)
+        chosen = scores.argmax(-1)
+        addition = torch.zeros_like(selected).scatter_(-1, chosen.unsqueeze(-1), active.unsqueeze(-1))
+        selected |= addition
+        running = torch.minimum(running, distance_from(chosen))
+    return selected, seed
 
 
 def gather_position_bias(position_bias: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -204,6 +230,9 @@ class MVPrunerTwoStage(nn.Module):
             "budgets": self.last_debug["stage1_budgets"].cpu().tolist(),
             "question_response": self.last_debug["question_response"],
         }
+        for name in ("stage1_diversity", "stage1_dra_weights", "stage1_seed_indices"):
+            if name in self.last_debug:
+                report["stage1"][name] = self.last_debug[name].cpu().tolist()
         report["stage2_budgets"] = self.last_debug["stage2_budgets"].cpu().tolist()
         paths = [value for value in report.values() if isinstance(value, dict) and "ok" in value]
         report["ok"] = all(value["ok"] for value in paths + list(report["projector"].values()))
@@ -249,6 +278,10 @@ class MVPrunerTwoStage(nn.Module):
         expected = self.num_views * self.tokens_per_view
         if total != expected or dim != self.d_model:
             raise ValueError(f"expected visual [B,{expected},{self.d_model}]")
+        if question.ndim != 3 or question.shape[0] != batch or question.shape[2] != dim:
+            raise ValueError("question must have shape [B,L,D]")
+        if question_mask.shape != question.shape[:2] or not bool(question_mask.bool().any(dim=1).all()):
+            raise ValueError("question must contain at least one unmasked token per sample")
         base_indices = torch.arange(total, device=visual.device).expand(batch, -1)
         all_camera_ids = (base_indices // self.tokens_per_view).to(torch.long)
         if self.stage1_top_k == total:
@@ -257,13 +290,13 @@ class MVPrunerTwoStage(nn.Module):
                      "stage1_indices": base_indices}
             return visual, base_indices, all_camera_ids, debug
 
-        per_view = visual.reshape(batch, self.num_views, self.tokens_per_view, dim)
+        per_view = visual.detach().reshape(batch, self.num_views, self.tokens_per_view, dim)
         distances = self._pairwise_distance(per_view)
         uniqueness = distances.min(dim=-1).values
         _require_finite("stage1 uniqueness", uniqueness)
 
-        visual_norm = F.normalize(visual.float(), p=2, dim=-1, eps=self.eps)
-        question_norm = F.normalize(question.float(), p=2, dim=-1, eps=self.eps)
+        visual_norm = F.normalize(visual.detach().float(), p=2, dim=-1, eps=self.eps)
+        question_norm = F.normalize(question.detach().float(), p=2, dim=-1, eps=self.eps)
         similarity = torch.matmul(visual_norm, question_norm.transpose(1, 2))
         similarity = similarity.masked_fill(~question_mask.to(torch.bool).unsqueeze(1), float("-inf"))
         raw_relevance = similarity.max(dim=-1).values
@@ -272,25 +305,17 @@ class MVPrunerTwoStage(nn.Module):
         relevance = torch.ones_like(shifted) if self.relevance_mode == "diversity_only" else shifted
         relevance = relevance.reshape(batch, self.num_views, self.tokens_per_view)
 
-        camera_weights = uniqueness.mean(dim=-1)
+        diversity = uniqueness.mean(dim=-1)
+        high = diversity.max(dim=1, keepdim=True).values
+        low = diversity.min(dim=1, keepdim=True).values
+        camera_weights = torch.softmax((diversity - high) / (high - low + 1e-5), dim=1)
         capacity = torch.full_like(camera_weights, self.tokens_per_view, dtype=torch.long)
-        budgets = allocate_bounded_budget(
-            camera_weights, capacity, total=self.stage1_top_k, minimum=self.min_tokens_per_camera, eps=self.eps
-        )
-
-        selected = torch.zeros_like(uniqueness, dtype=torch.bool)
-        running_uniqueness = uniqueness.clone()
-        for step in range(self.tokens_per_view):
-            active = step < budgets
-            importance = running_uniqueness * relevance
-            importance = importance.masked_fill(selected | ~active.unsqueeze(-1), float("-inf"))
-            chosen = importance.argmax(dim=-1)
-            addition = torch.zeros_like(selected).scatter(-1, chosen.unsqueeze(-1), active.unsqueeze(-1))
-            selected |= addition
-            chosen_distance = torch.gather(
-                distances, -1, chosen.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.tokens_per_view, 1)
-            ).squeeze(-1)
-            running_uniqueness = torch.minimum(running_uniqueness, chosen_distance)
+        with record_function("mvpruner.stage1_allocation"):
+            budgets = allocate_bounded_budget(
+                camera_weights, capacity, total=self.stage1_top_k, minimum=self.min_tokens_per_camera, eps=self.eps
+            )
+        with record_function("mvpruner.stage1_ccts"):
+            selected, seeds = _ccts_selection(distances, relevance, budgets)
 
         global_selected = selected.reshape(batch, total)
         sortable = torch.where(global_selected, base_indices, torch.full_like(base_indices, total))
@@ -302,6 +327,9 @@ class MVPrunerTwoStage(nn.Module):
             "shifted_relevance": shifted,
             "stage1_budgets": budgets,
             "stage1_indices": indices,
+            "stage1_diversity": diversity,
+            "stage1_dra_weights": camera_weights,
+            "stage1_seed_indices": seeds,
         }
         return gathered.to(visual.dtype), indices, camera_ids, debug
 

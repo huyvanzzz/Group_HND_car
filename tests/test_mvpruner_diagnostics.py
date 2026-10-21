@@ -136,7 +136,10 @@ def test_diagnose_train_enables_capture_reports_paths_and_loads_resume(tmp_path,
         model.text_model.get_input_embeddings().weight[less_than_id].fill_(99.0)
         model.text_model.get_input_embeddings().weight[greater_than_id].fill_(5.0)
     path = tmp_path / "resume.pt"
-    torch.save({"model": model.state_dict(), "metadata": {"stage": stage}}, path)
+    from efficient_vlm_ad.checkpointing import architecture_signature
+    torch.save({"model": model.state_dict(), "metadata": {
+        "stage": stage, "architecture_signature": architecture_signature(cfg),
+    }}, path)
     model.load_state_dict = Mock(wraps=model.load_state_dict)
     monkeypatch.setattr(pipeline, "_build_train_model", lambda _: (model, tokenizer, None))
 

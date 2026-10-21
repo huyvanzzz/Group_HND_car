@@ -17,6 +17,7 @@ def architecture_signature(cfg: Any) -> dict[str, Any]:
     """Configuration identity, independent of training state and output paths."""
     model = cfg.model
     return {
+        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name == "mvpruner_two_stage" else {}),
         **{f"vision.{key}": value for key, value in asdict(model.vision).items()},
         "projector.type": model.projector.type,
         **{f"text.{key}": value for key, value in asdict(model.text).items()},
@@ -32,6 +33,10 @@ def validate_checkpoint_signature(metadata: dict[str, Any], *, model: torch.nn.M
     if expected is None:
         return
     actual = metadata.get("architecture_signature")
+    version_key = "mvpruner.stage1_algorithm_version"
+    if version_key in expected and (not isinstance(actual, dict) or actual.get(version_key) != expected[version_key]):
+        raise ValueError("Checkpoint architecture_signature mvpruner.stage1_algorithm_version mismatch; "
+                         "start a new finetune run for Stage 1 v2 (DINO feature cache can be reused)")
     if actual is None:
         if str(expected.get("vision.name", "")).startswith("dinov2"):
             raise ValueError("DINOv2 checkpoint is missing metadata.architecture_signature")

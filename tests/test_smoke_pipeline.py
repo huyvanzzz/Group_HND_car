@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 import torch
+import pytest
 
 from efficient_vlm_ad.pipeline import _target_optimizer_steps
 
@@ -291,7 +292,8 @@ generation:
     assert all(forbidden_progress_keys.isdisjoint(row) for row in progress_rows)
 
 
-def test_mvpruner_offline_smoke_cli_sequence(tmp_path: Path):
+@pytest.mark.parametrize('finetune_only', [False, True])
+def test_mvpruner_offline_smoke_cli_sequence(tmp_path: Path, finetune_only):
     data_root = tmp_path / "dataset"
     _make_fake_data(data_root, rows_per_split=2)
     output_dir = tmp_path / "outputs"
@@ -380,14 +382,20 @@ evaluation:
             "1",
         ],
     ]
+    if finetune_only:
+        commands = commands[:2] + [
+            ["train", "--config", str(cfg), "--stage", "finetune", "--max-steps", "1"],
+        ] + commands[4:]
     for command in commands:
         subprocess.run([sys.executable, "-m", "efficient_vlm_ad", *command], check=True)
 
-    align = torch.load(output_dir / "checkpoints" / "align_latest.pt", map_location="cpu", weights_only=False)
+    stage = "finetune" if finetune_only else "align"
+    align = torch.load(output_dir / "checkpoints" / f"{stage}_latest.pt", map_location="cpu", weights_only=False)
+    assert align["metadata"]["architecture_signature"]["mvpruner.stage1_algorithm_version"] == 2
     assert align["metadata"]["mvpruner"]["stage1_top_k"] == 12
     assert align["metadata"]["mvpruner"]["stage2_top_k"] == 6
     assert align["metadata"]["mvpruner"]["beta_step"] == 1
-    assert (output_dir / "checkpoints" / "align_latest.pt.rng" / "rank_00000.pt").exists()
+    assert (output_dir / "checkpoints" / f"{stage}_latest.pt.rng" / "rank_00000.pt").exists()
     assert (output_dir / "predictions.jsonl").exists()
     assert (output_dir / "benchmark.json").exists()
 

@@ -65,6 +65,20 @@ def test_notebook_uses_kernel_python_for_install_and_cli(kind):
     assert '\npython -m efficient_vlm_ad ' not in text
 
 
+@pytest.mark.parametrize('kind', ['debug', 'train'])
+def test_notebook_refreshes_repo_source_in_kernel_after_clone(kind):
+    nb = notebook(kind)
+    helper_cell = next(
+        ''.join(cell['source'])
+        for cell in nb['cells']
+        if cell['cell_type'] == 'code' and 'def download_exact' in ''.join(cell['source'])
+    )
+    import_line = 'from efficient_vlm_ad.config import load_config'
+    assert "REPO_SRC = '/kaggle/working/Efficient_VLM_For_Autonomous_Driving/src'" in helper_cell
+    assert 'sys.path_importer_cache.pop(REPO_SRC, None)' in helper_cell
+    assert helper_cell.index('sys.path.insert(0, REPO_SRC)') < helper_cell.index(import_line)
+
+
 def test_debug_smokes_real_models_and_limits_optimizer_steps():
     text = source('debug')
     assert 'fake_t5' not in text and 'fake_vision' not in text
