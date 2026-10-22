@@ -14,6 +14,9 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from .benchmarking import summarize_latencies
+from .prefill_benchmarking import (
+    count_prefill_flops, measure_prefill_seconds, prefill_supported, prefill_measurement_metadata,
+)
 from .cache import FeatureCacheManifest, create_memmap, dinov2_manifest_fields, validate_manifest
 from .checkpointing import (
     _restore_rng_state,
@@ -1839,6 +1842,28 @@ def benchmark_checkpoint(
     dataset, collator = _make_dataset_and_collator(cfg, "test", tokenizer, max_samples=max_samples, transform=transform)
     dbg.log("FEATURE", {"split": "test", **dataset.summary()})
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collator)
+    if len(dataset) == 0:
+        raise ValueError("Benchmark requires at least one sample")
+    supported = prefill_supported(model)
+    warmup_samples = min(3, len(dataset))
+
+    def on_device(batch):
+        return {
+            key: value.to(device) if key in ("input_ids", "attention_mask", "visual_features", "images") else value
+            for key, value in batch.items()
+        }
+
+    from itertools import islice
+    with torch.no_grad():
+        for batch in progress(islice(loader, warmup_samples), desc="benchmark-warmup",
+                              total=warmup_samples, disable=disable_progress):
+            batch = on_device(batch)
+            _generate_batch(model, batch, cfg)
+            if supported:
+                measure_prefill_seconds(model, batch, cfg.generation)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     e2e, gen, token_counts = [], [], []
     progress_writer = MinimalProgressWriter(cfg.project.output_dir, "benchmark_progress.jsonl")
     progress_started = time.perf_counter()
@@ -1852,11 +1877,11 @@ def benchmark_checkpoint(
                 if key in batch:
                     batch[key] = batch[key].to(device)
             if device.type == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device)
             gen_start = time.perf_counter()
             ids = _generate_batch(model, batch, cfg)
             if device.type == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device)
             gen.append(time.perf_counter() - gen_start)
             decode_generated_predictions(tokenizer, ids.detach().cpu())
             e2e.append(time.perf_counter() - start)
@@ -1866,10 +1891,30 @@ def benchmark_checkpoint(
             current = idx + 1
             if current % log_every == 0 or current == total_samples:
                 _write_minimal_progress(progress_writer, stage="benchmark", current=current, total=total_samples, start=progress_started)
-    summary = summarize_latencies(e2e_seconds=e2e, generation_seconds=gen, output_tokens=token_counts)
+    # Snapshot generation peak before any FLOP-counter/backend instrumentation.
+    generation_peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+    prefill_seconds, prefill_flops = None, None
+    if supported:
+        prefill_seconds, prefill_flops = [], []
+        for phase, measure, values in (
+            ("benchmark-prefill", measure_prefill_seconds, prefill_seconds),
+            ("benchmark-flops", count_prefill_flops, prefill_flops),
+        ):
+            phase_started = time.perf_counter()
+            _write_minimal_progress(progress_writer, stage=phase, current=0, total=total_samples, start=phase_started)
+            with torch.no_grad():
+                for idx, batch in progress(enumerate(loader), desc=phase, total=len(loader), disable=disable_progress):
+                    values.append(measure(model, on_device(batch), cfg.generation))
+                    current = idx + 1
+                    if current % log_every == 0 or current == total_samples:
+                        _write_minimal_progress(progress_writer, stage=phase, current=current,
+                                                total=total_samples, start=phase_started)
+    summary = summarize_latencies(e2e_seconds=e2e, generation_seconds=gen, output_tokens=token_counts,
+                                  prefill_seconds=prefill_seconds, prefill_flops=prefill_flops)
+    summary["prefill_measurement"] = prefill_measurement_metadata(model, cfg.generation, warmup_samples=warmup_samples)
     summary.update({"device": str(device), "python": platform.python_version(), "torch": torch.__version__})
-    if torch.cuda.is_available():
-        summary.update({"gpu": torch.cuda.get_device_name(0), "peak_cuda_memory": torch.cuda.max_memory_allocated()})
+    if device.type == "cuda":
+        summary.update({"gpu": torch.cuda.get_device_name(device), "peak_cuda_memory": generation_peak})
     output = Path(cfg.project.output_dir) / "benchmark.json"
     output.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     dbg.log("BENCHMARK", summary)
