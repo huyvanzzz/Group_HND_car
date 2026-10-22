@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from efficient_vlm_ad.benchmarking import summarize_component_events, summarize_latencies
 from efficient_vlm_ad.evaluation import generation_diagnostics, metric_display_values, write_generation_diagnostics, write_predictions
@@ -34,10 +35,18 @@ def test_summarize_latencies_computes_generation_ms_per_output_token():
         e2e_seconds=[0.2, 0.4],
         generation_seconds=[0.1, 0.3],
         output_tokens=[5, 15],
+        prefill_seconds=[0.01, 0.03],
+        prefill_flops=[1e9, 3e9],
     )
 
     assert summary["e2e_mean_ms"] == 300.0
-    assert summary["generation_mean_ms"] == 200.0
+    assert summary["prefill_mean_ms"] == 20.0
+    assert summary["prefill_flops_mean_gflops"] == 2.0
+    assert summary["prefill_p50_ms"] == 10.0
+    assert summary["prefill_p95_ms"] == 30.0
+    assert summary["prefill_flops_p50_gflops"] == 1.0
+    assert summary["prefill_flops_p95_gflops"] == 3.0
+    assert not any(key in summary for key in ("generation_mean_ms", "generation_p50_ms", "generation_p95_ms"))
     assert summary["average_generation_ms_per_output_token"] == 20.0
 
 
@@ -56,6 +65,21 @@ def test_summarize_component_events_reports_per_iteration_cpu_and_cuda_time():
 
     assert summary["mvpruner.stage1_dra_ccts"]["cpu_mean_ms"] == 2.0
     assert summary["mvpruner.stage1_dra_ccts"]["cuda_mean_ms"] == 1.0
+
+
+def test_summary_rejects_empty_or_mismatched_samples():
+    with pytest.raises(ValueError, match="nonempty"):
+        summarize_latencies(e2e_seconds=[], generation_seconds=[], output_tokens=[])
+    with pytest.raises(ValueError, match="same benchmark samples"):
+        summarize_latencies(e2e_seconds=[.1], generation_seconds=[.1], output_tokens=[1],
+                            prefill_seconds=[], prefill_flops=[100])
+
+
+def test_summary_synthetic_metrics_are_null():
+    summary = summarize_latencies(e2e_seconds=[.1], generation_seconds=[.05], output_tokens=[2])
+    assert all(summary[key] is None for key in (
+        "prefill_mean_ms", "prefill_p50_ms", "prefill_p95_ms",
+        "prefill_flops_mean_gflops", "prefill_flops_p50_gflops", "prefill_flops_p95_gflops"))
 
 
 def test_metric_display_values_scales_caption_metrics():

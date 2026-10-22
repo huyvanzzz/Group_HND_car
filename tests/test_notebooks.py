@@ -292,9 +292,15 @@ def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resum
     assert "PREPARED_DATA_HF_REPO_TYPE = 'dataset'" in source
     assert "os.environ['PREPARED_DATA_HF_REPO_ID']" in source
     assert 'hf download "$CACHE_HF_REPO_ID"' in source
-    assert '--include "cache/*"' in source
+    assert '--local-dir "$PROFILE/cache"' in source
+    assert '--include "features.float16.memmap" "index.json" "manifest.json"' in source
     assert 'hf download "$PREPARED_DATA_HF_REPO_ID"' in source
-    assert '--include "prepared_data/*"' in source
+    assert '--local-dir "$PROFILE/prepared_data"' in source
+    assert '--include "train.jsonl" "val.jsonl" "test.jsonl" "manifest.json"' in source
+    assert '--include "cache/*"' not in source
+    assert '--include "prepared_data/*"' not in source
+    assert "Configured prepared-data repo did not provide all required artifacts" in source
+    assert "Configured cache repo did not provide all required artifacts" in source
     assert '"$PROFILE/prepared_data/manifest.json"' in source
     assert '"$PROFILE/prepared_data/train.jsonl"' in source
     assert '"$PROFILE/prepared_data/val.jsonl"' in source

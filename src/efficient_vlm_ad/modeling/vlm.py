@@ -217,6 +217,9 @@ class EfficientVLMForAD(nn.Module):
                 "stage1_indices": split.debug["stage1_indices"].detach().cpu().tolist(),
                 "stage2_indices": split.debug["stage2_indices"].detach().cpu().tolist(),
             }
+            for key in ("stage1_diversity", "stage1_dra_weights", "stage1_seed_indices"):
+                if key in split.debug:
+                    report["mvpruner"][key] = split.debug[key].detach().cpu().tolist()
             report["logits"] = _stats("logits", output.logits)
             report["loss"] = _stats("loss", output.loss.detach().reshape(1))
             return report

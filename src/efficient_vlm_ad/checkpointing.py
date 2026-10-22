@@ -12,6 +12,18 @@ import torch
 from .verification import assert_tied_weights_ok, retie_text_model_weights
 
 
+def validate_mvpruner_stage1_version(metadata: dict[str, Any], model: torch.nn.Module) -> None:
+    """Guard only the changed MVPruner selection; legacy router/GPA remain compatible."""
+    expected = getattr(getattr(model, 'visual_fusion', None), 'stage1_algorithm_version', None)
+    if expected is None:
+        return
+    saved = metadata.get('mvpruner')
+    actual = saved.get('stage1_algorithm_version') if isinstance(saved, dict) else None
+    if actual != expected:
+        raise ValueError(f'MVPruner Stage 1 version mismatch: checkpoint={actual}, expected={expected}; '
+                         'start a new finetune training run; prepared data and vision cache can be reused')
+
+
 def _rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {
         "python": random.getstate(),
@@ -126,6 +138,9 @@ def save_checkpoint(
     target.parent.mkdir(parents=True, exist_ok=True)
     retie_text_model_weights(model)
     assert_tied_weights_ok(model)
+    version = getattr(getattr(model, 'visual_fusion', None), 'stage1_algorithm_version', None)
+    if version is not None:
+        metadata = {**metadata, 'mvpruner': {**metadata.get('mvpruner', {}), 'stage1_algorithm_version': version}}
     payload = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -147,6 +162,7 @@ def load_checkpoint(
     map_location: str | torch.device = "cpu",
 ) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    validate_mvpruner_stage1_version(payload.get('metadata', {}), model)
     model.load_state_dict(payload["model"])
     retie_report = retie_text_model_weights(model)
     assert_tied_weights_ok(model)
