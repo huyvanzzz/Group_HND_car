@@ -1,5 +1,21 @@
 # T5 Internal MVPruner-Style Ablation Design
 
+## A0: Full-token baseline for A4
+
+Config: `configs/repvit_t5_efficient_mini_internal_pruning_a0_no_pruning.yaml`.
+Select `ABLATION = "a0_no_pruning"` in the Kaggle notebook.
+A0 matches A4's RepViT, projector, spatial/view/modal embeddings, T5,
+training schedule, generation settings and feature cache. It sets
+`pruning.enabled: false` and `keep_ratio: 1.0`, passing all 294 visual tokens
+plus question tokens through every T5 encoder layer and to decoder cross-attention.
+It bypasses pruning attention scores, diversity computation, selection and
+sequence compaction. Merely setting `keep_ratio: 1.0` with pruning enabled
+would still run the selection algorithm; A0 disables that overhead too.
+The output/checkpoint directory is separate from A4; parameter shapes match.
+For a controlled comparison, use the same initialization checkpoint (or the
+same fresh-training protocol), data, seed and effective batch size for both runs.
+Do not initialize only A0 from a checkpoint already finetuned with A4.
+
 ## A4: Diversity-aware quota and token selection
 
 Config: `configs/repvit_t5_efficient_mini_internal_pruning_a4_per_view_diversity.yaml`.

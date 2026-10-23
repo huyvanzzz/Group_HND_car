@@ -72,6 +72,83 @@ def test_a4_matches_a1_except_identity_and_selection():
     assert a4 == a1
 
 
+def test_a0_matches_a4_except_identity_and_disabling_pruning():
+    from dataclasses import asdict
+
+    a0 = asdict(load_config("configs/repvit_t5_efficient_mini_internal_pruning_a0_no_pruning.yaml"))
+    a4 = asdict(load_config("configs/repvit_t5_efficient_mini_internal_pruning_a4_per_view_diversity.yaml"))
+    assert a0["model"]["pruning"]["enabled"] is False
+    assert a0["model"]["pruning"]["keep_ratio"] == 1.0
+    a0["project"]["output_dir"] = a4["project"]["output_dir"]
+    a0["model"]["profile"] = a4["model"]["profile"]
+    a0["model"]["pruning"]["enabled"] = True
+    a0["model"]["pruning"]["keep_ratio"] = 0.5
+    assert a0 == a4
+
+
+def test_a0_factory_keeps_all_294_visual_tokens_without_selector(monkeypatch):
+    from dataclasses import replace
+
+    cfg = load_config("configs/repvit_t5_efficient_mini_internal_pruning_a0_no_pruning.yaml")
+    cfg = replace(cfg, model=replace(cfg.model, text=TextConfig(model_id="fake_t5", d_model=8)))
+    model, tokenizer = build_vlm_model(cfg)
+    assert model.pruning_enabled is False
+
+    def reject_pruning(*args, **kwargs):
+        raise AssertionError("A0 must not compute pruning scores or select tokens")
+
+    monkeypatch.setattr(model, "_compact", reject_pruning)
+    monkeypatch.setattr(model, "_fallback_scores", reject_pruning)
+    encoded = tokenizer(["A question"], padding=True, return_tensors="pt")
+    hidden, mask = model._encode_with_pruning(
+        encoded["input_ids"], encoded["attention_mask"], torch.randn(1, 6, 49, 512),
+    )
+    assert hidden.shape[1] == 294 + encoded["input_ids"].shape[1]
+    assert mask.shape == hidden.shape[:2]
+    assert model.last_pruned_visual_indices is None
+
+
+def test_a0_real_t5_preserves_tokens_in_every_layer_and_generation(monkeypatch):
+    from transformers import T5Config, T5ForConditionalGeneration
+    from efficient_vlm_ad.modeling.t5_internal_pruning import T5InternalPruningVLMForAD
+
+    text = T5ForConditionalGeneration(T5Config(
+        vocab_size=32, d_model=8, d_kv=4, d_ff=16, num_layers=2,
+        num_decoder_layers=1, num_heads=2, dropout_rate=0.0,
+        decoder_start_token_id=0, pad_token_id=0, eos_token_id=1,
+    ))
+    model = T5InternalPruningVLMForAD(
+        text_model=text, vision_dim=4, d_model=8, seq_len=49,
+        keep_ratio=1.0, min_keep_per_view=2, selection_policy="per_view_diversity",
+        pruning_enabled=False,
+    )
+
+    def reject_pruning(*args, **kwargs):
+        raise AssertionError("A0 must bypass pruning and attention scoring")
+
+    monkeypatch.setattr(model, "_compact", reject_pruning)
+    monkeypatch.setattr(model, "_scores_from_attention", reject_pruning)
+    seen_lengths = []
+    handles = [block.register_forward_pre_hook(
+        lambda module, args: seen_lengths.append(args[0].shape[1])
+    ) for block in text.encoder.block]
+    inputs = dict(input_ids=torch.tensor([[2, 3, 4]]), attention_mask=torch.ones(1, 3, dtype=torch.long),
+                  visual_features=torch.randn(1, 6, 49, 4))
+    output = model.forward_from_features(**inputs, labels=torch.tensor([[5, 1]]))
+    assert torch.isfinite(output.loss)
+    output.loss.backward()
+    assert model.projector.proj.weight.grad.abs().sum() > 0
+    model.eval()
+    with torch.no_grad():
+        generated = model.generate_from_features(**inputs, max_new_tokens=2)
+    assert generated.shape[0] == 1
+    assert seen_lengths == [297, 297, 297, 297]
+    assert model.last_pruning_layer is None
+    assert model.last_pruning_scores is None
+    for handle in handles:
+        handle.remove()
+
+
 def test_legacy_profile_uses_identity_projector():
     projector = MultiModalProjector(input_dim=768, d_model=768, seq_len=49)
 

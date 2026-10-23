@@ -181,5 +181,6 @@ def build_vlm_model(cfg):
         selection_policy=cfg.model.pruning.selection_policy,
         layer_policy=cfg.model.pruning.layer_policy,
         layer_index=cfg.model.pruning.layer_index,
+        pruning_enabled=cfg.model.pruning.enabled,
     )
     return model, tokenizer

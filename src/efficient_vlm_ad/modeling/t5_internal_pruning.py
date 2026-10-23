@@ -78,6 +78,7 @@ class T5InternalPruningVLMForAD(nn.Module):
         layer_policy: str = "middle",
         layer_index: int | None = None,
         num_views: int = 6,
+        pruning_enabled: bool = True,
     ) -> None:
         super().__init__()
         if selection_policy not in {"global_topk", "per_view_uniform", "ira", "per_view_diversity"}:
@@ -87,6 +88,7 @@ class T5InternalPruningVLMForAD(nn.Module):
         self.text_model = text_model
         self.seq_len = seq_len
         self.num_views = num_views
+        self.pruning_enabled = pruning_enabled
         self.keep_ratio = keep_ratio
         self.min_keep_per_view = min_keep_per_view
         self.selection_policy = selection_policy
@@ -388,12 +390,14 @@ class T5InternalPruningVLMForAD(nn.Module):
         encoder = getattr(self.text_model, "encoder", None)
         blocks = getattr(encoder, "block", None)
         if encoder is None or blocks is None:
+            if not self.pruning_enabled:
+                return hidden_states, combined_mask
             return self._fallback_compacted_inputs(input_ids, attention_mask, visual_features)
 
-        pruning_layer = self._resolve_pruning_layer()
+        pruning_layer = self._resolve_pruning_layer() if self.pruning_enabled else None
         self.last_pruning_layer = pruning_layer
         position_bias = None
-        extended_mask = encoder.get_extended_attention_mask(combined_mask, hidden_states.shape[:2])
+        extended_mask = self._encoder_attention_mask(encoder, combined_mask, hidden_states)
         for idx, block in enumerate(blocks):
             capture = idx == pruning_layer
             block_input = hidden_states
@@ -422,11 +426,19 @@ class T5InternalPruningVLMForAD(nn.Module):
                 scores = self._scores_from_attention(attention, attention_mask)
                 hidden_states, combined_mask = self._compact(hidden_states, attention_mask, scores)
                 position_bias = None
-                extended_mask = encoder.get_extended_attention_mask(combined_mask, hidden_states.shape[:2])
+                extended_mask = self._encoder_attention_mask(encoder, combined_mask, hidden_states)
 
         hidden_states = encoder.final_layer_norm(hidden_states)
         hidden_states = encoder.dropout(hidden_states)
         return hidden_states, combined_mask
+
+    @staticmethod
+    def _encoder_attention_mask(encoder, mask: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hasattr(encoder, "get_extended_attention_mask"):
+            return encoder.get_extended_attention_mask(mask, hidden_states.shape[:2])
+        # Newer Transformers releases removed this helper from T5Stack.
+        padding = 1.0 - mask[:, None, None, :].to(dtype=hidden_states.dtype)
+        return padding * torch.finfo(hidden_states.dtype).min
 
     def forward_from_features(
         self,
