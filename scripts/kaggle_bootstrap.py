@@ -9,7 +9,8 @@ from pathlib import Path
 
 def main() -> None:
     repo_url = os.environ.get("GITHUB_REPO_URL")
-    branch = os.environ.get("GITHUB_BRANCH", "huy")
+    branch = os.environ.get("GITHUB_BRANCH", "huy-v2drop")
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     target = Path("/kaggle/working/Efficient_VLM_For_Autonomous_Driving")
 
     if repo_url and not target.exists():
@@ -20,8 +21,8 @@ def main() -> None:
     os.chdir(target)
     subprocess.check_call(["git", "fetch", "origin", branch])
     subprocess.check_call(["git", "checkout", branch])
-    subprocess.check_call(["git", "reset", "--hard", f"origin/{branch}"])
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", ".[dev]"])
+    subprocess.check_call(["git", "pull", "--ff-only", "origin", branch])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", ".[mvpruner]"])
     subprocess.call([sys.executable, "-m", "pip", "install", "pycocoevalcap"])
 
     try:
@@ -49,22 +50,28 @@ def main() -> None:
         print(f"torch env debug failed: {exc}")
     subprocess.call(["nvidia-smi"])
 
-    config = "configs/repvit_t5_efficient_tiny_smoke.yaml"
+    import yaml
+
+    config_source = "configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner_l2.yaml"
+    config_data = yaml.safe_load(Path(config_source).read_text(encoding="utf-8"))
+    output_dir = "outputs/mvpruner_l2_bootstrap_debug"
+    config_data["project"]["output_dir"] = output_dir
+    config_data["cache"]["dir"] = output_dir + "/cache"
+    config = "/kaggle/working/mvpruner_l2_bootstrap_debug.yaml"
+    Path(config).write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
     dbg = ["--debug", "--debug-samples", "3"]
     commands = [
         ["inspect-data", "--config", config, *dbg],
         ["prepare-data", "--config", config, "--subset", "smoke", *dbg],
         ["debug-sample", "--config", config, "--split", "train", "--index", "0", *dbg],
         ["prepare-features", "--config", config, "--subset", "smoke", *dbg],
-        ["train", "--config", config, "--stage", "align", "--max-steps", "20", *dbg],
+        ["diagnose-train", "--config", config, "--stage", "finetune", "--debug-numerics", *dbg],
         [
             "train",
             "--config",
             config,
             "--stage",
             "finetune",
-            "--resume",
-            "outputs/repvit_t5_efficient_tiny_smoke/checkpoints/align_latest.pt",
             "--max-steps",
             "20",
             *dbg,
@@ -74,7 +81,7 @@ def main() -> None:
             "--config",
             config,
             "--checkpoint",
-            "outputs/repvit_t5_efficient_tiny_smoke/checkpoints/finetune_latest.pt",
+            output_dir + "/checkpoints/finetune_latest.pt",
             "--max-samples",
             "32",
             *dbg,
@@ -84,7 +91,7 @@ def main() -> None:
             "--config",
             config,
             "--checkpoint",
-            "outputs/repvit_t5_efficient_tiny_smoke/checkpoints/finetune_latest.pt",
+            output_dir + "/checkpoints/finetune_latest.pt",
             "--max-samples",
             "32",
             *dbg,
@@ -94,16 +101,13 @@ def main() -> None:
         subprocess.check_call([sys.executable, "-m", "efficient_vlm_ad", *command])
 
     print("\nSmoke run complete.")
-    print("For full training, open notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu.ipynb.")
+    print("For full training, open notebooks/kaggle_train_mvpruner_l2_finetune.ipynb.")
     print("Core full-train commands:")
+    print("export PYTORCH_ALLOC_CONF=expandable_segments:True")
     print(
-        "accelerate launch --multi_gpu --num_processes 2 --num_machines 1 --mixed_precision fp16 --dynamo_backend no "
-        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml --stage align"
-    )
-    print(
-        "accelerate launch --multi_gpu --num_processes 2 --num_machines 1 --mixed_precision fp16 --dynamo_backend no "
-        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml "
-        "--stage finetune --resume outputs/repvit_t5_efficient_mini_kaggle_2gpu/checkpoints/align_best.pt"
+        "accelerate launch --multi_gpu --num_processes 2 --num_machines 1 --mixed_precision no --dynamo_backend no "
+        "-m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner_l2.yaml "
+        "--stage finetune"
     )
 
 

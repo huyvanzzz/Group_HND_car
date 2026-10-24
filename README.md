@@ -1,42 +1,58 @@
-# Efficient VLM For Autonomous Driving
+# Efficient VLM for Autonomous Driving: MVPruner
 
-Refactor workspace for EM-VLM4AD experiments on Kaggle.
+This branch compares attention and L2 variation scoring at MVPruner stage 2 using
+RepViT-M1.5 and T5-Efficient-Mini. Both use the same stage 1 selector, camera
+minimums and feature-cache format.
 
-The original upstream code is kept unchanged in `em_vlm4ad/` as a reference. New code lives in
-`src/efficient_vlm_ad/` and is designed around config-driven profiles:
+| Profile | Stage 2 | Purpose |
+| --- | --- | --- |
+| `configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml` | attention | Real Kaggle baseline |
+| `configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner_l2.yaml` | l2_variation | Real Kaggle comparison |
+| `configs/mvpruner_attention_smoke.yaml` | attention | Offline CPU fake-model smoke |
+| `configs/mvpruner_l2_smoke.yaml` | l2_variation | Offline CPU fake-model smoke |
 
-- `configs/legacy_vit_t5_base.yaml`: faithful ViT-B/32 patch-projection + T5-Base baseline.
-- `configs/repvit_t5_efficient_mini.yaml`: main RepViT-M1.5 + T5-Efficient-Mini profile.
-- `configs/repvit_t5_efficient_tiny_smoke.yaml`: quick smoke/debug profile.
-
-## Current Entrypoints
-
-```bash
-python -m efficient_vlm_ad inspect-data --config configs/repvit_t5_efficient_mini.yaml
-python -m efficient_vlm_ad prepare-data --config configs/repvit_t5_efficient_mini.yaml
-python -m efficient_vlm_ad prepare-features --config configs/repvit_t5_efficient_mini.yaml
-python -m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini.yaml --stage align
-python -m efficient_vlm_ad train --config configs/repvit_t5_efficient_mini.yaml --stage finetune --resume CHECKPOINT
-python -m efficient_vlm_ad evaluate --config configs/repvit_t5_efficient_mini.yaml --checkpoint CHECKPOINT
-python -m efficient_vlm_ad benchmark --config configs/repvit_t5_efficient_mini.yaml --checkpoint CHECKPOINT
-```
-
-`HF_TOKEN` must come from the environment. Do not put it in YAML, CLI args, notebooks, or Git.
+Real profiles train FP32, finetune only. L2 variation selects using the L2 norm
+of each visual token's hidden-state change across the configured encoder block.
+Its profile uses a separate output/cache directory. Cached original RepViT
+features remain float16; selecting the L2 score does not change the cache schema.
+Attention checkpoints and L2 checkpoints cannot resume across scoring modes.
 
 ## Kaggle
 
-On Kaggle, store the Hugging Face token as a secret named `HF_TOKEN`, set `GITHUB_REPO_URL`, and run:
+Use `notebooks/kaggle_debug_mvpruner_finetune.ipynb` or
+`notebooks/kaggle_train_mvpruner_finetune.ipynb` for attention.
+Use the matching `kaggle_debug_mvpruner_l2_finetune.ipynb` or
+`kaggle_train_mvpruner_l2_finetune.ipynb` for L2 variation.
+All default to branch `huy-v2drop`. Full notebooks configure
+`PYTORCH_ALLOC_CONF=expandable_segments:True` before shell Python processes.
+
+The notebooks preserve separate Hugging Face repositories for prepared data,
+feature caches and optional finetune checkpoints, including distributed RNG
+sidecars. Checkpoint repositories default to empty. Set `HF_TOKEN` through Kaggle
+Secrets or the environment.
+
+## CLI
+
+Choose one real profile, then run:
 
 ```bash
-python scripts/kaggle_bootstrap.py
+python -m efficient_vlm_ad prepare-data --config CONFIG --subset full
+python -m efficient_vlm_ad prepare-features --config CONFIG --subset full
+python -m efficient_vlm_ad diagnose-train --config CONFIG --stage finetune --debug-numerics
+python -m efficient_vlm_ad train --config CONFIG --stage finetune
+python -m efficient_vlm_ad verify-resume-checkpoint --config CONFIG --stage finetune --checkpoint CHECKPOINT
+python -m efficient_vlm_ad evaluate --config CONFIG --checkpoint CHECKPOINT
+python -m efficient_vlm_ad benchmark --config CONFIG --checkpoint CHECKPOINT
 ```
 
-The bootstrap clones branch `huy`, installs the package editable, reads the Kaggle secret, and runs
-the smoke sequence. For a full run, use the Mini config and remove `--subset smoke`,
-`--max-steps`, and `--max-samples`.
+For offline smoke profiles, supply a local synthetic dataset via `data.local_dir`.
+The tests create temporary images and annotations and require no network access.
 
 ## Verification
 
 ```bash
-python -m pytest tests -q
+PYTHONPATH=src OMP_NUM_THREADS=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m pytest tests -q
 ```
+
+Artifact removals and retained coverage are recorded in [docs/v2drop-artifacts.md](docs/v2drop-artifacts.md).
+Reference source, shared data, caches and existing outputs are preserved.

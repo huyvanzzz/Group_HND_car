@@ -140,6 +140,7 @@ class MVPrunerTwoStage(nn.Module):
         tokens_per_view: int = 49,
         stage1_top_k: int = 196,
         stage2_top_k: int = 49,
+        stage2_score_mode: str = "attention",
         min_tokens_per_camera: int = 1,
         relevance_mode: str = "shifted_max_cosine",
         beta_start: float = 0.2,
@@ -157,6 +158,11 @@ class MVPrunerTwoStage(nn.Module):
         self.tokens_per_view = tokens_per_view
         self.stage1_top_k = stage1_top_k
         self.stage2_top_k = stage2_top_k
+        if stage2_score_mode not in {"attention", "l2_variation"}:
+            raise ValueError("stage2_score_mode must be attention or l2_variation")
+        self.stage2_score_mode = stage2_score_mode
+        self.capture_stage2_gradients = False
+        self.stage2_gradient_tensors: dict[str, torch.Tensor] = {}
         self.min_tokens_per_camera = min_tokens_per_camera
         self.relevance_mode = relevance_mode
         self.eps = eps
@@ -272,6 +278,14 @@ class MVPrunerTwoStage(nn.Module):
             remaining = remaining + torch.log((1.0 - probability).clamp(self.eps, 1.0))
         return hard_ranked, torch.stack(slots, dim=-2)
 
+    def clear_stage2_gradient_capture(self) -> None:
+        self.stage2_gradient_tensors.clear()
+
+    def capture_stage2_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if self.capture_stage2_gradients and tensor.requires_grad:
+            tensor.retain_grad()
+            self.stage2_gradient_tensors[name] = tensor
+
     def stage2_from_scores(
         self,
         values: torch.Tensor,
@@ -282,9 +296,12 @@ class MVPrunerTwoStage(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         batch, count, dim = values.shape
         use_training = self.training if training is None else training
+        self.capture_stage2_tensor("stage2_scores", scores)
+        self.capture_stage2_tensor("visual_value_path", values)
         if self.stage2_top_k == count:
             indices = torch.arange(count, device=values.device).expand(batch, -1)
-            return values, indices, camera_ids, {"stage2_indices": indices}
+            budgets = torch.stack([(camera_ids == p).sum(dim=1) for p in range(self.num_views)], dim=1)
+            return values, indices, camera_ids, {"stage2_indices": indices, "stage2_budgets": budgets}
         _require_finite("stage2 scores", scores)
         counts = torch.stack([(camera_ids == p).sum(dim=1) for p in range(self.num_views)], dim=1)
         camera_relevance = torch.stack(
@@ -300,9 +317,10 @@ class MVPrunerTwoStage(nn.Module):
         relevance_share = torch.softmax(normalized, dim=1)
         first_share = counts.to(scores.dtype) / counts.sum(dim=1, keepdim=True).clamp_min(1)
         weights = counts.to(scores.dtype) * (1.0 + relevance_share - first_share).clamp(0.0, 2.0)
-        budgets = allocate_bounded_budget(
-            weights, counts, total=self.stage2_top_k, minimum=self.min_tokens_per_camera, eps=self.eps
-        )
+        with record_function("mvpruner.stage2_allocation"):
+            budgets = allocate_bounded_budget(
+                weights, counts, total=self.stage2_top_k, minimum=self.min_tokens_per_camera, eps=self.eps
+            )
 
         beta = self.current_beta() if use_training else 0.0
         camera_axis = torch.arange(self.num_views, device=values.device).view(1, self.num_views, 1)
@@ -315,25 +333,35 @@ class MVPrunerTwoStage(nn.Module):
             logits = torch.where(candidate_mask, logits + beta * noise, logits)
 
         max_slots = min(count, self.stage2_top_k - (self.num_views - 1) * self.min_tokens_per_camera)
-        hard_slots, soft_slots = self._relaxed_slots(logits.float(), max_slots)
+        fast_inference = self.stage2_score_mode == "l2_variation" and not use_training
+        with record_function("mvpruner.stage2_selection"):
+            if fast_inference:
+                # Same logits, k and ordering as _relaxed_slots, including clamped-score ties.
+                hard_slots = logits.float().topk(max_slots, dim=-1, sorted=True).indices
+            else:
+                hard_slots, soft_slots = self._relaxed_slots(logits.float(), max_slots)
         slot_axis = torch.arange(max_slots, device=values.device).view(1, 1, max_slots)
         active_slots = slot_axis < budgets.unsqueeze(-1)
         sentinel = torch.full_like(hard_slots, count)
         hard_for_sort = torch.where(active_slots, hard_slots, sentinel)
 
         flat_hard = hard_for_sort.reshape(batch, -1)
-        flat_soft = soft_slots.reshape(batch, -1, count)
         canonical_order = flat_hard.argsort(dim=1)[:, : self.stage2_top_k]
         indices = torch.gather(flat_hard, 1, canonical_order)
+        selected_cameras = torch.gather(camera_ids, 1, indices)
+        allocation_debug = {"stage2_indices": indices, "stage2_budgets": budgets,
+                            "camera_relevance": camera_relevance,
+                            "camera_score_share": relevance_share, "first_stage_share": first_share}
+        if fast_inference:
+            result = values.gather(1, indices.unsqueeze(-1).expand(-1, -1, dim))
+            return result, indices, selected_cameras, allocation_debug
+        flat_soft = soft_slots.reshape(batch, -1, count)
         p_soft = torch.gather(flat_soft, 1, canonical_order.unsqueeze(-1).expand(-1, -1, count)).to(values.dtype)
         p_hard = values.new_zeros(batch, self.stage2_top_k, count).scatter(2, indices.unsqueeze(-1), 1.0)
         p_ste = p_hard - p_soft.detach() + p_soft
         result = torch.matmul(p_ste, values)
-        selected_cameras = torch.gather(camera_ids, 1, indices)
         debug = {
-            "stage2_indices": indices,
-            "stage2_budgets": budgets,
-            "camera_relevance": camera_relevance,
+            **allocation_debug,
             "p_soft": p_soft,
             "p_hard": p_hard,
         }

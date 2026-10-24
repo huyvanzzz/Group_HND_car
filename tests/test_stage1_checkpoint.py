@@ -21,7 +21,7 @@ def test_mvpruner_checkpoint_saves_version_and_preserves_metadata(tmp_path):
     path = tmp_path / 'new.pt'
     save_checkpoint(path, model=net, optimizer=optimizer, scheduler=None, scaler=None, metadata=metadata)
     restored = load_checkpoint(path, model=model())
-    assert restored['mvpruner'] == {'beta_step': 7, 'stage1_algorithm_version': 2}
+    assert restored['mvpruner'] == {'beta_step': 7, 'stage1_algorithm_version': 2, 'stage2_score_mode': 'attention'}
     assert metadata == {'stage': 'finetune', 'mvpruner': {'beta_step': 7}}
 
 

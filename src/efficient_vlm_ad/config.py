@@ -86,6 +86,7 @@ class FusionConfig:
     stage1_top_k: int = 196
     stage2_top_k: int = 49
     stage2_layer: int = 2
+    stage2_score_mode: str = "attention"
     min_tokens_per_camera: int = 1
     stage1_relevance_mode: str = "shifted_max_cosine"
     beta_start: float = 0.2
@@ -204,6 +205,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
     beta_schedule = str(fusion_raw.get("beta_schedule", "linear"))
     tau = float(fusion_raw.get("tau", 1.0))
     if fusion_name == "mvpruner_two_stage":
+        if fusion_raw.get("stage2_score_mode", "attention") not in {"attention", "l2_variation"}:
+            raise ValueError("stage2_score_mode must be attention or l2_variation")
         total_visual = len(view_order) * int(_require(vision_raw, "seq_len"))
         if not (len(view_order) * minimum_per_camera <= stage2_top_k <= stage1_top_k <= total_visual):
             raise ValueError("mvpruner budgets must satisfy views*minimum <= stage2_top_k <= stage1_top_k <= total visual tokens")
@@ -271,6 +274,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 stage1_top_k=stage1_top_k,
                 stage2_top_k=stage2_top_k,
                 stage2_layer=int(fusion_raw.get("stage2_layer", 2)),
+                stage2_score_mode=str(fusion_raw.get("stage2_score_mode", "attention")),
                 min_tokens_per_camera=minimum_per_camera,
                 stage1_relevance_mode=relevance_mode,
                 beta_start=beta_start,

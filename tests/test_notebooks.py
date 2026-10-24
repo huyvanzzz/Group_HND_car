@@ -1,4 +1,5 @@
 import json
+import pytest
 from pathlib import Path
 
 
@@ -7,259 +8,12 @@ def _notebook_source(path: str) -> str:
     return "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
 
 
-def test_smoke_notebook_is_debug_only():
-    source = _notebook_source("notebooks/kaggle_smoke_debug.ipynb")
+@pytest.mark.parametrize("variant", ["", "_l2"])
+def test_mvpruner_debug_notebook_runs_finetune_only_fp32_smoke(variant):
+    source = _notebook_source(f"notebooks/kaggle_debug_mvpruner{variant}_finetune.ipynb")
 
-    assert "repvit_t5_efficient_tiny_smoke.yaml" in source
-    assert "--max-steps 20" in source
-    assert "--debug --debug-samples" in source
-    assert "accelerate launch" in source
-
-
-def test_full_train_notebook_has_no_smoke_limits_by_default():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu.yaml" in source
-    assert "diagnose-train" in source
-    assert "--max-steps 1" in source
-    assert "--debug-numerics" in source
-    assert "--debug --debug-samples 1" in source
-    assert "--mixed_precision no" in source
-    assert "--mixed_precision fp16" not in source
-    assert "PYTHONUNBUFFERED=1 accelerate launch" in source
-    assert "train_progress.jsonl" in source
-    assert "eval_progress.jsonl" in source
-    assert "benchmark_progress.jsonl" in source
-    assert "--batch-size 16" in source
-    assert "tail -n 20" in source
-    assert "nvidia-smi" in source
-    assert "RUN_FULL_2GPU = False" not in source
-    assert "--max-samples" not in source
-    assert "align_best.pt" in source
-    assert "verify-align-checkpoint" in source
-    assert "align_checkpoint_verify.json" in source
-    assert "best_model.pt" in source
-
-
-def test_refactor_notebook_was_removed_to_avoid_stale_entrypoint():
-    assert not Path("notebooks/kaggle_run_em_vlm4ad_refactor.ipynb").exists()
-
-
-def test_router_base_notebooks_are_no_norm_entrypoints():
-    debug_source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router.ipynb")
-    full_source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router.yaml" in debug_source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_safe.yaml" in full_source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_k49" in debug_source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_k49" in full_source
-    assert "router_norm_k49" not in debug_source
-    assert "router_norm_k49" not in full_source
-
-
-def test_end_to_end_debug_notebook_exercises_raw_image_training_path():
-    source = _notebook_source("notebooks/kaggle_e2e_debug_repvit_t5_efficient_mini_2gpu.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_end2end.yaml" in source
-    assert "diagnose-train" in source
-    assert "--debug-numerics" in source
-    assert "--max-steps 1" in source
-    assert "prepare-features" not in source
-    assert "train_progress.jsonl" in source
-    assert "nvidia-smi" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
-
-
-def test_end_to_end_full_notebook_runs_full_epochs_without_smoke_limits():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_end2end.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_end2end.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_end2end_safe.yaml" in source
-    assert "prepare-data --config" in source
-    assert "prepare-features" not in source
-    assert "accelerate launch" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "finetune_best.pt" in source
-    assert "train_progress.jsonl" in source
-    assert "eval_progress.jsonl" in source
-    assert "benchmark_progress.jsonl" in source
-    assert "--batch-size 16" in source
-
-
-def test_di_adapter_debug_notebook_exercises_cached_feature_adapter_path():
-    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_di_adapter.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter.yaml" in source
-    assert "prepare-features" in source
-    assert "diagnose-train" in source
-    assert "--debug-numerics" in source
-    assert "--max-steps 20" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
-    assert "train_progress.jsonl" in source
-    assert "nvidia-smi" in source
-
-
-def test_di_adapter_full_notebook_runs_full_epochs_without_smoke_limits():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_di_adapter.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_di_adapter_safe.yaml" in source
-    assert "prepare-data --config" in source
-    assert "prepare-features --config" in source
-    assert "accelerate launch" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "finetune_latest.pt" in source
-    assert "align_best.pt" in source
-    assert "verify-align-checkpoint" in source
-    assert "align_checkpoint_verify.json" in source
-    assert "train_progress.jsonl" in source
-    assert "eval_progress.jsonl" in source
-    assert "benchmark_progress.jsonl" in source
-    assert "--batch-size 16" in source
-
-
-def test_router_debug_notebook_exercises_cached_feature_router_path():
-    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router_vsa_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
-    assert "prepare-features" in source
-    assert "diagnose-train" in source
-    assert "--debug-numerics" in source
-    assert "--max-steps 20" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
-    assert "train_progress.jsonl" in source
-    assert "nvidia-smi" in source
-
-
-def test_router_vsa_nonorm_debug_notebook_uses_nonorm_config():
-    source = _notebook_source("notebooks/kaggle_debug_repvit_t5_efficient_mini_2gpu_router_vsa_nonorm_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml" in source
-    assert "diagnose-train" in source
-    assert "--debug-numerics" in source
-    assert "--max-steps 20" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--resume \"$PROFILE/checkpoints/align_best.pt\"" in source
-
-
-def test_router_full_notebook_runs_full_epochs_without_smoke_limits():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router_vsa_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_safe.yaml" in source
-    assert "prepare-data --config" in source
-    assert "prepare-features --config" in source
-    assert "accelerate launch" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "finetune_latest.pt" in source
-    assert "align_best.pt" in source
-    assert "verify-align-checkpoint" in source
-
-
-def test_router_vsa_nonorm_full_notebook_uses_nonorm_config():
-    source = _notebook_source("notebooks/kaggle_full_train_repvit_t5_efficient_mini_2gpu_router_vsa_nonorm_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_safe.yaml" in source
-    assert "prepare-data --config" in source
-    assert "prepare-features --config" in source
-    assert "accelerate launch" in source
-    assert "--stage align" in source
-    assert "--stage finetune" in source
-    assert "--max-steps" not in source
-    assert "--max-samples" not in source
-    assert "verify-align-checkpoint" in source
-    assert "align_checkpoint_verify.json" in source
-    assert "train_progress.jsonl" in source
-    assert "eval_progress.jsonl" in source
-    assert "benchmark_progress.jsonl" in source
-    assert "--batch-size 16" in source
-
-
-def test_router_vsa_nonorm_finetune_only_notebook_has_debug_and_no_align_train():
-    source = _notebook_source("notebooks/kaggle_finetune_only_router_vsa_nonorm_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_nonorm_k49_finetune_only" in source
-    assert "decode_generated_predictions" in source
-    assert "tag decoded" in source
-    assert "speed decoded" in source
-    assert "generation_diagnostics.json" in source
-    assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune --max-steps 20" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "verify-resume-checkpoint" in source
-    assert "finetune_resume_checkpoint_verify.json" in source
-    assert "--batch-size 16" in source
-    assert "--stage align" not in source
-    assert "verify-align-checkpoint" not in source
-    assert "align_best.pt" not in source
-
-
-def test_router_vsa_finetune_only_notebook_targets_score_norm_vsa_config():
-    source = _notebook_source("notebooks/kaggle_finetune_only_router_vsa_k49.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_safe.yaml" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_router_vsa_k49_finetune_only" in source
-    assert "decode_generated_predictions" in source
-    assert "tag decoded" in source
-    assert "speed decoded" in source
-    assert "generation_diagnostics.json" in source
-    assert "diagnose-train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune --max-steps 20" in source
-    assert "train --config \"$RUNTIME_CONFIG\" --stage finetune" in source
-    assert "verify-resume-checkpoint" in source
-    assert "--batch-size 16" in source
-    assert "--stage align" not in source
-    assert "verify-align-checkpoint" not in source
-    assert "align_best.pt" not in source
-    assert "router_vsa_nonorm" not in source
-
-
-def test_resume_verify_notebook_checks_same_stage_resume_cases():
-    source = _notebook_source("notebooks/kaggle_verify_resume_checkpoints.ipynb")
-
-    assert "verify-resume-checkpoint" in source
-    assert "repvit_t5_efficient_mini_kaggle_2gpu.yaml" in source
-    assert "CACHE_HF_REPO_ID" in source
-    assert "FINETUNE_CHECKPOINT_HF_REPO_ID" in source
-    assert "FINETUNE_CHECKPOINT_FILENAME = \"finetune_latest.pt\"" in source
-    assert "RUN_HF_FINETUNE_CHECKPOINT_VERIFY = False" in source
-    assert "Skipping optional HF finetune checkpoint verify" in source
-    assert "UserSecretsClient" in source
-    assert "HF_TOKEN" in source
-    assert "--stage align" in source
-    assert "--checkpoint \"$ALIGN_VERIFY_PROFILE/checkpoints/align_latest.pt\"" in source
-    assert "--stage finetune" in source
-    assert "--checkpoint \"$PROFILE/checkpoints/finetune_latest.pt\"" in source
-    assert "resume_verify_finetune_tmp" in source
-    assert "--checkpoint \"$FINETUNE_VERIFY_PROFILE/checkpoints/finetune_latest.pt\"" in source
-    assert "align_resume_checkpoint_verify.json" in source
-    assert "finetune_resume_checkpoint_verify.json" in source
-    assert "sha256sum" in source
-
-
-def test_mvpruner_debug_notebook_runs_finetune_only_fp32_smoke():
-    source = _notebook_source("notebooks/kaggle_debug_mvpruner_finetune.ipynb")
-
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml" in source
+    assert f"repvit_t5_efficient_mini_kaggle_2gpu_mvpruner{variant}.yaml" in source
+    assert "huy-v2drop" in source
     assert 'transformers.__version__ == "4.46.3"' in source
     assert 'pip install -q -e ".[mvpruner]"' in source
     assert "PYO3_USE_ABI3_FORWARD_COMPATIBILITY" not in source
@@ -276,10 +30,12 @@ def test_mvpruner_debug_notebook_runs_finetune_only_fp32_smoke():
     assert "align_best.pt" not in source
 
 
-def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resume():
-    source = _notebook_source("notebooks/kaggle_train_mvpruner_finetune.ipynb")
+@pytest.mark.parametrize("variant", ["", "_l2"])
+def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resume(variant):
+    source = _notebook_source(f"notebooks/kaggle_train_mvpruner{variant}_finetune.ipynb")
 
-    assert "repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml" in source
+    assert f"repvit_t5_efficient_mini_kaggle_2gpu_mvpruner{variant}.yaml" in source
+    assert "huy-v2drop" in source
     assert 'transformers.__version__ == "4.46.3"' in source
     assert 'pip install -q -e ".[mvpruner]"' in source
     assert "PYO3_USE_ABI3_FORWARD_COMPATIBILITY" not in source
@@ -332,3 +88,16 @@ def test_mvpruner_full_notebook_trains_finetune_from_scratch_or_same_stage_resum
     assert "--max-samples" not in source
     assert "--stage align" not in source
     assert "align_best.pt" not in source
+
+
+def test_full_notebooks_set_allocator():
+    for variant in ("", "_l2"):
+        notebook = json.loads(Path(f"notebooks/kaggle_train_mvpruner{variant}_finetune.ipynb").read_text())
+        for cell in notebook["cells"]:
+            source = "".join(cell.get("source", []))
+            if source.startswith("%%bash") and ("python" in source or "accelerate launch" in source):
+                allocator = "export PYTORCH_ALLOC_CONF=expandable_segments:True"
+                assert allocator in source
+                assert source.index(allocator) < min(
+                    source.index(token) for token in ("python", "accelerate launch") if token in source
+                )

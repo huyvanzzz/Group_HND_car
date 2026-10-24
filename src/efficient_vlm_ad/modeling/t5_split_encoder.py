@@ -116,6 +116,15 @@ class T5SplitEncoder(nn.Module):
         return probabilities.to(hidden_states.dtype)
 
     @staticmethod
+    def _l2_variation(before: torch.Tensor, after: torch.Tensor) -> torch.Tensor:
+        if before.shape != after.shape or before.ndim != 3:
+            raise ValueError("L2 variation requires matching [B,N,D] block states")
+        scores = torch.linalg.vector_norm(after.float() - before.float(), ord=2, dim=-1)
+        if not bool(torch.isfinite(scores).all()):
+            raise FloatingPointError("Stage-2 L2 variation contains NaN/Inf")
+        return scores
+
+    @staticmethod
     def _visual_relevance(
         attention: torch.Tensor,
         *,
@@ -155,13 +164,23 @@ class T5SplitEncoder(nn.Module):
             hidden, position_bias = self._run_block(
                 self.encoder.block[0], hidden, extended_mask, position_bias, cache_position
             )
-            pre_dropout = self._pre_dropout_attention(self.encoder.block[1], hidden, position_bias, attention_mask)
+            block_input = hidden
+            is_l2 = self.pruner.stage2_score_mode == "l2_variation"
+            if not is_l2:
+                with record_function("mvpruner.stage2_attention_scoring"):
+                    pre_dropout = self._pre_dropout_attention(self.encoder.block[1], hidden, position_bias, attention_mask)
             hidden, position_bias = self._run_block(
                 self.encoder.block[1], hidden, extended_mask, position_bias, cache_position
             )
 
         with record_function("mvpruner.stage2_ira_gumbel"):
-            scores = self._visual_relevance(pre_dropout, visual_count=visual_count, question_mask=question_mask)
+            if is_l2:
+                with record_function("mvpruner.stage2_l2_scoring"):
+                    scores = self._l2_variation(block_input[:, :visual_count], hidden[:, :visual_count])
+                self.pruner.capture_stage2_tensor("scorer_block_input", block_input)
+                self.pruner.capture_stage2_tensor("scorer_block_output", hidden)
+            else:
+                scores = self._visual_relevance(pre_dropout, visual_count=visual_count, question_mask=question_mask)
             pruned_visual, selected_indices, selected_cameras, stage2_debug = self.pruner.stage2_from_scores(
                 hidden[:, :visual_count], scores, visual_camera_ids, training=use_training
             )
@@ -186,13 +205,15 @@ class T5SplitEncoder(nn.Module):
         from transformers.modeling_outputs import BaseModelOutput
 
         debug = {
-            "pre_dropout_attention": pre_dropout,
-            "visual_relevance": scores,
+            "stage2_score_mode": self.pruner.stage2_score_mode,
+            "stage2_scores": scores.detach(),
             "stage2_indices": selected_indices,
             "retained_indices": retained_indices,
             "position_bias": pruned_position_bias,
             **stage2_debug,
         }
+        if not is_l2:
+            debug.update(pre_dropout_attention=pre_dropout, visual_relevance=scores)
         return SplitEncoderResult(
             encoder_outputs=BaseModelOutput(last_hidden_state=hidden),
             attention_mask=pruned_mask,

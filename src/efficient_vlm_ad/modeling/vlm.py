@@ -211,6 +211,8 @@ class EfficientVLMForAD(nn.Module):
             )
             report["mvpruner_attention_mask"] = _stats("mvpruner_attention_mask", split.attention_mask)
             report["mvpruner"] = {
+                "stage2_score_mode": self.visual_fusion.stage2_score_mode,
+                "stage2_scores": _stats("stage2_scores", split.debug["stage2_scores"]),
                 "beta": self.visual_fusion.current_beta(),
                 "stage1_budgets": split.debug["stage1_budgets"].detach().cpu().tolist(),
                 "stage2_budgets": split.debug["stage2_budgets"].detach().cpu().tolist(),
@@ -218,6 +220,10 @@ class EfficientVLMForAD(nn.Module):
                 "stage2_indices": split.debug["stage2_indices"].detach().cpu().tolist(),
             }
             for key in ("stage1_diversity", "stage1_dra_weights", "stage1_seed_indices"):
+                if key in split.debug:
+                    report["mvpruner"][key] = split.debug[key].detach().cpu().tolist()
+            report["mvpruner"]["stage2_zero_score_count"] = int((split.debug["stage2_scores"] == 0).sum().item())
+            for key in ("camera_relevance", "camera_score_share", "first_stage_share"):
                 if key in split.debug:
                     report["mvpruner"][key] = split.debug[key].detach().cpu().tolist()
             report["logits"] = _stats("logits", output.logits)

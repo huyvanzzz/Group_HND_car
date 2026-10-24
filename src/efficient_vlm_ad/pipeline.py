@@ -1136,6 +1136,7 @@ def train_stage(
             mvpruner = _mvpruner_module(unwrapped)
             if mvpruner is not None:
                 metadata["mvpruner"] = {
+                    "stage2_score_mode": mvpruner.stage2_score_mode,
                     "stage1_top_k": mvpruner.stage1_top_k,
                     "stage2_top_k": mvpruner.stage2_top_k,
                     "beta": mvpruner.current_beta(),
@@ -1258,6 +1259,37 @@ def _batch_debug_summary(batch: dict[str, Any], device: torch.device | None = No
     return summary
 
 
+def _stage2_gradient_report(pruner) -> dict[str, Any]:
+    """Inspect retained grads from the actual CE forward, not forward_debug/no_grad."""
+    report = {"stage2_score_mode": pruner.stage2_score_mode, "ok": True, "tensors": {},
+              "budget_allocation_differentiable": False}
+    for name, tensor in pruner.stage2_gradient_tensors.items():
+        grad = tensor.grad
+        finite = grad is None or bool(torch.isfinite(grad).all())
+        report["ok"] &= finite
+        report["tensors"][name] = {
+            "shape": list(tensor.shape), "has_gradient": grad is not None,
+            "finite": finite,
+            "grad_norm": float(grad.float().norm().item()) if grad is not None and finite else None,
+        }
+    scores = pruner.stage2_gradient_tensors.get("stage2_scores")
+    indices = getattr(pruner, "last_debug", {}).get("stage2_indices")
+    if scores is not None and indices is not None:
+        selected = torch.zeros_like(scores, dtype=torch.bool).scatter(1, indices, True)
+        for name, mask in (("selected", selected), ("dropped", ~selected)):
+            denominator = int(mask.sum().item())
+            grad = scores.grad
+            report[f"{name}_score_nonzero_grad_ratio"] = (
+                float((grad[mask] != 0).float().mean().item()) if grad is not None and denominator else None)
+        values = pruner.stage2_gradient_tensors.get("visual_value_path")
+        if values is not None and values.grad is not None and bool((~selected).any()):
+            nonzero = values.grad.ne(0).any(dim=-1)
+            report["dropped_direct_value_nonzero_grad_ratio"] = float(nonzero[~selected].float().mean().item())
+    report["selection_gradient_available"] = scores is not None and scores.grad is not None
+    report["status"] = "captured" if report["selection_gradient_available"] else "identity_or_no_gradient"
+    return report
+
+
 def diagnose_train(
     cfg: ExperimentConfig,
     stage: str,
@@ -1359,20 +1391,39 @@ def diagnose_train(
 
     begin = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
-    with accelerator.autocast():
-        diagnose_output = model(**_batch_model_inputs(batch, cfg))
-        diagnose_loss = diagnose_output.loss
-    loss_finite = bool(torch.isfinite(diagnose_loss.detach()).item())
-    if not loss_finite:
-        raise FloatingPointError(f"Diagnose forward loss is not finite: {diagnose_loss.detach().cpu().item()}")
-    accelerator.backward(diagnose_loss)
-    gradient_report = trainable_gradient_finite_report(accelerator.unwrap_model(model))
+    pruner = _mvpruner_module(debug_model)
+    capture = pruner is not None and pruner.stage2_score_mode == "l2_variation"
+    stage2_gradient_report = None
+    previous_capture = pruner.capture_stage2_gradients if capture else False
+    if capture:
+        pruner.clear_stage2_gradient_capture()
+        pruner.capture_stage2_gradients = True
+    try:
+        with accelerator.autocast():
+            diagnose_output = model(**_batch_model_inputs(batch, cfg))
+            diagnose_loss = diagnose_output.loss
+        loss_finite = bool(torch.isfinite(diagnose_loss.detach()).item())
+        if not loss_finite:
+            raise FloatingPointError(f"Diagnose forward loss is not finite: {diagnose_loss.detach().cpu().item()}")
+        accelerator.backward(diagnose_loss)
+        gradient_report = trainable_gradient_finite_report(accelerator.unwrap_model(model))
+        if capture:
+            stage2_gradient_report = _stage2_gradient_report(pruner)
+            if not stage2_gradient_report["ok"]:
+                raise FloatingPointError(f"Non-finite Stage 2 surrogate gradients: {stage2_gradient_report}")
+    finally:
+        if capture:
+            pruner.clear_stage2_gradient_capture()
+            pruner.capture_stage2_gradients = previous_capture
+            # Do not retain the graph produced for gradient diagnostics.
+            pruner.last_debug = {}
     mark("backward", begin)
     if accelerator.is_main_process:
         dbg.log(
             "NUMERICS",
             {
                 "stage": "diagnose_backward",
+                "stage2_gradients": stage2_gradient_report,
                 "loss": float(diagnose_loss.detach().cpu().item()),
                 "gradients": gradient_report,
                 "optimizer_step_performed": False,
@@ -1398,6 +1449,7 @@ def diagnose_train(
         "loss_finite": loss_finite,
         "gradients": gradient_report,
         "optimizer_step_performed": False,
+        "stage2_gradients": stage2_gradient_report,
         "durations": durations,
     }
     _heartbeat(dbg, started_at, "diagnose_done")

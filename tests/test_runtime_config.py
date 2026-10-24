@@ -7,17 +7,17 @@ from efficient_vlm_ad.config import load_config
 
 
 def test_runtime_cache_and_generation_config_loaded():
-    cfg = load_config("configs/repvit_t5_efficient_tiny_smoke.yaml")
+    cfg = load_config("configs/mvpruner_attention_smoke.yaml")
 
     assert cfg.cache.dir.endswith("cache")
-    assert cfg.runtime.precision == "auto"
-    assert cfg.generation.max_new_tokens == 64
-    assert cfg.training.max_steps == 20
-    assert cfg.data.expected_counts["train"] == 341381
+    assert cfg.runtime.precision == "fp32"
+    assert cfg.generation.max_new_tokens == 2
+    assert cfg.training.max_steps == 2
+    assert cfg.runtime.device == "cpu"
 
 
 def test_full_generation_config_loaded():
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml")
 
     assert cfg.generation.max_new_tokens == 512
     assert cfg.generation.num_beams == 3
@@ -69,7 +69,7 @@ def test_accelerator_enables_unused_parameter_detection(monkeypatch):
     fake_accelerate.DistributedDataParallelKwargs = FakeDistributedDataParallelKwargs
     monkeypatch.setitem(sys.modules, "accelerate", fake_accelerate)
 
-    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu.yaml")
+    cfg = load_config("configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml")
     pipeline._build_accelerator(cfg)
 
     assert captured["ddp_kwargs"] == {"find_unused_parameters": True}

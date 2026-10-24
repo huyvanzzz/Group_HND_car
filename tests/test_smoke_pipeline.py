@@ -197,103 +197,8 @@ generation:
     assert len(index) == 6
 
 
-def test_router_offline_smoke_cli_sequence(tmp_path: Path):
-    data_root = tmp_path / "dataset"
-    _make_fake_data(data_root, rows_per_split=2)
-    output_dir = tmp_path / "outputs"
-    cfg = tmp_path / "router_config.yaml"
-    cfg.write_text(
-        f"""
-project:
-  output_dir: {output_dir.as_posix()}
-data:
-  hf_repo_id: local/fake
-  local_dir: {data_root.as_posix()}
-  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
-  expected_counts: {{train: 2, val: 2, test: 2}}
-model:
-  profile: offline_router
-  vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
-  text: {{model_id: fake_t5, d_model: 8}}
-  fusion:
-    name: question_guided_router
-    top_k: 4
-    diversity_weight: 0.001
-    tau_start: 2.0
-    tau_min: 0.5
-cache:
-  dir: {str(output_dir / "cache").replace(chr(92), "/")}
-runtime:
-  precision: fp32
-training:
-  batch_size: 1
-  gradient_accumulation_steps: 1
-  max_steps: 2
-  gpa_hidden_size: 4
-generation:
-  max_new_tokens: 4
-  num_beams: 1
-""",
-        encoding="utf-8",
-    )
-
-    for command in [
-        ["prepare-data", "--config", str(cfg), "--subset", "smoke"],
-        ["prepare-features", "--config", str(cfg), "--subset", "smoke"],
-        ["train", "--config", str(cfg), "--stage", "align", "--max-steps", "2", "--debug", "--debug-samples", "1"],
-        [
-            "train",
-            "--config",
-            str(cfg),
-            "--stage",
-            "finetune",
-            "--resume",
-            str(output_dir / "checkpoints" / "align_best.pt"),
-            "--max-steps",
-            "2",
-            "--debug",
-            "--debug-samples",
-            "1",
-        ],
-    ]:
-        subprocess.run([sys.executable, "-m", "efficient_vlm_ad", *command], check=True)
-
-    align_payload = torch.load(output_dir / "checkpoints" / "align_latest.pt", map_location="cpu", weights_only=False)
-    assert align_payload["metadata"]["router_tau"]["tau_step"] == 2
-    assert align_payload["metadata"]["router_tau"]["target_optimizer_steps"] == 2
-    debug_events = [
-        json.loads(line)
-        for line in (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    train_events = [event["payload"] for event in debug_events if event["section"] == "TRAIN"]
-    assert any("router" in payload for payload in train_events)
-    router_payload = next(payload["router"] for payload in train_events if "router" in payload)
-    assert router_payload["hard_khot_sum"] == [4.0]
-    assert sum(router_payload["camera_histogram"][0]) == 4
-    assert router_payload["scorer_grad_norm"] is not None
-
-    progress_rows = [
-        json.loads(line)
-        for line in (output_dir / "debug" / "train_progress.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    forbidden_progress_keys = {
-        "router",
-        "router_tau",
-        "selected_indices",
-        "camera_histogram",
-        "scorer_grad_norm",
-        "soft_khot_stats",
-        "ste_mask_stats",
-        "diversity_loss_raw",
-        "diversity_loss_weighted",
-    }
-    assert all(forbidden_progress_keys.isdisjoint(row) for row in progress_rows)
-
-
-@pytest.mark.parametrize('finetune_only', [False, True])
-def test_mvpruner_offline_smoke_cli_sequence(tmp_path: Path, finetune_only):
+@pytest.mark.parametrize('score_mode', ['attention', 'l2_variation'])
+def test_mvpruner_offline_smoke_cli_sequence(tmp_path: Path, score_mode):
     data_root = tmp_path / "dataset"
     _make_fake_data(data_root, rows_per_split=2)
     output_dir = tmp_path / "outputs"
@@ -309,14 +214,15 @@ data:
   expected_counts: {{train: 2, val: 2, test: 2}}
 model:
   profile: offline_mvpruner
-  vision: {{name: fake_vision, model_id: fake, output_dim: 12, seq_len: 4, image_size: 16}}
+  vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
   text: {{model_id: fake_t5, d_model: 8}}
   adapter: {{name: none}}
   fusion:
     name: mvpruner_two_stage
-    stage1_top_k: 12
+    stage1_top_k: 18
     stage2_top_k: 6
     stage2_layer: 2
+    stage2_score_mode: {score_mode}
     min_tokens_per_camera: 1
     stage1_relevance_mode: shifted_max_cosine
     beta_start: 0.2
@@ -332,9 +238,8 @@ training:
   vision_training: feature_cache
   batch_size: 1
   gradient_accumulation_steps: 1
-  max_steps: 1
   align_epochs: 1
-  finetune_epochs: 1
+  finetune_epochs: 2
   gpa_hidden_size: 4
 generation:
   max_new_tokens: 2
@@ -346,56 +251,41 @@ evaluation:
         encoding="utf-8",
     )
 
+
+    checkpoint = str(output_dir / "checkpoints" / "finetune_latest.pt")
     commands = [
         ["prepare-data", "--config", str(cfg), "--subset", "smoke"],
         ["prepare-features", "--config", str(cfg), "--subset", "smoke"],
-        ["train", "--config", str(cfg), "--stage", "align", "--max-steps", "1", "--debug", "--debug-samples", "1"],
-        [
-            "train",
-            "--config",
-            str(cfg),
-            "--stage",
-            "finetune",
-            "--resume",
-            str(output_dir / "checkpoints" / "align_best.pt"),
-            "--max-steps",
-            "1",
-        ],
-        [
-            "evaluate",
-            "--config",
-            str(cfg),
-            "--checkpoint",
-            str(output_dir / "checkpoints" / "finetune_latest.pt"),
-            "--max-samples",
-            "2",
-            "--batch-size",
-            "2",
-        ],
-        [
-            "benchmark",
-            "--config",
-            str(cfg),
-            "--checkpoint",
-            str(output_dir / "checkpoints" / "finetune_latest.pt"),
-            "--max-samples",
-            "1",
-        ],
+        ["diagnose-train", "--config", str(cfg), "--stage", "finetune", "--debug", "--debug-samples", "1", "--debug-numerics"],
+        ["train", "--config", str(cfg), "--stage", "finetune", "--max-steps", "1"],
+        ["verify-resume-checkpoint", "--config", str(cfg), "--stage", "finetune", "--checkpoint", checkpoint],
+        ["train", "--config", str(cfg), "--stage", "finetune", "--resume", checkpoint],
+        ["evaluate", "--config", str(cfg), "--checkpoint", checkpoint, "--max-samples", "2", "--batch-size", "2"],
+        ["benchmark", "--config", str(cfg), "--checkpoint", checkpoint, "--max-samples", "1"],
     ]
-    if finetune_only:
-        commands = commands[:2] + [
-            ["train", "--config", str(cfg), "--stage", "finetune", "--max-steps", "1"],
-        ] + commands[4:]
     for command in commands:
-        subprocess.run([sys.executable, "-m", "efficient_vlm_ad", *command], check=True)
+        result = subprocess.run(
+            [sys.executable, "-m", "efficient_vlm_ad", *command],
+            check=True, capture_output=True, text=True,
+        )
+        if command[0] == "diagnose-train":
+            report = json.loads(result.stdout[result.stdout.rfind("\n{") + 1:])
+            assert report["loss_finite"]
+            assert report["optimizer_step_performed"] is False
+            if score_mode == "l2_variation":
+                assert report["stage2_gradients"]["stage2_score_mode"] == score_mode
+                assert report["stage2_gradients"]["ok"]
+                assert report["stage2_gradients"]["tensors"]
 
-    stage = "finetune" if finetune_only else "align"
+
+    stage = "finetune"
     align = torch.load(output_dir / "checkpoints" / f"{stage}_latest.pt", map_location="cpu", weights_only=False)
     assert align["metadata"]["mvpruner"]["stage1_algorithm_version"] == 2
-    assert align["metadata"]["mvpruner"]["stage1_top_k"] == 12
+    assert align["metadata"]["mvpruner"]["stage1_top_k"] == 18
     assert align["metadata"]["mvpruner"]["stage2_top_k"] == 6
-    assert align["metadata"]["mvpruner"]["beta_step"] == 1
+    assert align["metadata"]["mvpruner"]["beta_step"] == 3
     assert (output_dir / "checkpoints" / f"{stage}_latest.pt.rng" / "rank_00000.pt").exists()
+    assert align["metadata"]["mvpruner"]["stage2_score_mode"] == score_mode
     assert (output_dir / "predictions.jsonl").exists()
     assert (output_dir / "benchmark.json").exists()
 

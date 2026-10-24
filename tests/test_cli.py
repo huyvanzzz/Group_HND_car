@@ -14,7 +14,7 @@ def test_inspect_data_cli_outputs_safe_metadata():
             "efficient_vlm_ad",
             "inspect-data",
             "--config",
-            "configs/repvit_t5_efficient_tiny_smoke.yaml",
+            "configs/mvpruner_attention_smoke.yaml",
         ],
         check=True,
         capture_output=True,
@@ -24,6 +24,6 @@ def test_inspect_data_cli_outputs_safe_metadata():
 
     payload = json.loads(result.stdout)
 
-    assert payload["hf_repo_id"] == "minhdang0901/drivelm-nuscenes-v1-0"
+    assert payload["hf_repo_id"] == "local/fake"
     assert payload["token_present"] is True
     assert "hf_should_not_be_printed" not in result.stdout

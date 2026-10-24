@@ -23,6 +23,7 @@ def prefill_supported(model) -> bool:
 def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> dict[str, Any]:
     return {
         'status': 'supported' if prefill_supported(model) else 'unsupported_synthetic',
+        'stage2_score_mode': getattr(getattr(model, 'visual_fusion', None), 'stage2_score_mode', None),
         'scope': 'feature embeddings/fusion/projector/pruning + T5 encoder + first decoder forward including LM head',
         'excluded_from_scope': ['data loading', 'host-to-device transfer', 'vision extraction',
                                 'subsequent decoding', 'token/beam selection', 'text postprocessing'],

@@ -13,7 +13,7 @@ from .verification import assert_tied_weights_ok, retie_text_model_weights
 
 
 def validate_mvpruner_stage1_version(metadata: dict[str, Any], model: torch.nn.Module) -> None:
-    """Guard only the changed MVPruner selection; legacy router/GPA remain compatible."""
+    """Guard MVPruner algorithms before loading; non-MVPruner models are unaffected."""
     expected = getattr(getattr(model, 'visual_fusion', None), 'stage1_algorithm_version', None)
     if expected is None:
         return
@@ -22,6 +22,11 @@ def validate_mvpruner_stage1_version(metadata: dict[str, Any], model: torch.nn.M
     if actual != expected:
         raise ValueError(f'MVPruner Stage 1 version mismatch: checkpoint={actual}, expected={expected}; '
                          'start a new finetune training run; prepared data and vision cache can be reused')
+    expected_mode = model.visual_fusion.stage2_score_mode
+    saved_mode = saved.get('stage2_score_mode', 'attention')
+    if saved_mode not in {'attention', 'l2_variation'} or saved_mode != expected_mode:
+        raise ValueError(f'MVPruner Stage 2 score mode mismatch: checkpoint={saved_mode}, '
+                         f'expected={expected_mode}; start a new finetune training run')
 
 
 def _rng_state() -> dict[str, Any]:
@@ -140,7 +145,9 @@ def save_checkpoint(
     assert_tied_weights_ok(model)
     version = getattr(getattr(model, 'visual_fusion', None), 'stage1_algorithm_version', None)
     if version is not None:
-        metadata = {**metadata, 'mvpruner': {**metadata.get('mvpruner', {}), 'stage1_algorithm_version': version}}
+        metadata = {**metadata, 'mvpruner': {**metadata.get('mvpruner', {}),
+                    'stage1_algorithm_version': version,
+                    'stage2_score_mode': model.visual_fusion.stage2_score_mode}}
     payload = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),

@@ -224,6 +224,7 @@ def build_visual_fusion(cfg):
             tokens_per_view=cfg.model.vision.seq_len,
             stage1_top_k=cfg.model.fusion.stage1_top_k,
             stage2_top_k=cfg.model.fusion.stage2_top_k,
+            stage2_score_mode=cfg.model.fusion.stage2_score_mode,
             min_tokens_per_camera=cfg.model.fusion.min_tokens_per_camera,
             relevance_mode=cfg.model.fusion.stage1_relevance_mode,
             beta_start=cfg.model.fusion.beta_start,

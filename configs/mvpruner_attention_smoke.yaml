@@ -1,0 +1,35 @@
+project:
+  output_dir: outputs/mvpruner_attention_smoke
+data:
+  hf_repo_id: local/fake
+  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
+cache:
+  dir: outputs/mvpruner_attention_smoke/cache
+runtime:
+  device: cpu
+  precision: fp32
+model:
+  profile: mvpruner_attention_smoke
+  vision: {name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}
+  text: {model_id: fake_t5, d_model: 8}
+  adapter: {name: none}
+  fusion:
+    name: mvpruner_two_stage
+    stage1_top_k: 18
+    stage2_top_k: 6
+    stage2_layer: 2
+    stage2_score_mode: attention
+    min_tokens_per_camera: 1
+    stage1_relevance_mode: shifted_max_cosine
+training:
+  vision_training: feature_cache
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 2
+  finetune_epochs: 1
+generation:
+  max_new_tokens: 2
+  num_beams: 1
+evaluation:
+  eval_batch_size: 2
+  benchmark_max_samples: 1

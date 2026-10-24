@@ -1,17 +1,17 @@
 project:
-  output_dir: outputs/repvit_t5_efficient_mini_kaggle_2gpu_end2end
+  output_dir: outputs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner_l2
 data:
   hf_repo_id: minhdang0901/drivelm-nuscenes-v1-0
   revision: main
   view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
   expected_counts: {train: 341381, val: 19785, test: 16817}
 cache:
-  dir: outputs/repvit_t5_efficient_mini_kaggle_2gpu_end2end/cache
+  dir: outputs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner_l2/cache
 runtime:
   device: auto
   precision: fp32
 model:
-  profile: repvit_t5_efficient_mini_kaggle_2gpu_end2end
+  profile: repvit_t5_efficient_mini_kaggle_2gpu_mvpruner_l2
   vision:
     name: repvit_m1_5
     model_id: timm/repvit_m1_5.dist_450e_in1k
@@ -23,23 +23,35 @@ model:
     model_id: google/t5-efficient-mini
     revision: af3816c2dbd386f7786f7757c536f0314084ff8b
     d_model: 384
+  adapter:
+    name: none
+  fusion:
+    name: mvpruner_two_stage
+    stage1_top_k: 196
+    stage2_top_k: 49
+    stage2_layer: 2
+    stage2_score_mode: l2_variation
+    min_tokens_per_camera: 1
+    stage1_relevance_mode: shifted_max_cosine
+    beta_start: 0.2
+    beta_end: 0.0
+    beta_schedule: linear
+    tau: 1.0
+    eps: 1.0e-8
 training:
-  vision_training: end_to_end
-  batch_size: 8
-  gradient_accumulation_steps: 4
+  vision_training: feature_cache
+  batch_size: 16
+  gradient_accumulation_steps: 2
   learning_rate: 0.0001
-  vision_learning_rate: 0.00001
-  text_learning_rate: 0.00005
-  head_learning_rate: 0.0001
   weight_decay: 0.05
   scheduler_gamma: 0.9
   align_epochs: 8
-  finetune_epochs: 8
+  finetune_epochs: 10
   gpa_hidden_size: 128
   max_grad_norm: 1.0
   num_workers: 2
   pin_memory: true
-  progress_log_every_steps: 50
+  progress_log_every_steps: 500
 generation:
   max_new_tokens: 512
   num_beams: 3
