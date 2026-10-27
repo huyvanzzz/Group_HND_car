@@ -15,11 +15,6 @@ def test_loads_self_contained_generic_config(tmp_path):
     assert cfg.data.view_order == CAMERA_ORDER
     assert cfg.training.effective_batch_size == 4
     assert cfg.training.effective_batch_size_for_processes(2) == 8
-    assert cfg.model.fusion.visual_self_attention_layers == 0
-    assert cfg.model.fusion.visual_self_attention_heads == 4
-    assert cfg.model.fusion.visual_self_attention_mlp_ratio == 2.0
-    assert cfg.model.fusion.visual_self_attention_dropout == 0.0
-    assert cfg.model.fusion.visual_self_attention_residual_scale == 1.0e-2
 
 
 def test_accelerate_and_exact_mvpruner_dependencies():
@@ -43,7 +38,6 @@ def test_loads_dino_mvpruner_profile():
     assert cfg.model.fusion.beta_end == 0.0
     assert cfg.model.fusion.beta_schedule == "linear"
     assert cfg.model.fusion.tau == 1.0
-    assert cfg.model.adapter.name == "none"
     assert cfg.training.vision_training == "feature_cache"
     assert cfg.runtime.precision == "fp32"
 
@@ -77,6 +71,7 @@ model:
   text:
     model_id: google/t5-efficient-mini
     d_model: 384
+  fusion: {name: mvpruner_two_stage, stage1_top_k: 12, stage2_top_k: 6}
 training:
   batch_size: 4
   gradient_accumulation_steps: 1

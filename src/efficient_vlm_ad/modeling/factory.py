@@ -3,11 +3,10 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .adapters import DynamicInstructionAdapter
-from .router import QuestionGuidedTokenRouter
 from .mvpruner import MVPrunerTwoStage
 from .vision import Dinov2FeatureExtractor, ImageProcessorTransform, LegacyVitPatchExtractor, RepVitFeatureExtractor
 from .vlm import EfficientVLMForAD, EndToEndEfficientVLMForAD
+from .unpruned import UnprunedVLMForAD
 from ..tokenization import ensure_special_less_than_token
 from ..checkpointing import architecture_signature
 
@@ -132,25 +131,22 @@ class FakeVisionEncoder(nn.Module):
 
 def build_text_and_tokenizer(cfg):
     if cfg.model.text.model_id == "fake_t5":
-        if cfg.model.fusion.name == "mvpruner_two_stage":
-            from transformers import T5Config, T5ForConditionalGeneration
-
-            heads = 2 if cfg.model.text.d_model % 2 == 0 else 1
-            config = T5Config(
-                vocab_size=4096,
-                d_model=cfg.model.text.d_model,
-                d_kv=cfg.model.text.d_model // heads,
-                d_ff=cfg.model.text.d_model * 2,
-                num_layers=4,
-                num_decoder_layers=2,
-                num_heads=heads,
-                dropout_rate=0.0,
-                decoder_start_token_id=0,
-                pad_token_id=0,
-                eos_token_id=1,
-            )
-            return T5ForConditionalGeneration(config), SimpleTokenizer()
-        return TinySeq2Seq(cfg.model.text.d_model), SimpleTokenizer()
+        from transformers import T5Config, T5ForConditionalGeneration
+        heads = 2 if cfg.model.text.d_model % 2 == 0 else 1
+        config = T5Config(
+            vocab_size=4096,
+            d_model=cfg.model.text.d_model,
+            d_kv=cfg.model.text.d_model // heads,
+            d_ff=cfg.model.text.d_model * 2,
+            num_layers=4,
+            num_decoder_layers=2,
+            num_heads=heads,
+            dropout_rate=0.0,
+            decoder_start_token_id=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        return T5ForConditionalGeneration(config), SimpleTokenizer()
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.text.model_id, revision=cfg.model.text.revision)
@@ -191,43 +187,7 @@ def build_vision_encoder(cfg):
     raise ValueError(f"Unknown vision model: {cfg.model.vision.name}")
 
 
-def build_visual_adapter(cfg):
-    if cfg.model.adapter.name == "none":
-        return None
-    if cfg.model.adapter.name == "minidrive_di":
-        return DynamicInstructionAdapter(
-            vision_dim=cfg.model.vision.output_dim,
-            text_dim=cfg.model.text.d_model,
-            num_heads=cfg.model.adapter.num_heads,
-            dropout=cfg.model.adapter.dropout,
-            residual_scale=cfg.model.adapter.residual_scale,
-        )
-    raise ValueError(f"Unknown adapter: {cfg.model.adapter.name}")
-
-
 def build_visual_fusion(cfg):
-    if cfg.model.fusion.name == "gpa":
-        return None
-    if cfg.model.fusion.name == "question_guided_router":
-        return QuestionGuidedTokenRouter(
-            vision_dim=cfg.model.vision.output_dim,
-            text_dim=cfg.model.text.d_model,
-            seq_len=cfg.model.vision.seq_len,
-            num_views=len(cfg.data.view_order),
-            top_k=cfg.model.fusion.top_k,
-            tau_start=cfg.model.fusion.tau_start,
-            tau_min=cfg.model.fusion.tau_min,
-            diversity_weight=cfg.model.fusion.diversity_weight,
-            eps=cfg.model.fusion.eps,
-            score_norm=cfg.model.fusion.score_norm,
-            selected_norm=cfg.model.fusion.selected_norm,
-            norm_eps=cfg.model.fusion.norm_eps,
-            visual_self_attention_layers=cfg.model.fusion.visual_self_attention_layers,
-            visual_self_attention_heads=cfg.model.fusion.visual_self_attention_heads,
-            visual_self_attention_mlp_ratio=cfg.model.fusion.visual_self_attention_mlp_ratio,
-            visual_self_attention_dropout=cfg.model.fusion.visual_self_attention_dropout,
-            visual_self_attention_residual_scale=cfg.model.fusion.visual_self_attention_residual_scale,
-        )
     if cfg.model.fusion.name == "mvpruner_two_stage":
         return MVPrunerTwoStage(
             d_model=cfg.model.text.d_model,
@@ -247,15 +207,24 @@ def build_visual_fusion(cfg):
 
 
 def build_vlm_model(cfg):
+    if cfg.training.gradient_checkpointing and cfg.model.fusion.name != "unpruned":
+        raise ValueError("gradient_checkpointing is currently supported only for unpruned")
     text_model, tokenizer = build_text_and_tokenizer(cfg)
+    if cfg.model.fusion.name == "unpruned":
+        model = UnprunedVLMForAD(
+            text_model=text_model, num_views=len(cfg.data.view_order),
+            vision_dim=cfg.model.vision.output_dim, d_model=cfg.model.text.d_model,
+            seq_len=cfg.model.vision.seq_len, projector_type=cfg.model.projector.type,
+            gradient_checkpointing=cfg.training.gradient_checkpointing,
+        )
+        model.architecture_signature = architecture_signature(cfg)
+        return model, tokenizer
     model = EfficientVLMForAD(
         text_model=text_model,
-        visual_adapter=build_visual_adapter(cfg),
         visual_fusion=build_visual_fusion(cfg),
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
-        gpa_hidden_size=cfg.training.gpa_hidden_size,
         projector_type=cfg.model.projector.type,
     )
     model.architecture_signature = architecture_signature(cfg)
@@ -263,16 +232,16 @@ def build_vlm_model(cfg):
 
 
 def build_end_to_end_vlm_model(cfg, vision_encoder: nn.Module):
+    if cfg.training.gradient_checkpointing:
+        raise ValueError("gradient_checkpointing is currently supported only for unpruned feature-cache training")
     text_model, tokenizer = build_text_and_tokenizer(cfg)
     model = EndToEndEfficientVLMForAD(
         vision_encoder=vision_encoder,
         text_model=text_model,
-        visual_adapter=build_visual_adapter(cfg),
         visual_fusion=build_visual_fusion(cfg),
         vision_dim=cfg.model.vision.output_dim,
         d_model=cfg.model.text.d_model,
         seq_len=cfg.model.vision.seq_len,
-        gpa_hidden_size=cfg.training.gpa_hidden_size,
         projector_type=cfg.model.projector.type,
     )
     model.architecture_signature = architecture_signature(cfg)

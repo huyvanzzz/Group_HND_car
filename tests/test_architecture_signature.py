@@ -34,9 +34,8 @@ def test_signature_contains_exact_architecture_and_ignores_training_settings():
         },
         "projector.type": "linear", "text.model_id": cfg.model.text.model_id,
         "text.revision": cfg.model.text.revision, "text.d_model": cfg.model.text.d_model,
-        **{f"adapter.{key}": value for key, value in asdict(cfg.model.adapter).items()},
         **{f"fusion.{key}": value for key, value in asdict(cfg.model.fusion).items()},
-        "training.gpa_hidden_size": cfg.training.gpa_hidden_size,
+        "mvpruner.stage1_algorithm_version": 2,
     }
     changed = replace(cfg, training=replace(cfg.training, learning_rate=0.123))
     assert checkpointing.architecture_signature(changed) == signature
@@ -69,7 +68,7 @@ def test_dino_rejected_before_any_model_or_optimizer_load(tmp_path, helper, kind
 
 
 @pytest.mark.parametrize("dino", [True, False])
-def test_signature_round_trip_and_legacy_missing_compatibility(tmp_path, dino):
+def test_signature_round_trip_for_mvpruner_profiles(tmp_path, dino):
     model = torch.nn.Linear(2, 2)
     model.architecture_signature = checkpointing.architecture_signature(_cfg(dino))
     optimizer = torch.optim.AdamW(model.parameters())
@@ -77,9 +76,6 @@ def test_signature_round_trip_and_legacy_missing_compatibility(tmp_path, dino):
     checkpointing.save_checkpoint(path, model=model, optimizer=optimizer, scheduler=None, scaler=None, metadata={})
     payload = torch.load(path, weights_only=False)
     assert payload["metadata"]["architecture_signature"] == model.architecture_signature
-    if not dino:
-        payload["metadata"].pop("architecture_signature")
-        torch.save(payload, path)
     checkpointing.load_checkpoint(path, model=model, optimizer=optimizer)
 
 
@@ -131,40 +127,6 @@ def test_mvpruner_config_mismatch_rejected_before_weights_load(tmp_path, field, 
     model.load_state_dict = Mock(side_effect=AssertionError("weights must not load"))
 
     with pytest.raises(ValueError, match=f"fusion.{field}"):
-        _strict_load_model_from_checkpoint(path, model, "cpu")
-    model.load_state_dict.assert_not_called()
-
-
-@pytest.mark.parametrize("field,value", [
-    ("adapter.dropout", 0.3),
-    ("fusion.top_k", 11),
-    ("fusion.visual_self_attention_layers", 2),
-    ("training.gpa_hidden_size", 64),
-])
-def test_adapter_router_and_gpa_config_mismatch_rejected_before_weights_load(tmp_path, field, value):
-    from efficient_vlm_ad.pipeline import _strict_load_model_from_checkpoint
-
-    cfg = _cfg()
-    cfg = replace(cfg, model=replace(
-        cfg.model,
-        adapter=replace(cfg.model.adapter, name="minidrive_di"),
-        fusion=replace(cfg.model.fusion, name="question_guided_router"),
-    ))
-    section, key = field.split(".", 1)
-    if section == "training":
-        changed = replace(cfg, training=replace(cfg.training, **{key: value}))
-    else:
-        changed_section = replace(getattr(cfg.model, section), **{key: value})
-        changed = replace(cfg, model=replace(cfg.model, **{section: changed_section}))
-    model = torch.nn.Linear(2, 2)
-    model.architecture_signature = checkpointing.architecture_signature(cfg)
-    path = tmp_path / "mismatch.pt"
-    torch.save({"model": {}, "metadata": {
-        "architecture_signature": checkpointing.architecture_signature(changed),
-    }}, path)
-    model.load_state_dict = Mock(side_effect=AssertionError("weights must not load"))
-
-    with pytest.raises(ValueError, match=field):
         _strict_load_model_from_checkpoint(path, model, "cpu")
     model.load_state_dict.assert_not_called()
 

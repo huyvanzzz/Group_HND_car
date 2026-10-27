@@ -1,5 +1,7 @@
 # Question-Guided Router Design Context
 
+> Historical research reference: GPA/router/instruction-adapter runtime paths have been removed. These designs are not active runtime features; the supported pipeline is MVPruner.
+
 Date: 2026-10-02
 
 ## Current Project Context

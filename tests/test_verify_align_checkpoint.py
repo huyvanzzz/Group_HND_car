@@ -41,6 +41,7 @@ model:
   profile: offline_verify
   vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
   text: {{model_id: fake_t5, d_model: 8}}
+  fusion: {{name: mvpruner_two_stage, stage1_top_k: 12, stage2_top_k: 6, stage2_layer: 2}}
 cache:
   dir: {str(output_dir / "cache").replace(chr(92), "/")}
 runtime:
@@ -50,7 +51,6 @@ training:
   gradient_accumulation_steps: 1
   align_epochs: 1
   finetune_epochs: 1
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1

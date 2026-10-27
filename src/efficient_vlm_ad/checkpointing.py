@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import json
 import os
+from copy import copy
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,29 @@ import torch
 from .verification import assert_tied_weights_ok, retie_text_model_weights
 
 
+# Only fields inactive in historical MVPruner profiles may be discarded.
+_LEGACY_INACTIVE_SIGNATURE_FIELDS = frozenset({
+    "adapter.name", "adapter.num_heads", "adapter.dropout", "adapter.residual_scale",
+    "training.gpa_hidden_size", "fusion.top_k", "fusion.diversity_weight",
+    "fusion.tau_start", "fusion.tau_min", "fusion.score_norm", "fusion.selected_norm",
+    "fusion.norm_eps", "fusion.visual_self_attention_layers",
+    "fusion.visual_self_attention_heads", "fusion.visual_self_attention_mlp_ratio",
+    "fusion.visual_self_attention_dropout", "fusion.visual_self_attention_residual_scale",
+})
+_LEGACY_GPA_STATE_KEYS = frozenset({
+    "gpa.z.0.weight", "gpa.g.0.weight", "gpa.w.weight", "gpa.w.bias",
+})
+
+
+def _normalize_mvpruner_signature(signature: dict[str, Any]) -> dict[str, Any]:
+    if signature.get("fusion.name") != "mvpruner_two_stage":
+        return signature
+    if "adapter.name" in signature and signature["adapter.name"] != "none":
+        raise ValueError("MVPruner checkpoint must have inactive adapter.name=none")
+    return {key: value for key, value in signature.items()
+            if key not in _LEGACY_INACTIVE_SIGNATURE_FIELDS}
+
+
 def architecture_signature(cfg: Any) -> dict[str, Any]:
     """Configuration identity, independent of training state and output paths."""
     model = cfg.model
@@ -21,9 +45,8 @@ def architecture_signature(cfg: Any) -> dict[str, Any]:
         **{f"vision.{key}": value for key, value in asdict(model.vision).items()},
         "projector.type": model.projector.type,
         **{f"text.{key}": value for key, value in asdict(model.text).items()},
-        **{f"adapter.{key}": value for key, value in asdict(model.adapter).items()},
-        **{f"fusion.{key}": value for key, value in asdict(model.fusion).items()},
-        "training.gpa_hidden_size": cfg.training.gpa_hidden_size,
+        **({"fusion.name": "unpruned"} if model.fusion.name == "unpruned" else
+           {f"fusion.{key}": value for key, value in asdict(model.fusion).items()}),
     }
 
 
@@ -43,6 +66,7 @@ def validate_checkpoint_signature(metadata: dict[str, Any], *, model: torch.nn.M
         return  # Historical non-DINO checkpoints did not record architecture identity.
     if not isinstance(actual, dict):
         raise ValueError("Checkpoint architecture_signature must be a mapping")
+    actual = _normalize_mvpruner_signature(actual)
 
     def differences(wanted: dict, stored: dict, prefix: str = "") -> list[str]:
         result = []
@@ -59,6 +83,32 @@ def validate_checkpoint_signature(metadata: dict[str, Any], *, model: torch.nn.M
     mismatches = differences(expected, actual)
     if mismatches:
         raise ValueError("Checkpoint architecture_signature mismatch: " + "; ".join(mismatches))
+
+
+def checkpoint_model_state(payload: dict[str, Any], *, model: torch.nn.Module,
+                           cfg: Any | None = None) -> dict[str, Any]:
+    """Validate architecture, then discard only the unused historical GPA tensors.
+
+    This returns a new mapping only when migration is needed. It never mutates
+    the payload, optimizer state, or checkpoint file and never relaxes loading
+    of active model tensors.
+    """
+    metadata = payload.get("metadata", {})
+    validate_checkpoint_signature(metadata, model=model, cfg=cfg)
+    state = payload["model"]
+    if not (_LEGACY_GPA_STATE_KEYS & state.keys()):
+        return state
+    signature = metadata.get("architecture_signature", {})
+    if not (isinstance(signature, dict)
+            and signature.get("fusion.name") == "mvpruner_two_stage"
+            and signature.get("mvpruner.stage1_algorithm_version") == 2
+            and signature.get("adapter.name") == "none"):
+        raise ValueError("Unused GPA weights require a signed historical MVPruner v2 checkpoint")
+    # Preserve PyTorch's per-module version metadata on OrderedDict state dicts.
+    migrated = copy(state)
+    for key in _LEGACY_GPA_STATE_KEYS:
+        migrated.pop(key, None)
+    return migrated
 
 
 def _rng_state() -> dict[str, Any]:
@@ -198,8 +248,7 @@ def load_checkpoint(
     cfg: Any | None = None,
 ) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
-    validate_checkpoint_signature(payload.get("metadata", {}), model=model, cfg=cfg)
-    model.load_state_dict(payload["model"])
+    model.load_state_dict(checkpoint_model_state(payload, model=model, cfg=cfg))
     retie_report = retie_text_model_weights(model)
     assert_tied_weights_ok(model)
     if optimizer is not None and retie_report["changed_parameter_objects"]:

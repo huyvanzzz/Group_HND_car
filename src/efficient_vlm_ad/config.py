@@ -88,29 +88,9 @@ class TextConfig:
 
 
 @dataclass(frozen=True)
-class AdapterConfig:
-    name: str = "none"
-    num_heads: int = 8
-    dropout: float = 0.1
-    residual_scale: float = 0.1
-
-
-@dataclass(frozen=True)
 class FusionConfig:
-    name: str = "gpa"
-    top_k: int = 49
-    diversity_weight: float = 0.0
-    tau_start: float = 2.0
-    tau_min: float = 0.5
+    name: str = "mvpruner_two_stage"
     eps: float = 1e-8
-    score_norm: bool = True
-    selected_norm: bool = True
-    norm_eps: float = 1e-5
-    visual_self_attention_layers: int = 0
-    visual_self_attention_heads: int = 4
-    visual_self_attention_mlp_ratio: float = 2.0
-    visual_self_attention_dropout: float = 0.0
-    visual_self_attention_residual_scale: float = 1e-2
     stage1_top_k: int = 196
     stage2_top_k: int = 49
     stage2_layer: int = 2
@@ -127,7 +107,6 @@ class ModelConfig:
     profile: str
     vision: VisionConfig
     text: TextConfig
-    adapter: AdapterConfig = field(default_factory=AdapterConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     projector: ProjectorConfig = field(default_factory=ProjectorConfig)
 
@@ -148,7 +127,6 @@ class TrainingConfig:
     scheduler_gamma: float = 0.9
     align_epochs: int = 6
     finetune_epochs: int = 6
-    gpa_hidden_size: int = 128
     max_steps: int | None = None
     align_max_steps: int | None = None
     finetune_max_steps: int | None = None
@@ -159,6 +137,11 @@ class TrainingConfig:
     pin_memory: bool = False
     progress_log_every_steps: int = 50
     vision_training: str = "feature_cache"
+    gradient_checkpointing: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.gradient_checkpointing, bool):
+            raise ValueError("training.gradient_checkpointing must be a boolean")
 
     @property
     def effective_batch_size(self) -> int:
@@ -223,11 +206,19 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if vision_training not in {"feature_cache", "end_to_end"}:
         raise ValueError("training.vision_training must be one of: feature_cache, end_to_end")
     adapter_name = str(adapter_raw.get("name", "none"))
-    if adapter_name not in {"none", "minidrive_di"}:
-        raise ValueError("model.adapter.name must be one of: none, minidrive_di")
-    fusion_name = str(fusion_raw.get("name", "gpa"))
-    if fusion_name not in {"gpa", "question_guided_router", "mvpruner_two_stage"}:
-        raise ValueError("model.fusion.name must be one of: gpa, question_guided_router, mvpruner_two_stage")
+    # Historical MVPruner YAML may declare an inactive adapter.
+    if adapter_name != "none":
+        raise ValueError("mvpruner_two_stage requires model.adapter.name=none; adapters are no longer supported")
+    fusion_name = str(fusion_raw.get("name", ""))
+    if fusion_name not in {"mvpruner_two_stage", "unpruned"}:
+        raise ValueError("model.fusion.name must be mvpruner_two_stage or unpruned")
+    if fusion_name == "unpruned" and vision_training != "feature_cache":
+        raise ValueError("unpruned currently requires feature_cache vision training")
+    gradient_checkpointing = train_raw.get("gradient_checkpointing", False)
+    if not isinstance(gradient_checkpointing, bool):
+        raise ValueError("training.gradient_checkpointing must be a boolean")
+    if gradient_checkpointing and fusion_name != "unpruned":
+        raise ValueError("training.gradient_checkpointing is currently supported only for unpruned")
     stage1_top_k = int(fusion_raw.get("stage1_top_k", len(view_order) * int(vision_raw.get("seq_len", 49))))
     stage2_top_k = int(fusion_raw.get("stage2_top_k", fusion_raw.get("top_k", vision_raw.get("seq_len", 49))))
     minimum_per_camera = int(fusion_raw.get("min_tokens_per_camera", 1))
@@ -282,27 +273,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 revision=text_raw.get("revision"),
                 d_model=int(_require(text_raw, "d_model")),
             ),
-            adapter=AdapterConfig(
-                name=adapter_name,
-                num_heads=int(adapter_raw.get("num_heads", 8)),
-                dropout=float(adapter_raw.get("dropout", 0.1)),
-                residual_scale=float(adapter_raw.get("residual_scale", 0.1)),
-            ),
             fusion=FusionConfig(
                 name=fusion_name,
-                top_k=int(fusion_raw.get("top_k", vision_raw.get("seq_len", 49))),
-                diversity_weight=float(fusion_raw.get("diversity_weight", 0.0)),
-                tau_start=float(fusion_raw.get("tau_start", 2.0)),
-                tau_min=float(fusion_raw.get("tau_min", 0.5)),
                 eps=float(fusion_raw.get("eps", 1e-8)),
-                score_norm=bool(fusion_raw.get("score_norm", True)),
-                selected_norm=bool(fusion_raw.get("selected_norm", True)),
-                norm_eps=float(fusion_raw.get("norm_eps", 1e-5)),
-                visual_self_attention_layers=int(fusion_raw.get("visual_self_attention_layers", 0)),
-                visual_self_attention_heads=int(fusion_raw.get("visual_self_attention_heads", 4)),
-                visual_self_attention_mlp_ratio=float(fusion_raw.get("visual_self_attention_mlp_ratio", 2.0)),
-                visual_self_attention_dropout=float(fusion_raw.get("visual_self_attention_dropout", 0.0)),
-                visual_self_attention_residual_scale=float(fusion_raw.get("visual_self_attention_residual_scale", 1e-2)),
                 stage1_top_k=stage1_top_k,
                 stage2_top_k=stage2_top_k,
                 stage2_layer=int(fusion_raw.get("stage2_layer", 2)),
@@ -315,6 +288,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ),
         ),
         training=TrainingConfig(
+            gradient_checkpointing=gradient_checkpointing,
             batch_size=int(_require(train_raw, "batch_size")),
             gradient_accumulation_steps=int(_require(train_raw, "gradient_accumulation_steps")),
             learning_rate=float(train_raw.get("learning_rate", 1e-4)),
@@ -325,7 +299,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
             scheduler_gamma=float(train_raw.get("scheduler_gamma", 0.9)),
             align_epochs=int(train_raw.get("align_epochs", 6)),
             finetune_epochs=int(train_raw.get("finetune_epochs", 6)),
-            gpa_hidden_size=int(train_raw.get("gpa_hidden_size", 128)),
             max_steps=int(train_raw["max_steps"]) if train_raw.get("max_steps") is not None else None,
             align_max_steps=int(train_raw["align_max_steps"]) if train_raw.get("align_max_steps") is not None else None,
             finetune_max_steps=int(train_raw["finetune_max_steps"]) if train_raw.get("finetune_max_steps") is not None else None,

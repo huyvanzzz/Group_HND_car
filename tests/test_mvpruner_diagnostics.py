@@ -20,7 +20,7 @@ def _model():
         text_model=text, visual_fusion=MVPrunerTwoStage(
             d_model=8, vision_dim=12, num_views=2, tokens_per_view=4,
             stage1_top_k=6, stage2_top_k=2, beta_start=0, beta_end=0,
-        ), vision_dim=12, d_model=8, seq_len=4, gpa_hidden_size=4, projector_type="linear",
+        ), vision_dim=12, d_model=8, seq_len=4, projector_type="linear",
     ).train()
 
 

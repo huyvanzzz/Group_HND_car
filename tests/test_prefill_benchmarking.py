@@ -135,11 +135,10 @@ def test_cuda_prefill():
     assert count_prefill_flops(model, batch, generation) > 0
 
 
-@pytest.mark.parametrize('fusion', ['mvpruner', 'identity', 'router', 'gpa'])
+@pytest.mark.parametrize('fusion', ['mvpruner', 'identity'])
 def test_actual_vlm_paths(fusion):
     from efficient_vlm_ad.modeling.vlm import EfficientVLMForAD
     from efficient_vlm_ad.modeling.mvpruner import MVPrunerTwoStage
-    from efficient_vlm_ad.modeling.router import QuestionGuidedTokenRouter
     base, _, generation = fixture(3)
     selected_fusion = None
     if fusion in ('mvpruner', 'identity'):
@@ -150,11 +149,8 @@ def test_actual_vlm_paths(fusion):
         base.text_model = T5ForConditionalGeneration(T5Config(
             vocab_size=32, d_model=8, d_kv=4, d_ff=16, num_layers=4, num_decoder_layers=2,
             num_heads=2, dropout_rate=0., decoder_start_token_id=0, eos_token_id=1, pad_token_id=0))
-    elif fusion == 'router':
-        selected_fusion = QuestionGuidedTokenRouter(vision_dim=12, text_dim=8, num_views=2,
-            seq_len=4, top_k=3, visual_self_attention_layers=1, visual_self_attention_heads=2)
     model = EfficientVLMForAD(text_model=base.text_model, visual_fusion=selected_fusion,
-                              vision_dim=12, d_model=8, seq_len=4, gpa_hidden_size=4).eval()
+                              vision_dim=12, d_model=8, seq_len=4, ).eval()
     batch = dict(input_ids=torch.tensor([[2, 3, 0]]), attention_mask=torch.tensor([[1, 1, 0]]),
                  visual_features=torch.randn(1, 2, 4, 12))
     assert measure_prefill_seconds(model, batch, generation) > 0

@@ -1,5 +1,7 @@
 # Frozen Encoder + Visual Adapter / Marker Prompting cho EM-VLM4AD
 
+> Historical research reference: GPA/router/instruction-adapter runtime paths have been removed. These designs are not active runtime features; the supported pipeline is MVPruner.
+
 Ngày research: 2026-09-26
 
 ## 1. Tóm tắt ngắn

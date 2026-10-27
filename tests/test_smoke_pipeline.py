@@ -52,6 +52,7 @@ model:
   profile: offline_tiny
   vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
   text: {{model_id: fake_t5, d_model: 8}}
+  fusion: {{name: mvpruner_two_stage, stage1_top_k: 12, stage2_top_k: 6, stage2_layer: 2}}
 cache:
   dir: {str(output_dir / "cache").replace(chr(92), "/")}
 runtime:
@@ -60,7 +61,6 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 2
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -129,9 +129,10 @@ generation:
     assert eval_progress[-1]["stage"] == "evaluate"
     assert eval_progress[-1]["current"] == 2
     assert eval_progress[-1]["total"] == 2
-    assert benchmark_progress[-1]["stage"] == "benchmark"
-    assert benchmark_progress[-1]["current"] == 2
-    assert benchmark_progress[-1]["total"] == 2
+    generation_progress = [row for row in benchmark_progress if row["stage"] == "benchmark"]
+    assert generation_progress[-1]["current"] == 2
+    assert generation_progress[-1]["total"] == 2
+    assert {row["stage"] for row in benchmark_progress} >= {"benchmark", "benchmark-prefill", "benchmark-flops"}
     debug_events = [
         json.loads(line)
         for line in (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8").splitlines()
@@ -174,6 +175,7 @@ model:
   profile: offline_tiny
   vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
   text: {{model_id: fake_t5, d_model: 8}}
+  fusion: {{name: mvpruner_two_stage, stage1_top_k: 12, stage2_top_k: 6, stage2_layer: 2}}
 cache:
   dir: {str(output_dir / "cache").replace(chr(92), "/")}
 runtime:
@@ -182,7 +184,6 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 2
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -195,101 +196,6 @@ generation:
 
     index = json.loads((output_dir / "cache" / "index.json").read_text(encoding="utf-8"))
     assert len(index) == 6
-
-
-def test_router_offline_smoke_cli_sequence(tmp_path: Path):
-    data_root = tmp_path / "dataset"
-    _make_fake_data(data_root, rows_per_split=2)
-    output_dir = tmp_path / "outputs"
-    cfg = tmp_path / "router_config.yaml"
-    cfg.write_text(
-        f"""
-project:
-  output_dir: {output_dir.as_posix()}
-data:
-  hf_repo_id: local/fake
-  local_dir: {data_root.as_posix()}
-  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
-  expected_counts: {{train: 2, val: 2, test: 2}}
-model:
-  profile: offline_router
-  vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
-  text: {{model_id: fake_t5, d_model: 8}}
-  fusion:
-    name: question_guided_router
-    top_k: 4
-    diversity_weight: 0.001
-    tau_start: 2.0
-    tau_min: 0.5
-cache:
-  dir: {str(output_dir / "cache").replace(chr(92), "/")}
-runtime:
-  precision: fp32
-training:
-  batch_size: 1
-  gradient_accumulation_steps: 1
-  max_steps: 2
-  gpa_hidden_size: 4
-generation:
-  max_new_tokens: 4
-  num_beams: 1
-""",
-        encoding="utf-8",
-    )
-
-    for command in [
-        ["prepare-data", "--config", str(cfg), "--subset", "smoke"],
-        ["prepare-features", "--config", str(cfg), "--subset", "smoke"],
-        ["train", "--config", str(cfg), "--stage", "align", "--max-steps", "2", "--debug", "--debug-samples", "1"],
-        [
-            "train",
-            "--config",
-            str(cfg),
-            "--stage",
-            "finetune",
-            "--resume",
-            str(output_dir / "checkpoints" / "align_best.pt"),
-            "--max-steps",
-            "2",
-            "--debug",
-            "--debug-samples",
-            "1",
-        ],
-    ]:
-        subprocess.run([sys.executable, "-m", "efficient_vlm_ad", *command], check=True)
-
-    align_payload = torch.load(output_dir / "checkpoints" / "align_latest.pt", map_location="cpu", weights_only=False)
-    assert align_payload["metadata"]["router_tau"]["tau_step"] == 2
-    assert align_payload["metadata"]["router_tau"]["target_optimizer_steps"] == 2
-    debug_events = [
-        json.loads(line)
-        for line in (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    train_events = [event["payload"] for event in debug_events if event["section"] == "TRAIN"]
-    assert any("router" in payload for payload in train_events)
-    router_payload = next(payload["router"] for payload in train_events if "router" in payload)
-    assert router_payload["hard_khot_sum"] == [4.0]
-    assert sum(router_payload["camera_histogram"][0]) == 4
-    assert router_payload["scorer_grad_norm"] is not None
-
-    progress_rows = [
-        json.loads(line)
-        for line in (output_dir / "debug" / "train_progress.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    forbidden_progress_keys = {
-        "router",
-        "router_tau",
-        "selected_indices",
-        "camera_histogram",
-        "scorer_grad_norm",
-        "soft_khot_stats",
-        "ste_mask_stats",
-        "diversity_loss_raw",
-        "diversity_loss_weighted",
-    }
-    assert all(forbidden_progress_keys.isdisjoint(row) for row in progress_rows)
 
 
 @pytest.mark.parametrize('finetune_only', [False, True])
@@ -311,7 +217,6 @@ model:
   profile: offline_mvpruner
   vision: {{name: fake_vision, model_id: fake, output_dim: 12, seq_len: 4, image_size: 16}}
   text: {{model_id: fake_t5, d_model: 8}}
-  adapter: {{name: none}}
   fusion:
     name: mvpruner_two_stage
     stage1_top_k: 12
@@ -335,7 +240,6 @@ training:
   max_steps: 1
   align_epochs: 1
   finetune_epochs: 1
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 2
   num_beams: 1
@@ -399,6 +303,20 @@ evaluation:
     assert (output_dir / "predictions.jsonl").exists()
     assert (output_dir / "benchmark.json").exists()
 
+    progress_rows = [json.loads(line) for line in
+        (output_dir / "debug" / "train_progress.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()]
+    detailed_keys = {"mvpruner", "stage1_indices", "stage2_indices", "stage1_budgets", "stage2_budgets"}
+    assert all(detailed_keys.isdisjoint(row) for row in progress_rows)
+    if not finetune_only:
+        events = [json.loads(line) for line in
+            (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+        payload = next(event["payload"]["mvpruner"] for event in events
+            if event["section"] == "TRAIN" and "mvpruner" in event["payload"])
+        assert sum(payload["stage1_budgets"][0]) == 12
+        assert sum(payload["stage2_budgets"][0]) == 6
+
 
 def test_epoch_training_saves_latest_best_and_final_alias(tmp_path: Path):
     data_root = tmp_path / "dataset"
@@ -418,6 +336,7 @@ model:
   profile: offline_epoch
   vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
   text: {{model_id: fake_t5, d_model: 8}}
+  fusion: {{name: mvpruner_two_stage, stage1_top_k: 12, stage2_top_k: 6, stage2_layer: 2}}
 cache:
   dir: {str(output_dir / "cache").replace(chr(92), "/")}
 runtime:
@@ -427,7 +346,6 @@ training:
   gradient_accumulation_steps: 1
   align_epochs: 2
   finetune_epochs: 2
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -483,6 +401,7 @@ model:
   profile: offline_nan
   vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
   text: {{model_id: fake_t5, d_model: 8}}
+  fusion: {{name: mvpruner_two_stage, stage1_top_k: 12, stage2_top_k: 6, stage2_layer: 2}}
 cache:
   dir: {str(output_dir / "cache").replace(chr(92), "/")}
 runtime:
@@ -491,7 +410,6 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 1
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -507,7 +425,7 @@ generation:
         def __init__(self):
             super().__init__()
             self.text_model = torch.nn.Linear(1, 1)
-            self.gpa = torch.nn.Linear(1, 1)
+            self.visual_fusion = torch.nn.Linear(1, 1)
             self.projector = torch.nn.Linear(1, 1)
             self.modal_embeddings = torch.nn.Embedding(2, 1)
             self.row_embeddings = None

@@ -4,7 +4,7 @@ from dataclasses import asdict
 import yaml
 
 from efficient_vlm_ad.config import (
-    CAMERA_ORDER, CacheConfig, DataConfig, ExperimentConfig, GenerationConfig,
+    CAMERA_ORDER, FusionConfig, CacheConfig, DataConfig, ExperimentConfig, GenerationConfig,
     ModelConfig, ProjectConfig, RuntimeConfig, TextConfig, TrainingConfig, VisionConfig,
 )
 
@@ -17,7 +17,8 @@ def fake_config():
         model=ModelConfig(profile='offline_test',
                           vision=VisionConfig(name='fake_vision', model_id='fake', output_dim=512,
                                               seq_len=49, image_size=224),
-                          text=TextConfig(model_id='fake_t5', d_model=256)),
+                          text=TextConfig(model_id='fake_t5', d_model=8),
+                          fusion=FusionConfig(name="mvpruner_two_stage", stage1_top_k=12, stage2_top_k=6)),
         training=TrainingConfig(batch_size=2, gradient_accumulation_steps=2, max_steps=20),
         cache=CacheConfig(dir='outputs/test/cache'), runtime=RuntimeConfig(),
         generation=GenerationConfig(),

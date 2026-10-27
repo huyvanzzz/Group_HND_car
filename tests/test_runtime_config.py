@@ -39,6 +39,7 @@ model:
   profile: p
   vision: {name: repvit_m1_5, model_id: m, output_dim: 512, seq_len: 49, image_size: 224}
   text: {model_id: t, d_model: 384}
+  fusion: {name: mvpruner_two_stage, stage1_top_k: 12, stage2_top_k: 6}
 training:
   batch_size: 1
   gradient_accumulation_steps: 1

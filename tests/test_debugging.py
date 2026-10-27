@@ -45,6 +45,7 @@ model:
   profile: offline_debug
   vision: {{name: fake_vision, model_id: fake, output_dim: 8, seq_len: 4, image_size: 16}}
   text: {{model_id: fake_t5, d_model: 8}}
+  fusion: {{name: mvpruner_two_stage, stage1_top_k: 12, stage2_top_k: 6, stage2_layer: 2}}
 cache:
   dir: {str(output_dir / "cache").replace(chr(92), "/")}
 runtime:
@@ -53,7 +54,6 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 2
-  gpa_hidden_size: 4
 generation:
   max_new_tokens: 4
   num_beams: 1
@@ -271,7 +271,7 @@ def test_diagnose_train_cli_reports_numerics_when_requested(tmp_path):
     json_start = result.stdout.rfind("\n{")
     payload = json.loads(result.stdout[json_start + 1 :])
     assert "[DEBUG][NUMERICS]" in result.stdout
-    assert '"inputs_embeds"' in debug_events
+    assert '"mvpruner_encoder_output"' in debug_events
     assert '"loss"' in debug_events
     assert payload["loss_finite"] is True
     assert payload["gradients"]["ok"] is True

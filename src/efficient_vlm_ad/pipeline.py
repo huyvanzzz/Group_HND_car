@@ -20,6 +20,7 @@ from .prefill_benchmarking import (
 from .cache import FeatureCacheManifest, create_memmap, dinov2_manifest_fields, validate_manifest
 from .checkpointing import (
     _restore_rng_state,
+    checkpoint_model_state,
     load_checkpoint,
     load_rank_rng_state,
     read_checkpoint_metadata,
@@ -36,7 +37,6 @@ from .hf_data import DatasetRecord, load_prepared_records
 from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, build_vlm_model
 from .modeling.multimodal import set_trainable_for_stage
 from .modeling.vision import dinov2_processor_policy
-from .modeling.router import QuestionGuidedTokenRouter, router_debug_payload
 from .modeling.mvpruner import MVPrunerTwoStage
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
@@ -532,13 +532,10 @@ def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
     modules = {
         "vision": getattr(model, "vision_encoder", torch.nn.Identity()),
         "text": model.text_model,
-        "gpa": model.gpa,
         "projector": model.projector,
         "spatial_pos": torch.nn.ModuleList([m for m in [model.row_embeddings, model.col_embeddings] if m]),
         "modal_embeddings": model.modal_embeddings,
     }
-    if getattr(model, "visual_adapter", None) is not None:
-        modules["visual_adapter"] = model.visual_adapter
     if getattr(model, "visual_fusion", None) is not None:
         modules["visual_fusion"] = model.visual_fusion
     return torch.nn.ModuleDict(modules)
@@ -582,11 +579,6 @@ def _batch_model_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[st
     return inputs
 
 
-def _router_module(model: torch.nn.Module) -> QuestionGuidedTokenRouter | None:
-    fusion = getattr(model, "visual_fusion", None)
-    return fusion if isinstance(fusion, QuestionGuidedTokenRouter) else None
-
-
 def _mvpruner_module(model: torch.nn.Module) -> MVPrunerTwoStage | None:
     fusion = getattr(model, "visual_fusion", None)
     return fusion if isinstance(fusion, MVPrunerTwoStage) else None
@@ -600,44 +592,33 @@ def _target_optimizer_steps(*, batches_per_epoch: int, total_epochs: int, gradie
     return max(1, steps_per_epoch * int(total_epochs))
 
 
-def _configure_router_tau(model: torch.nn.Module, *, target_steps: int, reset: bool) -> None:
-    router = _router_module(model)
-    if router is not None:
-        router.configure_tau(target_steps, reset=reset)
+def _configure_mvpruner_beta(model: torch.nn.Module, *, target_steps: int, reset: bool) -> None:
     mvpruner = _mvpruner_module(model)
     if mvpruner is not None:
         mvpruner.configure_beta(target_steps, reset=reset)
 
 
-def _step_router_tau(model: torch.nn.Module) -> None:
-    router = _router_module(model)
-    if router is not None:
-        router.step_tau()
+def _step_mvpruner_beta(model: torch.nn.Module) -> None:
     mvpruner = _mvpruner_module(model)
     if mvpruner is not None:
         mvpruner.step_beta()
 
 
-def _router_train_payload(model: torch.nn.Module) -> dict[str, Any]:
-    router = _router_module(model)
-    if router is None:
-        mvpruner = _mvpruner_module(model)
-        if mvpruner is None:
-            return {}
-        debug = getattr(mvpruner, "last_debug", {}) or {}
-        payload: dict[str, Any] = {
-            "beta": mvpruner.current_beta(),
-            "beta_step": int(mvpruner.beta_step.item()),
-            "beta_target_steps": int(mvpruner.beta_target_steps.item()),
-            "tau": float(mvpruner.tau.item()),
-        }
-        for key in ("stage1_budgets", "stage2_budgets", "stage1_indices", "stage2_indices"):
-            if key in debug:
-                payload[key] = debug[key].detach().cpu().tolist()
-        return {"mvpruner": payload}
-    payload = router_debug_payload(router)
-    payload["scorer_grad_norm"] = _module_grad_norm(router.scorer)
-    return {"router": payload}
+def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
+    mvpruner = _mvpruner_module(model)
+    if mvpruner is None:
+        return {}
+    debug = getattr(mvpruner, "last_debug", {}) or {}
+    payload: dict[str, Any] = {
+        "beta": mvpruner.current_beta(),
+        "beta_step": int(mvpruner.beta_step.item()),
+        "beta_target_steps": int(mvpruner.beta_target_steps.item()),
+        "tau": float(mvpruner.tau.item()),
+    }
+    for key in ("stage1_budgets", "stage2_budgets", "stage1_indices", "stage2_indices"):
+        if key in debug:
+            payload[key] = debug[key].detach().cpu().tolist()
+    return {"mvpruner": payload}
 
 
 def _generation_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[str, torch.Tensor]:
@@ -708,8 +689,6 @@ def _expected_finetune_modules(cfg: ExperimentConfig, model: torch.nn.Module) ->
 
 def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, stage: str) -> list[str]:
     expected = {"modal_embeddings"}
-    if getattr(model, "visual_fusion", None) is None:
-        expected.add("gpa")
     if stage == "finetune":
         expected.add("text_model")
     if _module_has_parameters(getattr(model, "projector")):
@@ -718,8 +697,6 @@ def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, s
         expected.add("row_embeddings")
     if getattr(model, "col_embeddings", None) is not None and _module_has_parameters(getattr(model, "col_embeddings")):
         expected.add("col_embeddings")
-    if getattr(model, "visual_adapter", None) is not None and _module_has_parameters(getattr(model, "visual_adapter")):
-        expected.add("visual_adapter")
     if getattr(model, "visual_fusion", None) is not None and _module_has_parameters(getattr(model, "visual_fusion")):
         expected.add("visual_fusion")
     if _uses_end_to_end_vision(cfg) and _module_has_parameters(getattr(model, "vision_encoder")):
@@ -729,8 +706,7 @@ def _expected_trainable_modules(cfg: ExperimentConfig, model: torch.nn.Module, s
 
 def _strict_load_model_from_checkpoint(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
-    validate_checkpoint_signature(payload.get("metadata", {}), model=model)
-    missing, unexpected = model.load_state_dict(payload["model"], strict=True)
+    missing, unexpected = model.load_state_dict(checkpoint_model_state(payload, model=model), strict=True)
     retie_text_model_weights(model)
     assert_tied_weights_ok(model)
     if missing or unexpected:
@@ -751,8 +727,7 @@ def _module_grad_norm(module: torch.nn.Module) -> float | None:
 
 def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Module, map_location: str | torch.device) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
-    validate_checkpoint_signature(payload.get("metadata", {}), model=model)
-    result = model.load_state_dict(payload["model"], strict=False)
+    result = model.load_state_dict(checkpoint_model_state(payload, model=model), strict=False)
     retie_text_model_weights(model)
     assert_tied_weights_ok(model)
     unexpected = list(result.unexpected_keys)
@@ -763,6 +738,20 @@ def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Mo
             f"missing_non_vision={missing_not_vision}, unexpected={unexpected}"
         )
     return dict(payload.get("metadata", {}))
+
+
+def _validate_unpruned_stage(cfg: ExperimentConfig, stage: str) -> None:
+    if cfg.model.fusion.name == "unpruned" and stage != "finetune":
+        raise ValueError("The unpruned baseline supports finetune only")
+
+
+def _unpruned_settings(cfg: ExperimentConfig) -> dict[str, Any]:
+    if cfg.model.fusion.name != "unpruned":
+        return {}
+    return {"unpruned": {
+        "visual_tokens": len(cfg.data.view_order) * cfg.model.vision.seq_len,
+        "gradient_checkpointing": cfg.training.gradient_checkpointing,
+    }}
 
 
 def train_stage(
@@ -777,6 +766,7 @@ def train_stage(
     disable_progress: bool = False,
     progress_log_every_steps: int | None = None,
 ) -> Path:
+    _validate_unpruned_stage(cfg, stage)
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     started_at = time.perf_counter()
     _heartbeat(dbg, started_at, "train_stage_start", train_stage=stage, resume=bool(resume), max_steps=max_steps)
@@ -798,7 +788,7 @@ def train_stage(
     assert_tied_weights_ok(model)
     if accelerator.is_main_process:
         dbg.log("DISTRIBUTED", _distributed_debug_payload(accelerator, cfg))
-        dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
+        dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg)), **_unpruned_settings(cfg)})
 
     start_step = 0
     start_epoch = 0
@@ -819,14 +809,15 @@ def train_stage(
             )
             _heartbeat(dbg, started_at, "checkpoint_metadata_start", path=resume)
         metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        if cfg.model.fusion.name == "unpruned" and metadata.get("stage") != "finetune":
+            raise ValueError("The unpruned baseline can resume only a finetune checkpoint")
         validate_checkpoint_signature(metadata, cfg=cfg)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_metadata_done", metadata=metadata)
             _heartbeat(dbg, started_at, "checkpoint_load_start", path=resume, same_stage=metadata.get("stage") == stage)
         if metadata.get("stage") == stage:
             resume_training_payload = torch.load(resume_path, map_location=device, weights_only=False)
-            validate_checkpoint_signature(resume_training_payload.get("metadata", {}), model=model, cfg=cfg)
-            model.load_state_dict(resume_training_payload["model"])
+            model.load_state_dict(checkpoint_model_state(resume_training_payload, model=model, cfg=cfg))
             retie_text_model_weights(model)
             assert_tied_weights_ok(model)
             metadata = dict(resume_training_payload.get("metadata", {}))
@@ -887,15 +878,15 @@ def train_stage(
         _heartbeat(dbg, started_at, "accelerator_prepare_start")
     step_limit = _stage_step_limit(cfg, stage, max_steps)
     total_epochs = 1 if step_limit is not None else _stage_epochs(cfg, stage)
-    target_router_steps = _target_optimizer_steps(
+    target_mvpruner_steps = _target_optimizer_steps(
         batches_per_epoch=len(loader),
         total_epochs=total_epochs,
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
         step_limit=step_limit,
     )
-    _configure_router_tau(
+    _configure_mvpruner_beta(
         model,
-        target_steps=target_router_steps,
+        target_steps=target_mvpruner_steps,
         reset=resume_training_payload is None,
     )
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
@@ -950,7 +941,7 @@ def train_stage(
             if isinstance(accelerator, _SingleProcessAccelerator):
                 batch = _move_training_batch(batch, device, cfg)
             with accelerator.autocast():
-                output = model(**_batch_model_inputs(batch, cfg), target_optimizer_steps=target_router_steps)
+                output = model(**_batch_model_inputs(batch, cfg), target_optimizer_steps=target_mvpruner_steps)
                 raw_loss = output.loss
                 loss = raw_loss / cfg.training.gradient_accumulation_steps
             if not torch.isfinite(raw_loss.detach()).item():
@@ -976,7 +967,7 @@ def train_stage(
                         with torch.no_grad():
                             numerics = debug_model.forward_debug(
                                 **_batch_model_inputs(batch, cfg),
-                                target_optimizer_steps=target_router_steps,
+                                target_optimizer_steps=target_mvpruner_steps,
                             )
                     dbg.log(
                         "NUMERICS",
@@ -1004,7 +995,7 @@ def train_stage(
                 debug_unwrapped = accelerator.unwrap_model(model)
                 if _uses_end_to_end_vision(cfg) and hasattr(debug_unwrapped, "vision_encoder"):
                     train_payload["vision_grad_norm"] = _module_grad_norm(debug_unwrapped.vision_encoder)
-                train_payload.update(_router_train_payload(debug_unwrapped))
+                train_payload.update(_mvpruner_train_payload(debug_unwrapped))
                 dbg.log(
                     "TRAIN",
                     train_payload,
@@ -1013,7 +1004,7 @@ def train_stage(
                 if cfg.training.max_grad_norm is not None:
                     accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
                 optimizer.step()
-                _step_router_tau(accelerator.unwrap_model(model))
+                _step_mvpruner_beta(accelerator.unwrap_model(model))
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
             if accelerator.is_main_process and (
@@ -1045,7 +1036,7 @@ def train_stage(
             if cfg.training.max_grad_norm is not None:
                 accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
             optimizer.step()
-            _step_router_tau(accelerator.unwrap_model(model))
+            _step_mvpruner_beta(accelerator.unwrap_model(model))
             optimizer.zero_grad(set_to_none=True)
 
         scheduler.step()
@@ -1098,6 +1089,7 @@ def train_stage(
                 best_val_loss = val_loss
                 best_epoch = epoch_number
             metadata = {
+                **_unpruned_settings(cfg),
                 "stage": stage,
                 "epoch": epoch_number,
                 "completed_epochs": epoch_number,
@@ -1129,16 +1121,6 @@ def train_stage(
                     "less_than_token": less_than_token_metadata(tokenizer),
                 },
             }
-            router = _router_module(unwrapped)
-            if router is not None:
-                metadata["router_tau"] = {
-                    "tau": router.current_tau(),
-                    "tau_step": int(router.tau_step.item()),
-                    "tau_start": float(router.tau_start.item()),
-                    "tau_min": float(router.tau_min.item()),
-                    "tau_decay": float(router.tau_decay.item()),
-                    "target_optimizer_steps": int(router.target_optimizer_steps.item()),
-                }
             mvpruner = _mvpruner_module(unwrapped)
             if mvpruner is not None:
                 metadata["mvpruner"] = {
@@ -1274,6 +1256,7 @@ def diagnose_train(
     debug_numerics: bool = False,
     disable_progress: bool = False,
 ) -> dict[str, Any]:
+    _validate_unpruned_stage(cfg, stage)
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     started_at = time.perf_counter()
     durations: dict[str, float] = {}
@@ -1302,7 +1285,7 @@ def diagnose_train(
     assert_tied_weights_ok(model)
     mark("model_to_device", begin)
     if accelerator.is_main_process:
-        dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg))})
+        dbg.log("MODEL", {"stage": stage, "params": model_param_summary(model), "device": str(device), "precision": str(resolve_precision(cfg)), **_unpruned_settings(cfg)})
 
     checkpoint_metadata = None
     if resume:
@@ -1432,6 +1415,7 @@ def verify_align_checkpoint(
     debug_numerics: bool = False,
     disable_progress: bool = False,
 ) -> dict[str, Any]:
+    _validate_unpruned_stage(cfg, "align")
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     started_at = time.perf_counter()
     checkpoint_path = Path(checkpoint)
@@ -1536,7 +1520,6 @@ def verify_align_checkpoint(
         "load_strict": True,
         "device": str(device),
         "vision_training": cfg.training.vision_training,
-        "adapter": cfg.model.adapter.name,
         "parameter_counts": {
             "model": parameter_count_report(model),
             "text_model": parameter_count_report(model.text_model),
@@ -1584,6 +1567,7 @@ def verify_resume_checkpoint(
     debug_numerics: bool = False,
     disable_progress: bool = False,
 ) -> dict[str, Any]:
+    _validate_unpruned_stage(cfg, stage)
     if stage not in {"align", "finetune"}:
         raise ValueError("--stage must be align or finetune")
     if index < 0:
@@ -1613,8 +1597,7 @@ def verify_resume_checkpoint(
     assert_tied_weights_ok(model)
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    validate_checkpoint_signature(payload.get("metadata", {}), model=model, cfg=cfg)
-    missing, unexpected = model.load_state_dict(payload["model"], strict=True)
+    missing, unexpected = model.load_state_dict(checkpoint_model_state(payload, model=model, cfg=cfg), strict=True)
     if missing or unexpected:
         raise RuntimeError(f"Strict checkpoint load failed: missing={list(missing)}, unexpected={list(unexpected)}")
     retie_report = retie_text_model_weights(model)
@@ -1709,7 +1692,6 @@ def verify_resume_checkpoint(
         "load_strict": True,
         "device": str(device),
         "vision_training": cfg.training.vision_training,
-        "adapter": cfg.model.adapter.name,
         "parameter_counts": {
             "model": parameter_count_report(model),
             "text_model": parameter_count_report(model.text_model),
@@ -1912,6 +1894,12 @@ def benchmark_checkpoint(
     summary = summarize_latencies(e2e_seconds=e2e, generation_seconds=gen, output_tokens=token_counts,
                                   prefill_seconds=prefill_seconds, prefill_flops=prefill_flops)
     summary["prefill_measurement"] = prefill_measurement_metadata(model, cfg.generation, warmup_samples=warmup_samples)
+    if cfg.model.fusion.name == "unpruned":
+        summary["unpruned"] = {
+            "visual_tokens": model.visual_token_len,
+            "training_gradient_checkpointing": metadata.get("unpruned", {}).get("gradient_checkpointing"),
+            "inference_gradient_checkpointing": False,
+        }
     summary.update({"device": str(device), "python": platform.python_version(), "torch": torch.__version__})
     if device.type == "cuda":
         summary.update({"gpu": torch.cuda.get_device_name(device), "peak_cuda_memory": generation_peak})

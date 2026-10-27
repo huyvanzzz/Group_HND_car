@@ -3,9 +3,8 @@
 Config-driven EM-VLM4AD experiments on Kaggle. The active profile is DINOv2-S + T5-Efficient-Mini with two-stage MVPruner:
 
 - `configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml`: frozen DINOv2-S, 64 tokens per camera, learned linear projector, MVPruner 196 → 49 tokens, FP32 finetuning.
-- `configs/legacy_vit_t5_base.yaml`: retained ViT-B/32 + T5-Base baseline.
 
-The upstream reference remains in `em_vlm4ad/`; implementation lives in `src/efficient_vlm_ad/`. RepViT extractors remain available in source for compatibility, while old RepViT configs and Kaggle notebooks have been removed.
+The runtime in `src/efficient_vlm_ad/` supports MVPruner and a native unpruned baseline. GPA, question-guided router and instruction-adapter execution paths and their baseline config have been removed. The upstream reference in `em_vlm4ad/` and research documents remain historical references; standalone vision utilities remain available.
 
 ## Kaggle
 
@@ -45,6 +44,20 @@ python -m efficient_vlm_ad benchmark --config "$CONFIG" --checkpoint CHECKPOINT
 ```
 
 Read [MVPruner details](docs/mvpruner-two-stage.md) for architecture, cache and checkpoint contracts. Supply `HF_TOKEN` through the environment or Kaggle secrets.
+
+## Unpruned baseline
+
+[Full-token finetuning notebook](notebooks/kaggle_train_dinov2_unpruned_finetune.ipynb) uses [the separate unpruned config](configs/dinov2_t5_efficient_mini_kaggle_2gpu_unpruned.yaml): all 384 visual tokens enter native T5 without scoring or pruning. It runs only finetuning from pretrained T5 and new multimodal modules, with separate output/cache/checkpoint paths and unpruned-only checkpoint resume. DINO, projector, training and generation settings match the MVPruner profile. See [baseline commands and reuse rules](docs/unpruned-baseline.md).
+
+Gradient checkpointing defaults to `False`. The notebook sets both allocator environment variables before torch starts, writes a separate runtime YAML and archives it with results. After a CUDA OOM, manually set `GRADIENT_CHECKPOINTING = True`, restart the kernel and resume the last compatible checkpoint. It does not automatically retry or change batch size. Benchmark timing excludes DINO feature extraction; GPU memory and performance have not been validated in the CPU test environment.
+
+## Historical MVPruner compatibility
+
+Existing MVPruner Stage-1-v2 checkpoints still load for training/resume, verification, evaluation and benchmarking. The loader validates the active architecture, then drops only the four unused historical GPA tensors and ignores an explicit list of inactive signature fields. Unknown weights, missing active weights, active historical adapters and incompatible MVPruner signatures still fail. Optimizer, scheduler and per-rank RNG state are preserved; source checkpoint files are not rewritten.
+
+Old MVPruner YAML may retain `adapter: {name: none}`, `training.gpa_hidden_size` and inactive router fields. They are ignored. The historical `fusion.top_k` fallback remains when `stage2_top_k` is absent; an explicit `stage2_top_k` wins. GPA/router configs and active adapters are rejected. DINO feature-cache files and manifest identity are unchanged.
+
+New model instances no longer allocate the unused GPA module, so total parameter counts decrease and fresh random initialization may differ for the same seed. Given the same active weights and RNG at execution time, the MVPruner computation is preserved.
 
 ## Verification
 

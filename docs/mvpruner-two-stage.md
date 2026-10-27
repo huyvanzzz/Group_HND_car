@@ -1,6 +1,6 @@
 # DINOv2 MVPruner two-stage profile
 
-Active profile: `configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml`. The retained router and GPA implementations remain available in source.
+Active profile: `configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml`. The runtime supports MVPruner only; historical GPA/router/adapter execution paths have been removed. See the README compatibility section for loading existing MVPruner checkpoints.
 
 ## Model flow
 

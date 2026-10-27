@@ -33,8 +33,6 @@ model:
     model_id: google/t5-efficient-mini
     revision: af3816c2dbd386f7786f7757c536f0314084ff8b
     d_model: 384
-  adapter:
-    name: none
   fusion:
     name: mvpruner_two_stage
     stage1_top_k: 196
@@ -56,7 +54,6 @@ training:
   scheduler_gamma: 0.9
   align_epochs: 8
   finetune_epochs: 10
-  gpa_hidden_size: 128
   max_grad_norm: 1.0
   num_workers: 2
   pin_memory: true
