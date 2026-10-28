@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,24 @@ class TextConfig:
 
 
 @dataclass(frozen=True)
+class CameraQueryConfig:
+    dim: int = 64
+    init_std: float = 1.0
+    rms_eps: float = 1e-6
+    position_policy: str = "new_sequence"
+
+    def __post_init__(self) -> None:
+        if type(self.dim) is not int or self.dim <= 0:
+            raise ValueError("fusion.query.dim must be a positive integer")
+        for name in ("init_std", "rms_eps"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"fusion.query.{name} must be finite and positive")
+        if self.position_policy != "new_sequence":
+            raise ValueError("fusion.query.position_policy must be new_sequence")
+
+
+@dataclass(frozen=True)
 class FusionConfig:
     name: str = "mvpruner_two_stage"
     eps: float = 1e-8
@@ -100,6 +119,16 @@ class FusionConfig:
     beta_end: float = 0.0
     beta_schedule: str = "linear"
     tau: float = 1.0
+    query: CameraQueryConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.name == "mvpruner_camera_query":
+            if self.query is None:
+                object.__setattr__(self, "query", CameraQueryConfig())
+            elif not isinstance(self.query, CameraQueryConfig):
+                raise ValueError("fusion.query must be a CameraQueryConfig")
+        elif self.query is not None:
+            raise ValueError("fusion.query is supported only by mvpruner_camera_query")
 
 
 @dataclass(frozen=True)
@@ -138,10 +167,16 @@ class TrainingConfig:
     progress_log_every_steps: int = 50
     vision_training: str = "feature_cache"
     gradient_checkpointing: bool = False
+    entropy_weight: float = 0.0
+    seed: int = 42
 
     def __post_init__(self) -> None:
         if not isinstance(self.gradient_checkpointing, bool):
             raise ValueError("training.gradient_checkpointing must be a boolean")
+        if isinstance(self.entropy_weight, bool) or not isinstance(self.entropy_weight, (int, float)) or not math.isfinite(self.entropy_weight) or self.entropy_weight < 0:
+            raise ValueError("training.entropy_weight must be finite and nonnegative")
+        if type(self.seed) is not int or self.seed < 0:
+            raise ValueError("training.seed must be a nonnegative integer")
 
     @property
     def effective_batch_size(self) -> int:
@@ -169,6 +204,24 @@ class ExperimentConfig:
     runtime: RuntimeConfig
     generation: GenerationConfig
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+
+    def __post_init__(self) -> None:
+        if self.model.fusion.name != "mvpruner_camera_query":
+            return
+        fusion = self.model.fusion
+        total = len(self.data.view_order) * self.model.vision.seq_len
+        if fusion.min_tokens_per_camera < 1 or not (len(self.data.view_order) * fusion.min_tokens_per_camera <= fusion.stage2_top_k <= fusion.stage1_top_k <= total):
+            raise ValueError("camera query budgets must satisfy views*minimum <= stage2_top_k <= stage1_top_k <= total")
+        if fusion.stage2_layer != 2 or fusion.stage1_relevance_mode not in {"shifted_max_cosine", "diversity_only"}:
+            raise ValueError("camera query requires stage2_layer=2 and a supported Stage 1 relevance mode")
+        if not math.isfinite(fusion.eps) or fusion.eps <= 0:
+            raise ValueError("camera query eps must be finite and positive")
+        if self.runtime.precision != "fp32" or self.training.vision_training != "feature_cache":
+            raise ValueError("camera query currently requires fp32 feature_cache training")
+        if self.training.gradient_checkpointing:
+            raise ValueError("gradient_checkpointing is not supported for camera query")
+        if self.training.batch_size < 1 or self.training.gradient_accumulation_steps < 1:
+            raise ValueError("camera query batch_size and gradient_accumulation_steps must be positive")
 
 
 def _require(mapping: dict[str, Any], key: str) -> Any:
@@ -210,8 +263,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if adapter_name != "none":
         raise ValueError("mvpruner_two_stage requires model.adapter.name=none; adapters are no longer supported")
     fusion_name = str(fusion_raw.get("name", ""))
-    if fusion_name not in {"mvpruner_two_stage", "unpruned"}:
-        raise ValueError("model.fusion.name must be mvpruner_two_stage or unpruned")
+    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query"}:
+        raise ValueError("model.fusion.name must be mvpruner_two_stage, mvpruner_camera_query or unpruned")
     if fusion_name == "unpruned" and vision_training != "feature_cache":
         raise ValueError("unpruned currently requires feature_cache vision training")
     gradient_checkpointing = train_raw.get("gradient_checkpointing", False)
@@ -227,6 +280,17 @@ def load_config(path: str | Path) -> ExperimentConfig:
     beta_end = float(fusion_raw.get("beta_end", 0.0))
     beta_schedule = str(fusion_raw.get("beta_schedule", "linear"))
     tau = float(fusion_raw.get("tau", 1.0))
+    query_raw = fusion_raw.get("query")
+    query = None
+    if fusion_name == "mvpruner_camera_query":
+        if query_raw is not None and not isinstance(query_raw, dict):
+            raise ValueError("fusion.query must be a mapping")
+        try:
+            query = CameraQueryConfig(**(query_raw or {}))
+        except TypeError as exc:
+            raise ValueError(f"Invalid fusion.query: {exc}") from exc
+    elif query_raw is not None:
+        raise ValueError("fusion.query is supported only by mvpruner_camera_query")
     if fusion_name == "mvpruner_two_stage":
         total_visual = len(view_order) * int(_require(vision_raw, "seq_len"))
         if not (len(view_order) * minimum_per_camera <= stage2_top_k <= stage1_top_k <= total_visual):
@@ -285,6 +349,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 beta_end=beta_end,
                 beta_schedule=beta_schedule,
                 tau=tau,
+                query=query,
             ),
         ),
         training=TrainingConfig(
@@ -309,6 +374,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             pin_memory=bool(train_raw.get("pin_memory", False)),
             progress_log_every_steps=int(train_raw.get("progress_log_every_steps", 50)),
             vision_training=vision_training,
+            entropy_weight=train_raw.get("entropy_weight", 0.5 if fusion_name == "mvpruner_camera_query" else 0.0),
+            seed=train_raw.get("seed", 42),
         ),
         cache=CacheConfig(dir=str(cache_raw.get("dir", "outputs/cache"))),
         runtime=RuntimeConfig(device=str(runtime_raw.get("device", "auto")), precision=precision),

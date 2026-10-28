@@ -40,13 +40,23 @@ def _normalize_mvpruner_signature(signature: dict[str, Any]) -> dict[str, Any]:
 def architecture_signature(cfg: Any) -> dict[str, Any]:
     """Configuration identity, independent of training state and output paths."""
     model = cfg.model
+    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key != "query"}
+    if model.fusion.name == "unpruned":
+        fusion = {"fusion.name": "unpruned"}
+    elif model.fusion.name == "mvpruner_camera_query":
+        for key in ("beta_start", "beta_end", "beta_schedule", "tau"):
+            fusion.pop(f"fusion.{key}", None)
+        query = asdict(model.fusion.query)
+        query.pop("init_std")  # Initial distribution belongs to training provenance, not inference architecture.
+        fusion.update({"fusion.query": query, "fusion.query_algorithm_version": 1,
+                       "fusion.query_bank_policy": "shared_prefix",
+                       "fusion.query_bank_size": model.fusion.stage2_top_k - (len(cfg.data.view_order) - 1) * model.fusion.min_tokens_per_camera})
     return {
-        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name == "mvpruner_two_stage" else {}),
+        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name in {"mvpruner_two_stage", "mvpruner_camera_query"} else {}),
         **{f"vision.{key}": value for key, value in asdict(model.vision).items()},
         "projector.type": model.projector.type,
         **{f"text.{key}": value for key, value in asdict(model.text).items()},
-        **({"fusion.name": "unpruned"} if model.fusion.name == "unpruned" else
-           {f"fusion.{key}": value for key, value in asdict(model.fusion).items()}),
+        **fusion,
     }
 
 

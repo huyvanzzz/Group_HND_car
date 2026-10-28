@@ -343,6 +343,27 @@ class MVPrunerTwoStage(nn.Module):
             remaining = remaining + torch.log((1.0 - probability).clamp(self.eps, 1.0))
         return hard_ranked, torch.stack(slots, dim=-2)
 
+    def stage2_budgets(self, scores: torch.Tensor, camera_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        counts = torch.stack([(camera_ids == p).sum(dim=1) for p in range(self.num_views)], dim=1)
+        camera_relevance = torch.stack(
+            [
+                (scores * (camera_ids == p)).sum(dim=1) / counts[:, p].clamp_min(1)
+                for p in range(self.num_views)
+            ],
+            dim=1,
+        )
+        low = camera_relevance.min(dim=1, keepdim=True).values
+        high = camera_relevance.max(dim=1, keepdim=True).values
+        normalized = (camera_relevance - low) / (high - low).clamp_min(self.eps)
+        relevance_share = torch.softmax(normalized, dim=1)
+        first_share = counts.to(scores.dtype) / counts.sum(dim=1, keepdim=True).clamp_min(1)
+        weights = counts.to(scores.dtype) * (1.0 + relevance_share - first_share).clamp(0.0, 2.0)
+        budgets = allocate_bounded_budget(
+            weights, counts, total=self.stage2_top_k, minimum=self.min_tokens_per_camera, eps=self.eps
+        )
+
+        return budgets, camera_relevance
+
     def stage2_from_scores(
         self,
         values: torch.Tensor,
@@ -361,23 +382,7 @@ class MVPrunerTwoStage(nn.Module):
             indices = torch.arange(count, device=values.device).expand(batch, -1)
             budgets = torch.stack([(camera_ids == p).sum(1) for p in range(self.num_views)], dim=1)
             return values, indices, camera_ids, {"stage2_indices": indices, "stage2_budgets": budgets}
-        counts = torch.stack([(camera_ids == p).sum(dim=1) for p in range(self.num_views)], dim=1)
-        camera_relevance = torch.stack(
-            [
-                (scores * (camera_ids == p)).sum(dim=1) / counts[:, p].clamp_min(1)
-                for p in range(self.num_views)
-            ],
-            dim=1,
-        )
-        low = camera_relevance.min(dim=1, keepdim=True).values
-        high = camera_relevance.max(dim=1, keepdim=True).values
-        normalized = (camera_relevance - low) / (high - low).clamp_min(self.eps)
-        relevance_share = torch.softmax(normalized, dim=1)
-        first_share = counts.to(scores.dtype) / counts.sum(dim=1, keepdim=True).clamp_min(1)
-        weights = counts.to(scores.dtype) * (1.0 + relevance_share - first_share).clamp(0.0, 2.0)
-        budgets = allocate_bounded_budget(
-            weights, counts, total=self.stage2_top_k, minimum=self.min_tokens_per_camera, eps=self.eps
-        )
+        budgets, camera_relevance = self.stage2_budgets(scores, camera_ids)
 
         beta = self.current_beta() if use_training else 0.0
         camera_axis = torch.arange(self.num_views, device=values.device).view(1, self.num_views, 1)

@@ -64,3 +64,7 @@ New model instances no longer allocate the unused GPA module, so total parameter
 ```bash
 python -m pytest tests -q
 ```
+
+## Camera-query Stage 2
+
+[Hướng dẫn camera-query](docs/camera-query-stage2.md), [config riêng](configs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_query.yaml) và [notebook Kaggle hai GPU](notebooks/kaggle_train_dinov2_camera_query_finetune.ipynb) chạy finetune-only từ pretrained T5: giữ Stage 1/IRA, nén 196 thành 49 tokens, entropy weight 0.5, seed 42. Profile mới sửa accumulation/scheduler riêng và chỉ resume checkpoint camera-query tại ranh giới epoch.

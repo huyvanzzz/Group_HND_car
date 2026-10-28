@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
+from transformers.modeling_outputs import Seq2SeqLMOutput
 from torch import nn
 from torch.profiler import record_function
 
 from .multimodal import MultiModalProjector
+from .camera_query import CameraQueryFusion
 from .mvpruner import MVPrunerTwoStage
 from .t5_split_encoder import T5SplitEncoder
+
+
+@dataclass
+class CameraQueryLMOutput(Seq2SeqLMOutput):
+    answer_loss: torch.Tensor | None = None
+    entropy_loss: torch.Tensor | None = None
 
 
 def _stats(name: str, tensor: torch.Tensor) -> dict:
@@ -66,6 +76,7 @@ class EfficientVLMForAD(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         training: bool | None = None,
+        compute_entropy: bool = True,
     ):
         assert isinstance(self.visual_fusion, MVPrunerTwoStage)
         assert self.t5_split_encoder is not None
@@ -106,6 +117,7 @@ class EfficientVLMForAD(nn.Module):
             visual_camera_ids=camera_ids,
             question_mask=attention_mask,
             training=training,
+            compute_entropy=compute_entropy,
         )
         split.debug.update(stage1_debug)
         self.visual_fusion.last_debug = {
@@ -140,11 +152,30 @@ class EfficientVLMForAD(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        return self.text_model(
+        decoder_kwargs = {}
+        if labels is None and isinstance(self.visual_fusion, CameraQueryFusion):
+            decoder_kwargs["decoder_input_ids"] = torch.full(
+                (input_ids.shape[0], 1), self.text_model.config.decoder_start_token_id,
+                dtype=input_ids.dtype, device=input_ids.device)
+        output = self.text_model(
+            **decoder_kwargs,
             encoder_outputs=split.encoder_outputs,
             attention_mask=split.attention_mask,
             labels=labels,
         )
+        return self._with_auxiliary_loss(output, split)
+
+    def _with_auxiliary_loss(self, output, split):
+        if isinstance(self.visual_fusion, CameraQueryFusion):
+            answer = output.loss
+            entropy = split.auxiliary_losses.get("entropy_loss")
+            total = answer
+            if answer is not None and self.training and entropy is not None:
+                total = answer + self.visual_fusion.entropy_weight * entropy
+            fields = dict(output)
+            fields["loss"] = total
+            output = CameraQueryLMOutput(**fields, answer_loss=answer, entropy_loss=entropy)
+        return output
 
     def forward_debug(
         self,
@@ -166,24 +197,44 @@ class EfficientVLMForAD(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
+        decoder_kwargs = {}
+        if labels is None and isinstance(self.visual_fusion, CameraQueryFusion):
+            decoder_kwargs["decoder_input_ids"] = torch.full(
+                (input_ids.shape[0], 1), self.text_model.config.decoder_start_token_id,
+                dtype=input_ids.dtype, device=input_ids.device)
         output = self.text_model(
+            **decoder_kwargs,
             encoder_outputs=split.encoder_outputs,
             attention_mask=split.attention_mask,
             labels=labels,
         )
+        output = self._with_auxiliary_loss(output, split)
         report["mvpruner_encoder_output"] = _stats(
             "mvpruner_encoder_output", split.encoder_outputs.last_hidden_state
         )
         report["mvpruner_attention_mask"] = _stats("mvpruner_attention_mask", split.attention_mask)
         report["mvpruner"] = {
-            "beta": self.visual_fusion.current_beta(),
             "stage1_budgets": split.debug["stage1_budgets"].detach().cpu().tolist(),
             "stage2_budgets": split.debug["stage2_budgets"].detach().cpu().tolist(),
             "stage1_indices": split.debug["stage1_indices"].detach().cpu().tolist(),
-            "stage2_indices": split.debug["stage2_indices"].detach().cpu().tolist(),
         }
+        if isinstance(self.visual_fusion, CameraQueryFusion):
+            report["mvpruner"]["stage2_method"] = "camera_query"
+            report["mvpruner"]["query_usage"] = split.debug["query_usage"].cpu().tolist()
+            for name in ("query_camera_ids", "query_slots"):
+                report["mvpruner"][name] = split.debug[name].cpu().tolist()
+            if "output_overlap" in split.debug:
+                report["mvpruner"]["output_overlap"] = split.debug["output_overlap"]
+            for name in ("answer_loss", "entropy_loss"):
+                value = getattr(output, name)
+                report[name] = float(value.detach()) if value is not None else None
+            report["weighted_entropy_loss"] = (report["entropy_loss"] * self.visual_fusion.entropy_weight
+                                                  if report["entropy_loss"] is not None else None)
+        else:
+            report["mvpruner"]["beta"] = self.visual_fusion.current_beta()
+            report["mvpruner"]["stage2_indices"] = split.debug["stage2_indices"].detach().cpu().tolist()
         report["logits"] = _stats("logits", output.logits)
-        report["loss"] = _stats("loss", output.loss.detach().reshape(1))
+        report["loss"] = _stats("loss", output.loss.detach().reshape(1)) if output.loss is not None else None
         return report
 
     def forward(
@@ -222,6 +273,7 @@ class EfficientVLMForAD(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             training=False,
+            compute_entropy=False,
         )
         return self.text_model.generate(
             encoder_outputs=split.encoder_outputs,

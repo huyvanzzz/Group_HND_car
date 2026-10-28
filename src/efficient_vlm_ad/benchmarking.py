@@ -66,6 +66,9 @@ def summarize_component_events(events: Iterable[Any], *, iterations: int) -> dic
         "mvpruner.stage1_dra_ccts",
         "mvpruner.t5_blocks_0_1",
         "mvpruner.stage2_ira_gumbel",
+        "mvpruner.stage2_allocation",
+        "mvpruner.stage2_camera_query",
+        "mvpruner.stage2_bias_adaptation",
         "mvpruner.t5_blocks_2_3",
     }
     denominator = max(1, int(iterations))

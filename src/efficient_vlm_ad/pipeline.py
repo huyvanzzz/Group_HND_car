@@ -38,6 +38,10 @@ from .modeling.factory import build_end_to_end_vlm_model, build_vision_encoder, 
 from .modeling.multimodal import set_trainable_for_stage
 from .modeling.vision import dinov2_processor_policy
 from .modeling.mvpruner import MVPrunerTwoStage
+from .query_training import (
+    is_camera_query, seed_model, window_size, window_boundary, training_recipe,
+    validate_resume_metadata, validate_rank_sidecars,
+)
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
 from .tokenization import decode_generated_predictions, less_than_token_metadata, repair_less_than_token_after_checkpoint
@@ -135,9 +139,19 @@ def _build_accelerator(cfg: ExperimentConfig):
     except Exception:
         return _SingleProcessAccelerator(resolve_device(cfg), mixed_precision=mixed_precision)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    query_kwargs = {}
+    if is_camera_query(cfg):
+        from accelerate import DataLoaderConfiguration
+        query_kwargs = {
+            "step_scheduler_with_optimizer": False,
+            "dataloader_config": DataLoaderConfiguration(
+                use_seedable_sampler=True, data_seed=cfg.training.seed,
+            ),
+        }
     return Accelerator(
+        **query_kwargs,
         mixed_precision=mixed_precision,
-        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
+        gradient_accumulation_steps=1 if is_camera_query(cfg) else cfg.training.gradient_accumulation_steps,
         kwargs_handlers=[ddp_kwargs],
     )
 
@@ -542,6 +556,8 @@ def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
 
 
 def _build_train_model(cfg: ExperimentConfig):
+    if is_camera_query(cfg):
+        seed_model(cfg)
     if _uses_end_to_end_vision(cfg):
         vision, transform = build_vision_encoder(cfg)
         model, tokenizer = build_end_to_end_vlm_model(cfg, vision)
@@ -609,6 +625,16 @@ def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
     if mvpruner is None:
         return {}
     debug = getattr(mvpruner, "last_debug", {}) or {}
+    if hasattr(mvpruner, "compressor"):
+        fields = {
+            "stage1_budgets", "stage2_budgets", "budgets", "query_usage",
+            "query_slot_usage", "max_probability", "logit_scale", "logit_std",
+            "output_norm", "output_norms",
+        }
+        return {"camera_query": {
+            key: value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
+            for key, value in debug.items() if key in fields
+        }}
     payload: dict[str, Any] = {
         "beta": mvpruner.current_beta(),
         "beta_step": int(mvpruner.beta_step.item()),
@@ -741,6 +767,8 @@ def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Mo
 
 
 def _validate_unpruned_stage(cfg: ExperimentConfig, stage: str) -> None:
+    if is_camera_query(cfg) and stage != "finetune":
+        raise ValueError("Camera-query supports finetune only")
     if cfg.model.fusion.name == "unpruned" and stage != "finetune":
         raise ValueError("The unpruned baseline supports finetune only")
 
@@ -812,6 +840,9 @@ def train_stage(
         if cfg.model.fusion.name == "unpruned" and metadata.get("stage") != "finetune":
             raise ValueError("The unpruned baseline can resume only a finetune checkpoint")
         validate_checkpoint_signature(metadata, cfg=cfg)
+        if is_camera_query(cfg):
+            validate_resume_metadata(cfg, metadata)
+            validate_rank_sidecars(resume, metadata, accelerator.num_processes)
         if accelerator.is_main_process:
             _heartbeat(dbg, started_at, "checkpoint_metadata_done", metadata=metadata)
             _heartbeat(dbg, started_at, "checkpoint_load_start", path=resume, same_stage=metadata.get("stage") == stage)
@@ -842,9 +873,10 @@ def train_stage(
             optimizer.load_state_dict(resume_training_payload["optimizer"])
             if resume_training_payload.get("scheduler") is not None:
                 scheduler.load_state_dict(resume_training_payload["scheduler"])
-            _restore_rng_state(resume_training_payload["rng_state"])
+            if not is_camera_query(cfg):
+                _restore_rng_state(resume_training_payload["rng_state"])
             rank_manifest = Path(str(resume) + ".rng") / "manifest.json"
-            if rank_manifest.exists():
+            if rank_manifest.exists() and not is_camera_query(cfg):
                 rank_resume_payload = load_rank_rng_state(
                     resume,
                     rank=int(getattr(accelerator, "process_index", 0)),
@@ -884,16 +916,17 @@ def train_stage(
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
         step_limit=step_limit,
     )
-    _configure_mvpruner_beta(
-        model,
-        target_steps=target_mvpruner_steps,
-        reset=resume_training_payload is None,
-    )
+    if not is_camera_query(cfg):
+        _configure_mvpruner_beta(model, target_steps=target_mvpruner_steps, reset=resume_training_payload is None)
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
     if rank_resume_payload is not None:
         _restore_sampler_state(loader, rank_resume_payload.get("sampler_state"))
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "accelerator_prepare_done")
+    if is_camera_query(cfg) and resume_training_payload is not None:
+        rank_resume_payload = validate_rank_sidecars(resume, metadata, accelerator.num_processes)[accelerator.process_index]
+        _restore_rng_state(rank_resume_payload["rng_state"])
+    optimizer_step = int(resume_training_payload.get("metadata", {}).get("optimizer_step", 0)) if resume_training_payload else 0
     global_step = start_step
     model.train()
     latest_ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"{stage}_latest.pt"
@@ -907,7 +940,12 @@ def train_stage(
         epoch_loss = 0.0
         epoch_batches = 0
         epoch_started_at = time.perf_counter()
-        loader_iter = iter(loader)
+        if is_camera_query(cfg):
+            if hasattr(loader, "set_epoch"):
+                loader.set_epoch(epoch)
+            elif hasattr(loader.sampler, "generator"):
+                loader.sampler.generator = torch.Generator().manual_seed(cfg.training.seed + epoch)
+        loader_iter = iter(loader) if step_limit is not None or not is_camera_query(cfg) else None
         bar_source = range(step_limit) if step_limit is not None else loader
         bar_total = step_limit if step_limit is not None else len(loader)
         if accelerator.is_main_process:
@@ -943,7 +981,8 @@ def train_stage(
             with accelerator.autocast():
                 output = model(**_batch_model_inputs(batch, cfg), target_optimizer_steps=target_mvpruner_steps)
                 raw_loss = output.loss
-                loss = raw_loss / cfg.training.gradient_accumulation_steps
+                divisor = window_size(epoch_batches, bar_total, cfg.training.gradient_accumulation_steps) if is_camera_query(cfg) else cfg.training.gradient_accumulation_steps
+                loss = raw_loss / divisor
             if not torch.isfinite(raw_loss.detach()).item():
                 if accelerator.is_main_process:
                     progress_writer.write(
@@ -982,6 +1021,19 @@ def train_stage(
                 raise FloatingPointError(f"Non-finite loss at step {global_step}: {raw_loss.detach().cpu().item()}")
             accelerator.backward(loss)
             loss_value = float(raw_loss.detach().cpu().item())
+            query_losses = {}
+            if is_camera_query(cfg):
+                names = ("answer_loss", "entropy_loss", "total_loss")
+                values = torch.stack([
+                    output.answer_loss.detach().float(),
+                    output.entropy_loss.detach().float(),
+                    raw_loss.detach().float(),
+                ])
+                if hasattr(accelerator, "reduce"):
+                    values = accelerator.reduce(values, reduction="mean")
+                query_losses = dict(zip(names, values.cpu().tolist()))
+                query_losses["weighted_entropy"] = query_losses["entropy_loss"] * cfg.training.entropy_weight
+                loss_value = query_losses["total_loss"]
             epoch_loss += loss_value
             epoch_batches += 1
             if debug and accelerator.is_main_process and global_step < start_step + dbg.samples:
@@ -989,6 +1041,7 @@ def train_stage(
                     "step": global_step,
                     "epoch": epoch_number,
                     "loss": loss_value,
+                    **query_losses,
                     "finite_loss": bool(torch.isfinite(raw_loss.detach()).item()),
                     "lr": _optimizer_lr(optimizer),
                 }
@@ -1000,11 +1053,15 @@ def train_stage(
                     "TRAIN",
                     train_payload,
                 )
-            if (global_step + 1) % cfg.training.gradient_accumulation_steps == 0:
+            if (window_boundary(epoch_batches - 1, bar_total, cfg.training.gradient_accumulation_steps) if is_camera_query(cfg) else (global_step + 1) % cfg.training.gradient_accumulation_steps == 0):
                 if cfg.training.max_grad_norm is not None:
                     accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
                 optimizer.step()
-                _step_mvpruner_beta(accelerator.unwrap_model(model))
+                if is_camera_query(cfg):
+                    if not getattr(accelerator, "optimizer_step_was_skipped", False):
+                        optimizer_step += 1
+                else:
+                    _step_mvpruner_beta(accelerator.unwrap_model(model))
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
             if accelerator.is_main_process and (
@@ -1021,6 +1078,7 @@ def train_stage(
                     step_in_epoch=epoch_batches,
                     total_steps_epoch=bar_total,
                     loss=loss_value,
+                    **query_losses,
                     lr=_optimizer_lr(optimizer),
                     finite_loss=True,
                     elapsed_seconds=round(elapsed, 3),
@@ -1032,7 +1090,7 @@ def train_stage(
                 bar.set_postfix(loss=f"{loss_value:.4f}", lr=_optimizer_lr(optimizer), global_step=global_step)
         if epoch_batches == 0:
             raise ValueError("Training dataloader was empty")
-        if global_step % cfg.training.gradient_accumulation_steps != 0:
+        if not is_camera_query(cfg) and global_step % cfg.training.gradient_accumulation_steps != 0:
             if cfg.training.max_grad_norm is not None:
                 accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
             optimizer.step()
@@ -1121,8 +1179,11 @@ def train_stage(
                     "less_than_token": less_than_token_metadata(tokenizer),
                 },
             }
+            if is_camera_query(cfg):
+                metadata.update(training_recipe(cfg))
+                metadata.update(optimizer_step=optimizer_step, epoch_boundary=(epoch_batches == len(loader)))
             mvpruner = _mvpruner_module(unwrapped)
-            if mvpruner is not None:
+            if mvpruner is not None and not is_camera_query(cfg):
                 metadata["mvpruner"] = {
                     "stage1_top_k": mvpruner.stage1_top_k,
                     "stage2_top_k": mvpruner.stage2_top_k,
@@ -1209,8 +1270,8 @@ def train_stage(
             world_size=world_size,
             epoch=epoch_number,
             batch_cursor=epoch_batches,
-            optimizer_step=int(_mvpruner_module(accelerator.unwrap_model(model)).beta_step.item())
-            if _mvpruner_module(accelerator.unwrap_model(model)) is not None
+            optimizer_step=optimizer_step if is_camera_query(cfg) else int(_mvpruner_module(accelerator.unwrap_model(model)).beta_step.item())
+            if is_camera_query(cfg) or _mvpruner_module(accelerator.unwrap_model(model)) is not None
             else global_step,
             sampler_state=_sampler_state(loader),
         )
@@ -1221,8 +1282,8 @@ def train_stage(
                 world_size=world_size,
                 epoch=epoch_number,
                 batch_cursor=epoch_batches,
-                optimizer_step=int(_mvpruner_module(accelerator.unwrap_model(model)).beta_step.item())
-                if _mvpruner_module(accelerator.unwrap_model(model)) is not None
+                optimizer_step=optimizer_step if is_camera_query(cfg) else int(_mvpruner_module(accelerator.unwrap_model(model)).beta_step.item())
+                if is_camera_query(cfg) or _mvpruner_module(accelerator.unwrap_model(model)) is not None
                 else global_step,
                 sampler_state=_sampler_state(loader),
             )
@@ -1293,6 +1354,9 @@ def diagnose_train(
         begin = time.perf_counter()
         checkpoint_metadata = read_checkpoint_metadata(resume, map_location="cpu")
         validate_checkpoint_signature(checkpoint_metadata, cfg=cfg)
+        if is_camera_query(cfg):
+            validate_resume_metadata(cfg, checkpoint_metadata)
+            validate_rank_sidecars(resume, checkpoint_metadata, accelerator.num_processes)
         checkpoint_metadata = _strict_load_model_from_checkpoint(resume, model, device)
         repair_less_than_token_after_checkpoint(tokenizer, model, checkpoint_metadata)
         mark("checkpoint_metadata", begin)
@@ -1583,6 +1647,9 @@ def verify_resume_checkpoint(
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     metadata = dict(payload.get("metadata", {}))
     checkpoint_stage = metadata.get("stage")
+    if is_camera_query(cfg):
+        validate_resume_metadata(cfg, metadata)
+        validate_rank_sidecars(checkpoint_path, metadata)
     if checkpoint_stage != stage:
         raise ValueError(f"metadata.stage must match --stage, got metadata.stage={checkpoint_stage!r}, --stage={stage!r}")
 
@@ -1718,6 +1785,7 @@ def verify_resume_checkpoint(
         "resume_forward_loss": float(raw_loss.detach().cpu().item()),
         "resume_forward_loss_finite": loss_finite,
         "one_step_resume_probe_ok": True,
+        **({"probe_scope": "single_process_optimizer_probe", "ddp_replay_verified": False, "rank_sidecars_validated": True} if is_camera_query(cfg) else {}),
         "post_step_t5_tying": post_step_t5_report,
         "post_step_trainable_finite": finite_report,
         "numerics": numerics,

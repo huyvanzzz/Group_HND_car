@@ -31,8 +31,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    if cfg.model.fusion.name != "mvpruner_two_stage":
-        raise ValueError("component benchmark requires fusion.name=mvpruner_two_stage")
+    if cfg.model.fusion.name not in {"mvpruner_two_stage", "mvpruner_camera_query"}:
+        raise ValueError("component benchmark requires an MVPruner or camera-query fusion")
     device = resolve_device(cfg)
     model, tokenizer, transform = _build_train_model(cfg)
     model.to(device)
@@ -64,6 +64,7 @@ def main() -> None:
         torch.cuda.synchronize(device)
 
     summary = {
+        "fusion": cfg.model.fusion.name,
         "mode": args.mode,
         "warmup": args.warmup,
         "iterations": args.iterations,

@@ -21,9 +21,14 @@ def prefill_supported(model) -> bool:
 
 
 def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> dict[str, Any]:
+    query_fusion = getattr(model, 'visual_fusion', None)
+    camera_query = hasattr(query_fusion, 'compressor')
     return {
         'status': 'supported' if prefill_supported(model) else 'unsupported_synthetic',
-        'scope': 'feature embeddings/fusion/projector/pruning + T5 encoder + first decoder forward including LM head',
+        'scope': ('feature embeddings/fusion/projector/query compression + T5 encoder + first decoder forward including LM head'
+                  if camera_query else 'feature embeddings/fusion/projector/pruning + T5 encoder + first decoder forward including LM head'),
+        **({'token_reduction': {'name': 'camera_query', 'visual_tokens': query_fusion.stage2_top_k}}
+           if camera_query else {}),
         'excluded_from_scope': ['data loading', 'host-to-device transfer', 'vision extraction',
                                 'subsequent decoding', 'token/beam selection', 'text postprocessing'],
         'flops_method': 'torch.utils.flop_counter.FlopCounterMode; estimated supported major operators',

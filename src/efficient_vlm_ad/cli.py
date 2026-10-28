@@ -233,6 +233,12 @@ def config_debug_payload(cfg) -> dict:
         "text": cfg.model.text.model_id,
         "cache_dir": cfg.cache.dir,
         "runtime": {"device": cfg.runtime.device, "precision": cfg.runtime.precision},
+        **({"camera_query": {
+            "query_dim": cfg.model.fusion.query.dim,
+            "position_policy": cfg.model.fusion.query.position_policy,
+            "entropy_weight": cfg.training.entropy_weight,
+            "seed": cfg.training.seed,
+        }} if cfg.model.fusion.name == "mvpruner_camera_query" else {}),
     }
 
 

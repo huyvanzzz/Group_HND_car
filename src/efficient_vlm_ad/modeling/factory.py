@@ -188,6 +188,18 @@ def build_vision_encoder(cfg):
 
 
 def build_visual_fusion(cfg):
+    if cfg.model.fusion.name == "mvpruner_camera_query":
+        from .camera_query import CameraQueryFusion
+        query = cfg.model.fusion.query
+        return CameraQueryFusion(
+            d_model=cfg.model.text.d_model, vision_dim=cfg.model.vision.output_dim,
+            num_views=len(cfg.data.view_order), tokens_per_view=cfg.model.vision.seq_len,
+            stage1_top_k=cfg.model.fusion.stage1_top_k, stage2_top_k=cfg.model.fusion.stage2_top_k,
+            min_tokens_per_camera=cfg.model.fusion.min_tokens_per_camera,
+            relevance_mode=cfg.model.fusion.stage1_relevance_mode, eps=cfg.model.fusion.eps,
+            query_dim=query.dim, query_init_std=query.init_std, query_rms_eps=query.rms_eps,
+            entropy_weight=cfg.training.entropy_weight,
+        )
     if cfg.model.fusion.name == "mvpruner_two_stage":
         return MVPrunerTwoStage(
             d_model=cfg.model.text.d_model,
