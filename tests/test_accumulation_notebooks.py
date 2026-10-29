@@ -27,9 +27,10 @@ def test_accumulation_runtime_is_fresh_and_keeps_cache_and_profile(profile, tmp_
     namespace = dict(Path=Path, os=os, json=json, load_config=load_config, GRADIENT_CHECKPOINTING=False)
     exec(compile(snippet, '<runtime>', 'exec'), namespace)
     raw = yaml.safe_load(runtime.read_text())
-    assert raw['project']['output_dir'] == original['project']['output_dir'] + '_accumulation_v2'
+    assert raw['project']['output_dir'] == original['project']['output_dir']
     assert os.environ['PROFILE'] == raw['project']['output_dir']
     assert raw['cache'] == original['cache']
+    assert Path(raw['cache']['dir']) == Path(raw['project']['output_dir']) / 'cache'
     assert raw['model'] == original['model']
     assert raw['training']['gradient_accumulation_steps'] == 2
     assert tracked.read_bytes() == config.read_bytes()

@@ -14,7 +14,7 @@ DDP vẫn đồng bộ gradient sau từng microbatch như trước; thay đổi
 
 ## Chạy mới và resume
 
-Mỗi notebook tạo runtime YAML riêng, nối `_accumulation_v2` vào output_dir của profile gốc và đặt `PROFILE` theo output_dir đó. Ví dụ camera-query ghi vào `outputs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_query_accumulation_v2`. Bốn profile giữ danh tính fusion/model riêng và nguyên đường dẫn cache đã cấu hình.
+Mỗi notebook tạo runtime YAML riêng và giữ nguyên output_dir của profile gốc, không thêm hậu tố. Ví dụ camera-query dùng `outputs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_query/`, bên trong có `cache/`, `prepared_data/`, `debug/` và `checkpoints/`. Mỗi profile có đúng một folder run; tên và danh tính fusion/model giữ nguyên.
 
 `RESUME_TRAINING = False` là mặc định. Notebook bắt đầu từ pretrained T5 và khởi tạo mới các module multimodal; không tự chọn checkpoint local hoặc tải checkpoint Hugging Face để tiếp tục. Nếu thư mục checkpoints mới đã có bất kỳ nội dung nào, notebook dừng và yêu cầu chọn output mới hoặc bật resume rõ ràng. Không xóa hay ghi đè checkpoint cũ để chạy lại.
 
@@ -22,7 +22,7 @@ Khi đặt `RESUME_TRAINING = True`, luồng resume chọn local latest, tệp l
 
 ## Tái sử dụng dữ liệu
 
-Runtime mới có thể sao chép `prepared_data` từ output gốc khi thư mục prepared mới chưa tồn tại. Sau đó vẫn kiểm tra full subset, số dòng từng split và expected_counts như trước. Cache DINO không đổi tên, không đổi fingerprint và không nới điều kiện tương thích: manifest v2, processor identity, shape `[N,6,64,384]`, index, dung lượng memmap và camera keys vẫn được kiểm tra chính xác. Khi thiếu cache, luồng chuẩn bị raw images rồi trích xuất feature giữ nguyên.
+Prepared data và cache đều nằm trong folder profile gốc. Vẫn kiểm tra full subset, số dòng từng split và expected_counts như trước. Cache DINO không đổi tên, không đổi fingerprint và không nới điều kiện tương thích: manifest v2, processor identity, shape `[N,6,64,384]`, index, dung lượng memmap và camera keys vẫn được kiểm tra chính xác. Khi thiếu cache, luồng chuẩn bị raw images rồi trích xuất feature giữ nguyên.
 
 Các kiểm thử CPU kiểm tra hợp đồng runtime và shell guard, cú pháp notebook, phép chuẩn hóa accumulation và metadata resume. Chúng không thay thế phép đo chất lượng, bộ nhớ hoặc tốc độ trên Kaggle hai GPU.
 
