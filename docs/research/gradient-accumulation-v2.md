@@ -28,7 +28,15 @@ Các kiểm thử CPU kiểm tra hợp đồng runtime và shell guard, cú phá
 
 ## Kết quả xác minh ngày 2026-10-30
 
-Toàn bộ repository: **542 passed, 3 skipped** trong 603.76 giây khi chạy `python -m pytest -q` với `PYTHONPATH=src`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`. Ba test bị skip do môi trường không hỗ trợ symlink hoặc không có CUDA.
+### Cell kiểm tra gradient trên Kaggle
+
+Notebook MVPruner có một cell ngay sau diagnose và trước train, chạy `python -m efficient_vlm_ad.accumulation_debug --config "$CONFIG"`. Cell dùng model và các batch thật từ cache theo config runtime, so gradient của backend với reference trung bình raw loss cho cả cửa sổ đủ A và cửa sổ dư một microbatch. Hai lượt replay cùng RNG để dropout/Gumbel không làm lệch phép so; không có optimizer step, clipping hoặc thay đổi checkpoint.
+
+Kết quả mong đợi là `PASS`, `gradient_norm_ratio` gần 1 và sai số nhỏ trong ngưỡng `rtol=1e-4`, `atol=1e-6`. Với A=2, nếu bị chia thêm một lần thì tỉ lệ norm khoảng 0.5 và cell báo `FAIL` bằng exit code khác 0. Trường hợp gradient reference toàn bằng 0 cũng không được coi là xác minh thành công. Báo cáo nằm trong `debug/gradient_accumulation_verify.json` và event `ACCUMULATION_VERIFY` của `debug_events.jsonl` trong output profile.
+
+Đây là kiểm tra một process ở FP32, dùng một model và lưu gradient reference trên CPU; không xác minh DDP hai GPU hoặc nhịp optimizer bằng phép so này. Vòng cập nhật, clipping, skipped step và DDP được kiểm tra riêng trong suite. Cell có thêm chi phí forward/backward và bộ nhớ CPU, chỉ dùng để debug trước training.
+
+Trước khi bổ sung cell debug, toàn bộ repository đạt **542 passed, 3 skipped** trong 603.76 giây khi chạy `python -m pytest -q` với `PYTHONPATH=src`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`. Ba test bị skip do môi trường không hỗ trợ symlink hoặc không có CUDA. Sau khi thêm cell, **122 test liên quan pass**, bao gồm kiểm tra numeric debug mới, các regression accumulation/lifecycle và notebook. Kiểm tra âm xác nhận chia thừa làm tỉ lệ norm còn 0.5 và lệnh debug trả exit code lỗi.
 
 Kiểm thử bao phủ A=1/2/4, cửa sổ đủ/dư/ngắn hơn A, nhiều epoch, debug giới hạn lẻ và lặp loader; so gradient trước clipping và trọng số sau cập nhật với reference. Cả bốn profile đã chạy qua Accelerate thật và fallback. DDP hai tiến trình CPU kiểm tra đồng bộ từng microbatch, nhóm dư, reference trung bình trên hai rank và trọng số cuối giống nhau. Lifecycle CLI, resume phiên bản mới, từ chối recipe cũ/sai, counter khi skipped update và bảo toàn checkpoint cũ đều được kiểm tra.
 
