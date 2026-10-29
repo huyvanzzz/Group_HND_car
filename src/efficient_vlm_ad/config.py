@@ -107,6 +107,23 @@ class CameraQueryConfig:
 
 
 @dataclass(frozen=True)
+class QuestionScoringConfig:
+    num_heads: int = 4
+    hidden_dim: int = 64
+    gamma: float = 0.1
+    rms_eps: float = 1e-6
+
+    def __post_init__(self) -> None:
+        for name in ("num_heads", "hidden_dim"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"fusion.question_scoring.{name} must be a positive integer")
+        for name in ("gamma", "rms_eps"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 or (name == "rms_eps" and value == 0):
+                raise ValueError(f"invalid fusion.question_scoring.{name}")
+
+
+@dataclass(frozen=True)
 class FusionConfig:
     name: str = "mvpruner_two_stage"
     eps: float = 1e-8
@@ -120,15 +137,25 @@ class FusionConfig:
     beta_schedule: str = "linear"
     tau: float = 1.0
     query: CameraQueryConfig | None = None
+    question_scoring: QuestionScoringConfig | None = None
 
     def __post_init__(self) -> None:
-        if self.name == "mvpruner_camera_query":
+        if self.name in {"mvpruner_camera_query", "mvpruner_camera_query_qaware"}:
             if self.query is None:
                 object.__setattr__(self, "query", CameraQueryConfig())
             elif not isinstance(self.query, CameraQueryConfig):
                 raise ValueError("fusion.query must be a CameraQueryConfig")
         elif self.query is not None:
             raise ValueError("fusion.query is supported only by mvpruner_camera_query")
+        if self.name == "mvpruner_camera_query_qaware":
+            if self.question_scoring is None:
+                object.__setattr__(self, "question_scoring", QuestionScoringConfig())
+            elif not isinstance(self.question_scoring, QuestionScoringConfig):
+                raise ValueError("fusion.question_scoring must be a QuestionScoringConfig")
+            if not all(math.isfinite(v) for v in (self.beta_start, self.beta_end, self.tau)) or not self.beta_start >= self.beta_end >= 0 or self.tau != 1.0 or self.beta_schedule != "linear":
+                raise ValueError("question-aware allocation requires finite beta_start >= beta_end >= 0, linear beta and tau=1")
+        elif self.question_scoring is not None:
+            raise ValueError("fusion.question_scoring is supported only by mvpruner_camera_query_qaware")
 
 
 @dataclass(frozen=True)
@@ -169,6 +196,7 @@ class TrainingConfig:
     gradient_checkpointing: bool = False
     entropy_weight: float = 0.0
     seed: int = 42
+    beta_decay_updates: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.gradient_checkpointing, bool):
@@ -177,6 +205,8 @@ class TrainingConfig:
             raise ValueError("training.entropy_weight must be finite and nonnegative")
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("training.seed must be a nonnegative integer")
+        if self.beta_decay_updates is not None and (type(self.beta_decay_updates) is not int or self.beta_decay_updates < 1):
+            raise ValueError("training.beta_decay_updates must be null or a positive integer")
 
     @property
     def effective_batch_size(self) -> int:
@@ -206,9 +236,13 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     def __post_init__(self) -> None:
-        if self.model.fusion.name != "mvpruner_camera_query":
+        if self.training.beta_decay_updates is not None and self.model.fusion.name != "mvpruner_camera_query_qaware":
+            raise ValueError("training.beta_decay_updates is supported only by mvpruner_camera_query_qaware")
+        if self.model.fusion.name not in {"mvpruner_camera_query", "mvpruner_camera_query_qaware"}:
             return
         fusion = self.model.fusion
+        if fusion.question_scoring is not None and self.model.text.d_model % fusion.question_scoring.num_heads:
+            raise ValueError("text.d_model must be divisible by question_scoring.num_heads")
         total = len(self.data.view_order) * self.model.vision.seq_len
         if fusion.min_tokens_per_camera < 1 or not (len(self.data.view_order) * fusion.min_tokens_per_camera <= fusion.stage2_top_k <= fusion.stage1_top_k <= total):
             raise ValueError("camera query budgets must satisfy views*minimum <= stage2_top_k <= stage1_top_k <= total")
@@ -263,7 +297,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if adapter_name != "none":
         raise ValueError("mvpruner_two_stage requires model.adapter.name=none; adapters are no longer supported")
     fusion_name = str(fusion_raw.get("name", ""))
-    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query"}:
+    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware"}:
         raise ValueError("model.fusion.name must be mvpruner_two_stage, mvpruner_camera_query or unpruned")
     if fusion_name == "unpruned" and vision_training != "feature_cache":
         raise ValueError("unpruned currently requires feature_cache vision training")
@@ -282,7 +316,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     tau = float(fusion_raw.get("tau", 1.0))
     query_raw = fusion_raw.get("query")
     query = None
-    if fusion_name == "mvpruner_camera_query":
+    if fusion_name in {"mvpruner_camera_query", "mvpruner_camera_query_qaware"}:
         if query_raw is not None and not isinstance(query_raw, dict):
             raise ValueError("fusion.query must be a mapping")
         try:
@@ -291,6 +325,17 @@ def load_config(path: str | Path) -> ExperimentConfig:
             raise ValueError(f"Invalid fusion.query: {exc}") from exc
     elif query_raw is not None:
         raise ValueError("fusion.query is supported only by mvpruner_camera_query")
+    question_scoring = None
+    scoring_raw = fusion_raw.get("question_scoring")
+    if fusion_name == "mvpruner_camera_query_qaware":
+        if scoring_raw is not None and not isinstance(scoring_raw, dict):
+            raise ValueError("fusion.question_scoring must be a mapping")
+        try:
+            question_scoring = QuestionScoringConfig(**(scoring_raw or {}))
+        except TypeError as exc:
+            raise ValueError(f"Invalid fusion.question_scoring: {exc}") from exc
+    elif scoring_raw is not None:
+        raise ValueError("fusion.question_scoring is supported only by mvpruner_camera_query_qaware")
     if fusion_name == "mvpruner_two_stage":
         total_visual = len(view_order) * int(_require(vision_raw, "seq_len"))
         if not (len(view_order) * minimum_per_camera <= stage2_top_k <= stage1_top_k <= total_visual):
@@ -350,6 +395,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 beta_schedule=beta_schedule,
                 tau=tau,
                 query=query,
+                question_scoring=question_scoring,
             ),
         ),
         training=TrainingConfig(
@@ -374,8 +420,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             pin_memory=bool(train_raw.get("pin_memory", False)),
             progress_log_every_steps=int(train_raw.get("progress_log_every_steps", 50)),
             vision_training=vision_training,
-            entropy_weight=train_raw.get("entropy_weight", 0.5 if fusion_name == "mvpruner_camera_query" else 0.0),
+            entropy_weight=train_raw.get("entropy_weight", 0.5 if fusion_name in {"mvpruner_camera_query", "mvpruner_camera_query_qaware"} else 0.0),
             seed=train_raw.get("seed", 42),
+            beta_decay_updates=train_raw.get("beta_decay_updates"),
         ),
         cache=CacheConfig(dir=str(cache_raw.get("dir", "outputs/cache"))),
         runtime=RuntimeConfig(device=str(runtime_raw.get("device", "auto")), precision=precision),

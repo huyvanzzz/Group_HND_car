@@ -40,10 +40,10 @@ def _normalize_mvpruner_signature(signature: dict[str, Any]) -> dict[str, Any]:
 def architecture_signature(cfg: Any) -> dict[str, Any]:
     """Configuration identity, independent of training state and output paths."""
     model = cfg.model
-    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key != "query"}
+    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key not in {"query", "question_scoring"}}
     if model.fusion.name == "unpruned":
         fusion = {"fusion.name": "unpruned"}
-    elif model.fusion.name == "mvpruner_camera_query":
+    elif model.fusion.name in {"mvpruner_camera_query", "mvpruner_camera_query_qaware"}:
         for key in ("beta_start", "beta_end", "beta_schedule", "tau"):
             fusion.pop(f"fusion.{key}", None)
         query = asdict(model.fusion.query)
@@ -51,8 +51,11 @@ def architecture_signature(cfg: Any) -> dict[str, Any]:
         fusion.update({"fusion.query": query, "fusion.query_algorithm_version": 1,
                        "fusion.query_bank_policy": "shared_prefix",
                        "fusion.query_bank_size": model.fusion.stage2_top_k - (len(cfg.data.view_order) - 1) * model.fusion.min_tokens_per_camera})
+        if model.fusion.name == "mvpruner_camera_query_qaware":
+            fusion.update({"fusion.question_scoring": asdict(model.fusion.question_scoring),
+                           "fusion.allocation_algorithm": "qaware_prefix_dp_v1"})
     return {
-        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name in {"mvpruner_two_stage", "mvpruner_camera_query"} else {}),
+        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name in {"mvpruner_two_stage", "mvpruner_camera_query", "mvpruner_camera_query_qaware"} else {}),
         **{f"vision.{key}": value for key, value in asdict(model.vision).items()},
         "projector.type": model.projector.type,
         **{f"text.{key}": value for key, value in asdict(model.text).items()},

@@ -238,7 +238,14 @@ def config_debug_payload(cfg) -> dict:
             "position_policy": cfg.model.fusion.query.position_policy,
             "entropy_weight": cfg.training.entropy_weight,
             "seed": cfg.training.seed,
-        }} if cfg.model.fusion.name == "mvpruner_camera_query" else {}),
+            **({"question_scoring": {
+                "num_heads": cfg.model.fusion.question_scoring.num_heads,
+                "hidden_dim": cfg.model.fusion.question_scoring.hidden_dim,
+                "gamma": cfg.model.fusion.question_scoring.gamma,
+                "rms_eps": cfg.model.fusion.question_scoring.rms_eps,
+            }, "beta_decay_updates": cfg.training.beta_decay_updates}
+               if cfg.model.fusion.name == "mvpruner_camera_query_qaware" else {}),
+        }} if cfg.model.fusion.name in {"mvpruner_camera_query", "mvpruner_camera_query_qaware"} else {}),
     }
 
 

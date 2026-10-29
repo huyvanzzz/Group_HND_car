@@ -72,6 +72,7 @@ class CameraQueryCompressor(nn.Module):
         *,
         compute_entropy: bool = True,
         capture_diagnostics: bool = False,
+        score_bias: torch.Tensor | None = None,
     ) -> CameraQueryResult:
         if (
             values.ndim != 3
@@ -131,6 +132,10 @@ class CameraQueryCompressor(nn.Module):
             logits = torch.matmul(queries, keys.transpose(1, 2)) / math.sqrt(
                 self.query_dim
             )
+            if score_bias is not None:
+                if score_bias.shape != values.shape[:2] or not bool(torch.isfinite(score_bias).all()):
+                    raise ValueError("score_bias must be finite [B,N]")
+                logits = logits + score_bias.float().unsqueeze(1)
             probabilities = torch.softmax(logits.masked_fill(~valid, -torch.inf), -1)
             if not bool(torch.isfinite(probabilities).all()):
                 raise FloatingPointError("camera-query probabilities must be finite")

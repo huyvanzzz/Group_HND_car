@@ -68,6 +68,10 @@ def summarize_component_events(events: Iterable[Any], *, iterations: int) -> dic
         "mvpruner.stage2_ira_gumbel",
         "mvpruner.stage2_allocation",
         "mvpruner.stage2_camera_query",
+        "mvpruner.stage2_question_scoring",
+        "mvpruner.stage2_prefix_hard_dp",
+        "mvpruner.stage2_prefix_soft_dp",
+        "mvpruner.stage2_candidate_pool",
         "mvpruner.stage2_bias_adaptation",
         "mvpruner.t5_blocks_2_3",
     }

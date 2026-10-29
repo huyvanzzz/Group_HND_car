@@ -8,6 +8,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from .camera_query import CameraQueryFusion
+from .question_camera_query import QuestionAwareCameraQueryFusion
 from .mvpruner import MVPrunerTwoStage, gather_position_bias, validate_attention_numerics
 
 
@@ -146,6 +147,7 @@ class T5SplitEncoder(nn.Module):
         compute_entropy: bool = True,
     ) -> SplitEncoderResult:
         use_training = self.training if training is None else bool(training)
+        is_qaware = isinstance(self.pruner, QuestionAwareCameraQueryFusion)
         batch, sequence, _ = inputs_embeds.shape
         if sequence != visual_count + question_mask.shape[1]:
             raise ValueError("inputs_embeds length must equal visual_count + question length")
@@ -158,8 +160,10 @@ class T5SplitEncoder(nn.Module):
             hidden, position_bias = self._run_block(
                 self.encoder.block[0], hidden, extended_mask, position_bias, cache_position
             )
-            pre_dropout = self._pre_dropout_attention(self.encoder.block[1], hidden, position_bias, attention_mask)
-            self.pruner.capture_tensor("attention", pre_dropout)
+            pre_dropout = None
+            if not is_qaware:
+                pre_dropout = self._pre_dropout_attention(self.encoder.block[1], hidden, position_bias, attention_mask)
+                self.pruner.capture_tensor("attention", pre_dropout)
             hidden, position_bias = self._run_block(
                 self.encoder.block[1], hidden, extended_mask, position_bias, cache_position
             )
@@ -169,10 +173,15 @@ class T5SplitEncoder(nn.Module):
         if is_query:
             if getattr(self.encoder, "gradient_checkpointing", False):
                 raise ValueError("camera-query gradient checkpointing is not supported")
-            with record_function("mvpruner.stage2_allocation"):
-                scores = self._visual_relevance(pre_dropout, visual_count=visual_count, question_mask=question_mask)
-            compression = self.pruner.compress_from_scores(hidden[:, :visual_count], scores, visual_camera_ids,
-                                                          compute_entropy=compute_entropy)
+            if is_qaware:
+                compression = self.pruner.compress_from_question(
+                    hidden[:, :visual_count], hidden[:, visual_count:], question_mask,
+                    visual_camera_ids, training=use_training, compute_entropy=compute_entropy)
+            else:
+                with record_function("mvpruner.stage2_allocation"):
+                    scores = self._visual_relevance(pre_dropout, visual_count=visual_count, question_mask=question_mask)
+                compression = self.pruner.compress_from_scores(hidden[:, :visual_count], scores, visual_camera_ids,
+                                                              compute_entropy=compute_entropy)
             selected_cameras = compression.visual_camera_ids
             stage2_debug = compression.debug
             if compression.entropy_loss is not None:
@@ -211,11 +220,11 @@ class T5SplitEncoder(nn.Module):
         from transformers.modeling_outputs import BaseModelOutput
 
         debug = {
-            "pre_dropout_attention": pre_dropout,
-            "visual_relevance": scores,
             "position_bias": pruned_position_bias,
             **stage2_debug,
         }
+        if not is_qaware:
+            debug.update(pre_dropout_attention=pre_dropout, visual_relevance=scores)
         if not is_query:
             debug.update(stage2_indices=selected_indices, retained_indices=retained_indices)
         return SplitEncoderResult(

@@ -34,7 +34,7 @@ def test_signature_contains_exact_architecture_and_ignores_training_settings():
         },
         "projector.type": "linear", "text.model_id": cfg.model.text.model_id,
         "text.revision": cfg.model.text.revision, "text.d_model": cfg.model.text.d_model,
-        **{f"fusion.{key}": value for key, value in asdict(cfg.model.fusion).items() if key != "query"},
+        **{f"fusion.{key}": value for key, value in asdict(cfg.model.fusion).items() if key not in {"query", "question_scoring"}},
         "mvpruner.stage1_algorithm_version": 2,
     }
     changed = replace(cfg, training=replace(cfg.training, learning_rate=0.123))

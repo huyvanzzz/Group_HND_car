@@ -4,7 +4,7 @@ import json
 import platform
 import shutil
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ from .prefill_benchmarking import (
 from .cache import FeatureCacheManifest, create_memmap, dinov2_manifest_fields, validate_manifest
 from .checkpointing import (
     _restore_rng_state,
+    _rng_state,
     checkpoint_model_state,
     load_checkpoint,
     load_rank_rng_state,
@@ -39,7 +40,7 @@ from .modeling.multimodal import set_trainable_for_stage
 from .modeling.vision import dinov2_processor_policy
 from .modeling.mvpruner import MVPrunerTwoStage
 from .query_training import (
-    is_camera_query, seed_model, window_size, window_boundary, training_recipe,
+    is_camera_query, is_question_aware_camera_query, qaware_beta_horizon, seed_model, window_size, window_boundary, training_recipe,
     validate_resume_metadata, validate_rank_sidecars,
 )
 from .progress import progress, progress_bar
@@ -595,6 +596,15 @@ def _batch_model_inputs(batch: dict[str, Any], cfg: ExperimentConfig) -> dict[st
     return inputs
 
 
+@contextmanager
+def _preserve_rng():
+    state = _rng_state()
+    try:
+        yield
+    finally:
+        _restore_rng_state(state)
+
+
 def _mvpruner_module(model: torch.nn.Module) -> MVPrunerTwoStage | None:
     fusion = getattr(model, "visual_fusion", None)
     return fusion if isinstance(fusion, MVPrunerTwoStage) else None
@@ -620,6 +630,24 @@ def _step_mvpruner_beta(model: torch.nn.Module) -> None:
         mvpruner.step_beta()
 
 
+def _configure_qaware_beta(fusion, cfg, prepared_batches, metadata=None):
+    if metadata is not None:
+        for key in ('beta_step', 'beta_target_steps'):
+            if int(getattr(fusion, key).item()) != metadata[key]:
+                raise ValueError(f'Question-aware checkpoint beta buffer disagrees with metadata: {key}')
+    horizon = qaware_beta_horizon(cfg, prepared_batches, stored_horizon=metadata['beta_target_steps'] if metadata else None)
+    fusion.configure_beta(horizon, reset=metadata is None)
+    return horizon
+
+
+def _advance_query_update(cfg, fusion, optimizer_step, *, skipped):
+    if skipped:
+        return optimizer_step
+    if is_question_aware_camera_query(cfg):
+        fusion.step_beta()
+    return optimizer_step + 1
+
+
 def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
     mvpruner = _mvpruner_module(model)
     if mvpruner is None:
@@ -630,6 +658,8 @@ def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
             "stage1_budgets", "stage2_budgets", "budgets", "query_usage",
             "query_slot_usage", "max_probability", "logit_scale", "logit_std",
             "output_norm", "output_norms",
+            "camera_shares", "expected_budgets", "soft_row_mass_error",
+            "beta", "tau", "gamma", "score_std", "alpha_entropy",
         }
         return {"camera_query": {
             key: value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
@@ -919,6 +949,12 @@ def train_stage(
     if not is_camera_query(cfg):
         _configure_mvpruner_beta(model, target_steps=target_mvpruner_steps, reset=resume_training_payload is None)
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    if is_question_aware_camera_query(cfg):
+        target_mvpruner_steps = _configure_qaware_beta(
+            _mvpruner_module(accelerator.unwrap_model(model)), cfg, len(loader), metadata if resume_training_payload else None,
+        )
+        if resume_training_payload is None:
+            seed_model(cfg, rank=accelerator.process_index)
     if rank_resume_payload is not None:
         _restore_sampler_state(loader, rank_resume_payload.get("sampler_state"))
     if accelerator.is_main_process:
@@ -1003,7 +1039,7 @@ def train_stage(
                     numerics = {}
                     debug_model = accelerator.unwrap_model(model)
                     if debug_numerics and hasattr(debug_model, "forward_debug"):
-                        with torch.no_grad():
+                        with (_preserve_rng() if is_question_aware_camera_query(cfg) else nullcontext()), torch.no_grad():
                             numerics = debug_model.forward_debug(
                                 **_batch_model_inputs(batch, cfg),
                                 target_optimizer_steps=target_mvpruner_steps,
@@ -1058,8 +1094,10 @@ def train_stage(
                     accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
                 optimizer.step()
                 if is_camera_query(cfg):
-                    if not getattr(accelerator, "optimizer_step_was_skipped", False):
-                        optimizer_step += 1
+                    optimizer_step = _advance_query_update(
+                        cfg, _mvpruner_module(accelerator.unwrap_model(model)), optimizer_step,
+                        skipped=getattr(accelerator, "optimizer_step_was_skipped", False),
+                    )
                 else:
                     _step_mvpruner_beta(accelerator.unwrap_model(model))
                 optimizer.zero_grad(set_to_none=True)
@@ -1182,6 +1220,11 @@ def train_stage(
             if is_camera_query(cfg):
                 metadata.update(training_recipe(cfg))
                 metadata.update(optimizer_step=optimizer_step, epoch_boundary=(epoch_batches == len(loader)))
+                if is_question_aware_camera_query(cfg):
+                    fusion = _mvpruner_module(unwrapped)
+                    metadata.update(beta_step=int(fusion.beta_step.item()), beta_target_steps=int(fusion.beta_target_steps.item()))
+                    if metadata['beta_step'] != optimizer_step:
+                        raise RuntimeError('Question-aware beta_step must equal optimizer_step')
             mvpruner = _mvpruner_module(unwrapped)
             if mvpruner is not None and not is_camera_query(cfg):
                 metadata["mvpruner"] = {
@@ -1406,7 +1449,7 @@ def diagnose_train(
     numerics = None
     debug_model = accelerator.unwrap_model(model)
     if debug_numerics and accelerator.is_main_process and hasattr(debug_model, "forward_debug"):
-        with torch.no_grad(), accelerator.autocast():
+        with (_preserve_rng() if is_question_aware_camera_query(cfg) else nullcontext()), torch.no_grad(), accelerator.autocast():
             numerics = debug_model.forward_debug(
                 **_batch_model_inputs(batch, cfg),
             )
@@ -1731,7 +1774,7 @@ def verify_resume_checkpoint(
     loss_finite = bool(torch.isfinite(raw_loss.detach()).item())
     numerics = None
     if debug_numerics and hasattr(model, "forward_debug"):
-        with torch.no_grad():
+        with (_preserve_rng() if is_question_aware_camera_query(cfg) else nullcontext()), torch.no_grad():
             numerics = model.forward_debug(**_batch_model_inputs(batch, cfg))
         dbg.log("NUMERICS", {"stage": "verify_resume_forward", **numerics})
     if not loss_finite:

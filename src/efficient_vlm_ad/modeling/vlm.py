@@ -219,7 +219,11 @@ class EfficientVLMForAD(nn.Module):
             "stage1_indices": split.debug["stage1_indices"].detach().cpu().tolist(),
         }
         if isinstance(self.visual_fusion, CameraQueryFusion):
-            report["mvpruner"]["stage2_method"] = "camera_query"
+            report["mvpruner"]["stage2_method"] = split.debug.get("stage2_method", "camera_query")
+            for name in ("camera_shares", "expected_budgets", "soft_row_mass_error", "beta", "tau", "gamma", "score_std", "alpha_entropy"):
+                if name in split.debug:
+                    value = split.debug[name]
+                    report["mvpruner"][name] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
             report["mvpruner"]["query_usage"] = split.debug["query_usage"].cpu().tolist()
             for name in ("query_camera_ids", "query_slots"):
                 report["mvpruner"][name] = split.debug[name].cpu().tolist()

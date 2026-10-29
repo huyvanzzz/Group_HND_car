@@ -7,13 +7,15 @@ import subprocess
 import sys
 
 import torch
+import pytest
 import yaml
 
 from config_helpers import fake_config
 from test_smoke_pipeline import _make_fake_data
 
 
-def test_camera_query_offline_cli_lifecycle(tmp_path):
+@pytest.mark.parametrize('fusion_name', ['mvpruner_camera_query', 'mvpruner_camera_query_qaware'])
+def test_camera_query_offline_cli_lifecycle(tmp_path, fusion_name):
     data = tmp_path / 'dataset'
     _make_fake_data(data, rows_per_split=3)
     raw = asdict(fake_config())
@@ -23,7 +25,11 @@ def test_camera_query_offline_cli_lifecycle(tmp_path):
     raw['cache']['dir'] = (out / 'cache').as_posix()
     raw['runtime'] = {'device': 'cpu', 'precision': 'fp32'}
     raw['model']['vision'].update(output_dim=8, seq_len=4, image_size=16)
-    raw['model']['fusion'].update(name='mvpruner_camera_query', query={'dim': 4})
+    raw['model']['fusion'].update(name=fusion_name, query={'dim': 4})
+    qaware = fusion_name == 'mvpruner_camera_query_qaware'
+    if qaware:
+        raw['model']['fusion'].update(stage2_top_k=8, question_scoring={'num_heads': 4, 'hidden_dim': 8})
+        raw['training']['beta_decay_updates'] = 4
     raw['training'].update(max_steps=None, batch_size=1, finetune_epochs=1, num_workers=0,
                            entropy_weight=0.5, seed=42)
     raw['generation'].update(max_new_tokens=3, num_beams=1)
@@ -56,6 +62,13 @@ def test_camera_query_offline_cli_lifecycle(tmp_path):
     assert metadata['completed_epochs'] == 2
     assert metadata['optimizer_step'] == 4  # Three microbatches / accumulation two, per epoch.
     assert metadata['entropy_weight'] == 0.5 and metadata['epoch_boundary']
+    if qaware:
+        assert metadata['beta_step'] == metadata['optimizer_step'] == 4
+        assert metadata['beta_target_steps'] == 4
+        assert metadata['architecture_signature']['fusion.allocation_algorithm'] == 'qaware_prefix_dp_v1'
+        assert metadata['training_loop_version'] == 'qaware_prefix_dp_manual_accumulation_v1'
+        state = torch.load(checkpoint, map_location='cpu', weights_only=False)['model']
+        assert any('question_scorer.' in name for name in state)
     assert len((out / 'predictions.jsonl').read_text().splitlines()) == 2
     measurements = json.loads((out / 'benchmark.json').read_text())
     assert measurements  # CLI benchmark must complete all real tiny-T5 stages.

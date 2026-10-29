@@ -188,6 +188,22 @@ def build_vision_encoder(cfg):
 
 
 def build_visual_fusion(cfg):
+    if cfg.model.fusion.name == "mvpruner_camera_query_qaware":
+        from .question_camera_query import QuestionAwareCameraQueryFusion
+        fusion = cfg.model.fusion
+        query, scoring = fusion.query, fusion.question_scoring
+        return QuestionAwareCameraQueryFusion(
+            d_model=cfg.model.text.d_model, vision_dim=cfg.model.vision.output_dim,
+            num_views=len(cfg.data.view_order), tokens_per_view=cfg.model.vision.seq_len,
+            stage1_top_k=fusion.stage1_top_k, stage2_top_k=fusion.stage2_top_k,
+            min_tokens_per_camera=fusion.min_tokens_per_camera,
+            relevance_mode=fusion.stage1_relevance_mode, eps=fusion.eps,
+            beta_start=fusion.beta_start, beta_end=fusion.beta_end, tau=fusion.tau,
+            query_dim=query.dim, query_init_std=query.init_std, query_rms_eps=query.rms_eps,
+            entropy_weight=cfg.training.entropy_weight,
+            scoring_num_heads=scoring.num_heads, scoring_hidden_dim=scoring.hidden_dim,
+            scoring_gamma=scoring.gamma, scoring_rms_eps=scoring.rms_eps,
+        )
     if cfg.model.fusion.name == "mvpruner_camera_query":
         from .camera_query import CameraQueryFusion
         query = cfg.model.fusion.query

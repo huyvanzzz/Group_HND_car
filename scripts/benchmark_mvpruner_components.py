@@ -31,7 +31,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    if cfg.model.fusion.name not in {"mvpruner_two_stage", "mvpruner_camera_query"}:
+    if cfg.model.fusion.name not in {"mvpruner_two_stage", "mvpruner_camera_query", "mvpruner_camera_query_qaware"}:
         raise ValueError("component benchmark requires an MVPruner or camera-query fusion")
     device = resolve_device(cfg)
     model, tokenizer, transform = _build_train_model(cfg)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import random
+import math
 from pathlib import Path
 import numpy as np
 import torch
@@ -9,10 +10,21 @@ import torch
 LOOP_VERSION = 'camera_query_manual_accumulation_v1'
 
 def is_camera_query(cfg):
-    return cfg.model.fusion.name == 'mvpruner_camera_query'
+    return getattr(cfg.model.fusion, 'name', None) in {'mvpruner_camera_query', 'mvpruner_camera_query_qaware'}
 
-def seed_model(cfg):
-    seed = int(cfg.training.seed)
+def is_question_aware_camera_query(cfg):
+    return getattr(cfg.model.fusion, 'name', None) == 'mvpruner_camera_query_qaware'
+
+def qaware_beta_horizon(cfg, prepared_batches, stored_horizon=None):
+    explicit = getattr(cfg.training, 'beta_decay_updates', None)
+    if stored_horizon is not None:
+        if explicit is not None and int(explicit) != int(stored_horizon):
+            raise ValueError('Question-aware beta horizon differs from checkpoint')
+        return int(stored_horizon)
+    return max(1, int(explicit) if explicit is not None else int(cfg.training.finetune_epochs) * math.ceil(prepared_batches / cfg.training.gradient_accumulation_steps))
+
+def seed_model(cfg, rank=0):
+    seed = int(cfg.training.seed) + int(rank)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -28,12 +40,24 @@ def window_boundary(index, batches, accumulation):
 
 def training_recipe(cfg):
     query = cfg.model.fusion.query
-    return {
+    recipe = {
         'training_loop_version': LOOP_VERSION,
         'seed': int(cfg.training.seed),
         'entropy_weight': float(cfg.training.entropy_weight),
         'initialization_recipe': {'query_normal_std': float(query.init_std), 'key_std': 'inverse_sqrt_input_dim', 'omega': 1.0},
     }
+    if is_question_aware_camera_query(cfg):
+        fusion = cfg.model.fusion
+        recipe['allocation_recipe'] = {
+            'beta_start': float(fusion.beta_start), 'beta_end': float(fusion.beta_end),
+            'beta_schedule': fusion.beta_schedule, 'tau': float(fusion.tau),
+        }
+        recipe.update(training_loop_version='qaware_prefix_dp_manual_accumulation_v1',
+                      rng_policy='model_and_sampler_seed_then_post_prepare_seed_plus_rank_v1')
+        recipe['initialization_recipe'] = {**recipe['initialization_recipe'],
+            'attention_and_scorer_hidden': 'xavier_uniform_gain_1',
+            'scorer_hidden_bias': 0.0, 'scorer_output_std': 0.02}
+    return recipe
 
 def validate_resume_metadata(cfg, metadata):
     if metadata.get('stage') != 'finetune':
@@ -43,6 +67,13 @@ def validate_resume_metadata(cfg, metadata):
     for key, expected in training_recipe(cfg).items():
         if metadata.get(key) != expected:
             raise ValueError(f'Camera-query resume training metadata mismatch: {key}')
+    if is_question_aware_camera_query(cfg):
+        if metadata.get('beta_step') != metadata.get('optimizer_step'):
+            raise ValueError('Question-aware checkpoint beta_step must equal optimizer_step')
+        horizon = metadata.get('beta_target_steps')
+        if not isinstance(horizon, int) or horizon < 1:
+            raise ValueError('Question-aware checkpoint requires a positive beta horizon')
+        qaware_beta_horizon(cfg, 0, stored_horizon=horizon)
 
 def validate_rank_sidecars(path, metadata, world_size=None):
     expected_world = int(metadata.get('distributed', {}).get('num_processes', 1))

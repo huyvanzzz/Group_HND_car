@@ -23,11 +23,13 @@ def prefill_supported(model) -> bool:
 def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> dict[str, Any]:
     query_fusion = getattr(model, 'visual_fusion', None)
     camera_query = hasattr(query_fusion, 'compressor')
+    question_aware = getattr(query_fusion, 'algorithm_version', None) == 'qaware_prefix_dp_v1'
     return {
         'status': 'supported' if prefill_supported(model) else 'unsupported_synthetic',
-        'scope': ('feature embeddings/fusion/projector/query compression + T5 encoder + first decoder forward including LM head'
+        'scope': ('feature embeddings/projector/Stage 1/question scoring/hard prefix DP/query compression + T5 encoder + first decoder forward including LM head'
+                  if question_aware else 'feature embeddings/fusion/projector/query compression + T5 encoder + first decoder forward including LM head'
                   if camera_query else 'feature embeddings/fusion/projector/pruning + T5 encoder + first decoder forward including LM head'),
-        **({'token_reduction': {'name': 'camera_query', 'visual_tokens': query_fusion.stage2_top_k}}
+        **({'token_reduction': {'name': 'camera_query_qaware' if question_aware else 'camera_query', 'visual_tokens': query_fusion.stage2_top_k}}
            if camera_query else {}),
         'excluded_from_scope': ['data loading', 'host-to-device transfer', 'vision extraction',
                                 'subsequent decoding', 'token/beam selection', 'text postprocessing'],
@@ -35,7 +37,7 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
         'flops_per_mac': 2,
         'flops_attention_backend': 'math SDPA with native MHA fastpath disabled; latency uses original backend',
         'flops_excluded_ops': ['normalization', 'softmax', 'activation/elementwise operations',
-                               'sorting/indexing/gather', 'CPU control flow'],
+                               'sorting/indexing/gather', 'CPU control flow'] + (['dynamic programming', 'logsumexp'] if question_aware else []),
         'num_beams': generation.num_beams,
         'warmup_samples': warmup_samples,
         'protocol': 'T5 adaptation; not an exact reproduction of the MVPruner measurement protocol',
