@@ -1,5 +1,6 @@
 import pytest
 import torch
+from efficient_vlm_ad.training_accumulation import loss_for_backward
 from efficient_vlm_ad.query_training import window_size, window_boundary, training_recipe, validate_resume_metadata
 
 @pytest.mark.parametrize('batches,accum,expected', [(5,2,[2,2,2,2,1]),(3,4,[3,3,3])])
@@ -11,9 +12,9 @@ def test_accumulated_gradients_and_epoch_scheduler(accelerated):
     from efficient_vlm_ad.pipeline import _SingleProcessAccelerator
     if accelerated:
         from accelerate import Accelerator
-        accelerator = Accelerator(gradient_accumulation_steps=1, step_scheduler_with_optimizer=False)
+        accelerator = Accelerator(gradient_accumulation_steps=2, step_scheduler_with_optimizer=False)
     else:
-        accelerator = _SingleProcessAccelerator(torch.device('cpu'))
+        accelerator = _SingleProcessAccelerator(torch.device('cpu'), gradient_accumulation_steps=2)
     model = torch.nn.Linear(1,1,bias=False)
     model.weight.data.fill_(1.)
     reference = torch.nn.Linear(1,1,bias=False)
@@ -24,7 +25,7 @@ def test_accumulated_gradients_and_epoch_scheduler(accelerated):
     model,opt,scheduler = accelerator.prepare(model,opt,scheduler)
     for epoch in range(2):
         for i in range(5):
-            accelerator.backward(model(torch.tensor([[float(i+1)]])).square().mean()/window_size(i,5,2))
+            accelerator.backward(loss_for_backward(model(torch.tensor([[float(i+1)]])).square().mean(), 2, window_size(i,5,2)))
             if window_boundary(i,5,2):
                 opt.step();opt.zero_grad()
         for start in range(0,5,2):
@@ -72,7 +73,7 @@ def test_dropout_epoch_resume_matches_continuous(tmp_path, monkeypatch, fallback
         return result
     monkeypatch.setattr(pipeline,'_build_train_model',with_dropout)
     if fallback:
-        monkeypatch.setattr(pipeline,'_build_accelerator',lambda cfg:pipeline._SingleProcessAccelerator(torch.device('cpu')))
+        monkeypatch.setattr(pipeline,'_build_accelerator',lambda cfg:pipeline._SingleProcessAccelerator(torch.device('cpu'), gradient_accumulation_steps=cfg.training.gradient_accumulation_steps))
     full=replace(cfg,project=replace(cfg.project,output_dir=str(tmp_path/'full')))
     fullpath=pipeline.train_stage(full,'finetune',disable_progress=True)
     first=replace(cfg,project=replace(cfg.project,output_dir=str(tmp_path/'split')),training=replace(cfg.training,finetune_epochs=1))
@@ -118,7 +119,7 @@ def test_camera_query_accelerator_has_one_scaling_owner():
     cfg=replace(cfg,model=replace(cfg.model,fusion=replace(cfg.model.fusion,name='mvpruner_camera_query')),
                 runtime=replace(cfg.runtime,precision='fp32'))
     accelerator=_build_accelerator(cfg)
-    assert accelerator.gradient_accumulation_steps==1
+    assert accelerator.gradient_accumulation_steps==cfg.training.gradient_accumulation_steps
     assert accelerator.step_scheduler_with_optimizer is False
     assert accelerator.dataloader_config.use_seedable_sampler is True
     assert accelerator.dataloader_config.data_seed==42

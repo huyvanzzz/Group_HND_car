@@ -157,7 +157,8 @@ def test_historical_checkpoint_full_lifecycle(tmp_path, monkeypatch, stage):
     cfg = replace(cfg, training=replace(cfg.training, max_steps=1),
                   generation=replace(cfg.generation, max_new_tokens=2))
     monkeypatch.setattr(pipeline, "_build_accelerator",
-                        lambda _: pipeline._SingleProcessAccelerator(torch.device("cpu")))
+                        lambda config: pipeline._SingleProcessAccelerator(torch.device("cpu"),
+                            gradient_accumulation_steps=config.training.gradient_accumulation_steps))
     prepare_data(cfg, subset="smoke", disable_progress=True)
     pipeline.prepare_features(cfg, subset="smoke", disable_progress=True)
     latest = pipeline.train_stage(cfg, stage, max_steps=1, disable_progress=True)

@@ -66,7 +66,7 @@ def test_camera_query_offline_cli_lifecycle(tmp_path, fusion_name):
         assert metadata['beta_step'] == metadata['optimizer_step'] == 4
         assert metadata['beta_target_steps'] == 4
         assert metadata['architecture_signature']['fusion.allocation_algorithm'] == 'qaware_prefix_dp_v1'
-        assert metadata['training_loop_version'] == 'qaware_prefix_dp_manual_accumulation_v1'
+        assert metadata['training_loop_version'] == 'qaware_prefix_dp_manual_accumulation_v2'
         state = torch.load(checkpoint, map_location='cpu', weights_only=False)['model']
         assert any('question_scorer.' in name for name in state)
     assert len((out / 'predictions.jsonl').read_text().splitlines()) == 2

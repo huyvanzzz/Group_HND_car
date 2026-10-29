@@ -141,7 +141,8 @@ def test_real_entrypoints_reject_dino_before_load(tmp_path, monkeypatch, entrypo
     cfg = replace(cfg, project=replace(cfg.project, output_dir=str(tmp_path)),
                   runtime=replace(cfg.runtime, device="cpu", precision="fp32"))
     model, tokenizer = build_vlm_model(cfg)
-    metadata = {"stage": "align"}
+    from efficient_vlm_ad.training_accumulation import accumulation_metadata
+    metadata = {"stage": "align", **accumulation_metadata(cfg)}
     if kind == "mismatch":
         metadata["architecture_signature"] = {**model.architecture_signature, "fusion.stage2_top_k": -1}
     path = tmp_path / "bad.pt"

@@ -305,3 +305,22 @@ def test_parameter_count_report_labels_duplicate_tied_weights_clearly():
     assert report["named_parameter_params"] == 8
     assert report["named_parameter_params_with_duplicates"] == 16
     assert report["checkpoint_state_dict_params"] == 16
+
+@pytest.mark.parametrize('probe', ['align', 'resume'])
+@pytest.mark.parametrize('recipe', [None, {'version': 1}, {
+    'version': 2, 'steps': 99, 'normalization': 'backend_with_tail_correction', 'scheduler': 'epoch'}])
+def test_training_checkpoint_verifiers_reject_old_or_mismatched_accumulation(tmp_path, probe, recipe):
+    from config_helpers import fake_config
+    from efficient_vlm_ad import pipeline
+
+    cfg = fake_config()
+    metadata = {'stage': 'align'}
+    if recipe is not None:
+        metadata['accumulation_recipe'] = recipe
+    path = tmp_path / 'legacy.pt'
+    torch.save({'metadata': metadata}, path)
+    with pytest.raises(ValueError, match='accumulation'):
+        if probe == 'align':
+            pipeline.verify_align_checkpoint(cfg, str(path), disable_progress=True)
+        else:
+            pipeline.verify_resume_checkpoint(cfg, str(path), stage='align', disable_progress=True)

@@ -189,7 +189,8 @@ def test_baseline_finetune_lifecycle_and_checkpointing_resume(tmp_path, monkeypa
                   training=replace(cfg.training,max_steps=1),
                   generation=replace(cfg.generation,max_new_tokens=2))
     monkeypatch.setattr(pipeline,'_build_accelerator',
-        lambda _: pipeline._SingleProcessAccelerator(torch.device('cpu')))
+        lambda config: pipeline._SingleProcessAccelerator(torch.device('cpu'),
+            gradient_accumulation_steps=config.training.gradient_accumulation_steps))
     with pytest.raises(ValueError,match='finetune'):
         pipeline.train_stage(cfg,'align',disable_progress=True)
     prepare_data(cfg,subset='smoke',disable_progress=True)

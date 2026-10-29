@@ -7,7 +7,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-LOOP_VERSION = 'camera_query_manual_accumulation_v1'
+from .training_accumulation import window_size, window_boundary
+
+LOOP_VERSION = 'camera_query_manual_accumulation_v2'
 
 def is_camera_query(cfg):
     return getattr(cfg.model.fusion, 'name', None) in {'mvpruner_camera_query', 'mvpruner_camera_query_qaware'}
@@ -31,17 +33,12 @@ def seed_model(cfg, rank=0):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def window_size(index, batches, accumulation):
-    start = (index // accumulation) * accumulation
-    return min(accumulation, batches - start)
-
-def window_boundary(index, batches, accumulation):
-    return (index + 1) % accumulation == 0 or index + 1 == batches
-
 def training_recipe(cfg):
     query = cfg.model.fusion.query
     recipe = {
         'training_loop_version': LOOP_VERSION,
+        'accumulation_normalization': 'backend_with_tail_correction',
+        'scheduler_cadence': 'epoch',
         'seed': int(cfg.training.seed),
         'entropy_weight': float(cfg.training.entropy_weight),
         'initialization_recipe': {'query_normal_std': float(query.init_std), 'key_std': 'inverse_sqrt_input_dim', 'omega': 1.0},
@@ -52,7 +49,7 @@ def training_recipe(cfg):
             'beta_start': float(fusion.beta_start), 'beta_end': float(fusion.beta_end),
             'beta_schedule': fusion.beta_schedule, 'tau': float(fusion.tau),
         }
-        recipe.update(training_loop_version='qaware_prefix_dp_manual_accumulation_v1',
+        recipe.update(training_loop_version='qaware_prefix_dp_manual_accumulation_v2',
                       rng_policy='model_and_sampler_seed_then_post_prepare_seed_plus_rank_v1')
         recipe['initialization_recipe'] = {**recipe['initialization_recipe'],
             'attention_and_scorer_hidden': 'xavier_uniform_gain_1',

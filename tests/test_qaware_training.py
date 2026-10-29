@@ -69,7 +69,7 @@ def test_qaware_dropout_epoch_resume_matches_continuous(tmp_path, monkeypatch, f
         return result
     monkeypatch.setattr(pipeline,'_build_train_model',with_dropout)
     if fallback:
-        monkeypatch.setattr(pipeline,'_build_accelerator',lambda cfg:pipeline._SingleProcessAccelerator(torch.device('cpu')))
+        monkeypatch.setattr(pipeline,'_build_accelerator',lambda cfg:pipeline._SingleProcessAccelerator(torch.device('cpu'), gradient_accumulation_steps=cfg.training.gradient_accumulation_steps))
     full=replace(cfg,project=replace(cfg.project,output_dir=str(tmp_path/'full')))
     fullpath=pipeline.train_stage(full,'finetune',disable_progress=True)
     first=replace(cfg,project=replace(cfg.project,output_dir=str(tmp_path/'split')),training=replace(cfg.training,finetune_epochs=1))

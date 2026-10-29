@@ -40,8 +40,12 @@ from .modeling.multimodal import set_trainable_for_stage
 from .modeling.vision import dinov2_processor_policy
 from .modeling.mvpruner import MVPrunerTwoStage
 from .query_training import (
-    is_camera_query, is_question_aware_camera_query, qaware_beta_horizon, seed_model, window_size, window_boundary, training_recipe,
+    is_camera_query, is_question_aware_camera_query, qaware_beta_horizon, seed_model, training_recipe,
     validate_resume_metadata, validate_rank_sidecars,
+)
+from .training_accumulation import (
+    window_size, window_boundary, loss_for_backward, accumulation_metadata,
+    validate_accumulation_checkpoint,
 )
 from .progress import progress, progress_bar
 from .progress_logging import MinimalProgressWriter, ProgressEventWriter
@@ -69,15 +73,17 @@ class _SingleProcessAccelerator:
     is_main_process = True
     sync_gradients = True
 
-    def __init__(self, device: torch.device, mixed_precision: str = "no") -> None:
+    def __init__(self, device: torch.device, mixed_precision: str = "no", gradient_accumulation_steps: int = 1) -> None:
         self.device = device
         self.mixed_precision = mixed_precision
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.step_scheduler_with_optimizer = False
 
     def prepare(self, *objects):
         return objects
 
     def backward(self, loss: torch.Tensor) -> None:
-        loss.backward()
+        (loss / self.gradient_accumulation_steps).backward()
 
     def autocast(self):
         dtype = torch.float16 if self.mixed_precision == "fp16" else torch.bfloat16
@@ -138,13 +144,13 @@ def _build_accelerator(cfg: ExperimentConfig):
     try:
         from accelerate import Accelerator, DistributedDataParallelKwargs
     except Exception:
-        return _SingleProcessAccelerator(resolve_device(cfg), mixed_precision=mixed_precision)
+        return _SingleProcessAccelerator(resolve_device(cfg), mixed_precision=mixed_precision,
+                                         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     query_kwargs = {}
     if is_camera_query(cfg):
         from accelerate import DataLoaderConfiguration
         query_kwargs = {
-            "step_scheduler_with_optimizer": False,
             "dataloader_config": DataLoaderConfiguration(
                 use_seedable_sampler=True, data_seed=cfg.training.seed,
             ),
@@ -152,7 +158,8 @@ def _build_accelerator(cfg: ExperimentConfig):
     return Accelerator(
         **query_kwargs,
         mixed_precision=mixed_precision,
-        gradient_accumulation_steps=1 if is_camera_query(cfg) else cfg.training.gradient_accumulation_steps,
+        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
+        step_scheduler_with_optimizer=False,
         kwargs_handlers=[ddp_kwargs],
     )
 
@@ -166,6 +173,7 @@ def _distributed_debug_payload(accelerator, cfg: ExperimentConfig) -> dict[str, 
         "mixed_precision": str(getattr(accelerator, "mixed_precision", "no")),
         "per_process_batch_size": cfg.training.batch_size,
         "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
+        "backend_gradient_accumulation_steps": accelerator.gradient_accumulation_steps,
         "effective_batch_size": cfg.training.effective_batch_size_for_processes(
             int(getattr(accelerator, "num_processes", 1))
         ),
@@ -825,6 +833,12 @@ def train_stage(
     progress_log_every_steps: int | None = None,
 ) -> Path:
     _validate_unpruned_stage(cfg, stage)
+    if resume is None:
+        checkpoint_dir = Path(cfg.project.output_dir) / "checkpoints"
+        if (any(checkpoint_dir.glob(f"{stage}_*"))
+                or (stage == "finetune" and (checkpoint_dir / "best_model.pt").exists())):
+            raise ValueError("Fresh training requires a new output directory; existing checkpoints will not be overwritten. "
+                             "Resume a compatible accumulation_v2 checkpoint explicitly, or choose an empty output directory.")
     dbg = _debug_printer(cfg, debug, debug_samples, debug_jsonl)
     started_at = time.perf_counter()
     _heartbeat(dbg, started_at, "train_stage_start", train_stage=stage, resume=bool(resume), max_steps=max_steps)
@@ -867,6 +881,7 @@ def train_stage(
             )
             _heartbeat(dbg, started_at, "checkpoint_metadata_start", path=resume)
         metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        validate_accumulation_checkpoint(cfg, metadata)
         if cfg.model.fusion.name == "unpruned" and metadata.get("stage") != "finetune":
             raise ValueError("The unpruned baseline can resume only a finetune checkpoint")
         validate_checkpoint_signature(metadata, cfg=cfg)
@@ -1017,8 +1032,8 @@ def train_stage(
             with accelerator.autocast():
                 output = model(**_batch_model_inputs(batch, cfg), target_optimizer_steps=target_mvpruner_steps)
                 raw_loss = output.loss
-                divisor = window_size(epoch_batches, bar_total, cfg.training.gradient_accumulation_steps) if is_camera_query(cfg) else cfg.training.gradient_accumulation_steps
-                loss = raw_loss / divisor
+                actual_window = window_size(epoch_batches, bar_total, cfg.training.gradient_accumulation_steps)
+                loss = loss_for_backward(raw_loss, cfg.training.gradient_accumulation_steps, actual_window)
             if not torch.isfinite(raw_loss.detach()).item():
                 if accelerator.is_main_process:
                     progress_writer.write(
@@ -1080,6 +1095,8 @@ def train_stage(
                     **query_losses,
                     "finite_loss": bool(torch.isfinite(raw_loss.detach()).item()),
                     "lr": _optimizer_lr(optimizer),
+                    "accumulation_window_size": actual_window,
+                    "optimizer_step": optimizer_step,
                 }
                 debug_unwrapped = accelerator.unwrap_model(model)
                 if _uses_end_to_end_vision(cfg) and hasattr(debug_unwrapped, "vision_encoder"):
@@ -1089,7 +1106,7 @@ def train_stage(
                     "TRAIN",
                     train_payload,
                 )
-            if (window_boundary(epoch_batches - 1, bar_total, cfg.training.gradient_accumulation_steps) if is_camera_query(cfg) else (global_step + 1) % cfg.training.gradient_accumulation_steps == 0):
+            if window_boundary(epoch_batches - 1, bar_total, cfg.training.gradient_accumulation_steps):
                 if cfg.training.max_grad_norm is not None:
                     accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
                 optimizer.step()
@@ -1099,7 +1116,9 @@ def train_stage(
                         skipped=getattr(accelerator, "optimizer_step_was_skipped", False),
                     )
                 else:
-                    _step_mvpruner_beta(accelerator.unwrap_model(model))
+                    if not getattr(accelerator, "optimizer_step_was_skipped", False):
+                        optimizer_step += 1
+                        _step_mvpruner_beta(accelerator.unwrap_model(model))
                 optimizer.zero_grad(set_to_none=True)
             global_step += 1
             if accelerator.is_main_process and (
@@ -1119,6 +1138,8 @@ def train_stage(
                     **query_losses,
                     lr=_optimizer_lr(optimizer),
                     finite_loss=True,
+                    accumulation_window_size=actual_window,
+                    optimizer_step=optimizer_step,
                     elapsed_seconds=round(elapsed, 3),
                     steps_per_second=round(steps_per_second, 6),
                     estimated_epoch_remaining_seconds=round(remaining_steps / steps_per_second, 3) if steps_per_second > 0 else None,
@@ -1128,13 +1149,6 @@ def train_stage(
                 bar.set_postfix(loss=f"{loss_value:.4f}", lr=_optimizer_lr(optimizer), global_step=global_step)
         if epoch_batches == 0:
             raise ValueError("Training dataloader was empty")
-        if not is_camera_query(cfg) and global_step % cfg.training.gradient_accumulation_steps != 0:
-            if cfg.training.max_grad_norm is not None:
-                accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
-            optimizer.step()
-            _step_mvpruner_beta(accelerator.unwrap_model(model))
-            optimizer.zero_grad(set_to_none=True)
-
         scheduler.step()
         epoch_train_loss = epoch_loss / epoch_batches
         accelerator.wait_for_everyone()
@@ -1185,11 +1199,13 @@ def train_stage(
                 best_val_loss = val_loss
                 best_epoch = epoch_number
             metadata = {
+                **accumulation_metadata(cfg),
                 **_unpruned_settings(cfg),
                 "stage": stage,
                 "epoch": epoch_number,
                 "completed_epochs": epoch_number,
                 "global_step": global_step,
+                "optimizer_step": optimizer_step,
                 "profile": cfg.model.profile,
                 "train_loss": epoch_train_loss,
                 "val_loss": val_loss,
@@ -1313,9 +1329,7 @@ def train_stage(
             world_size=world_size,
             epoch=epoch_number,
             batch_cursor=epoch_batches,
-            optimizer_step=optimizer_step if is_camera_query(cfg) else int(_mvpruner_module(accelerator.unwrap_model(model)).beta_step.item())
-            if is_camera_query(cfg) or _mvpruner_module(accelerator.unwrap_model(model)) is not None
-            else global_step,
+            optimizer_step=optimizer_step,
             sampler_state=_sampler_state(loader),
         )
         if is_best:
@@ -1325,9 +1339,7 @@ def train_stage(
                 world_size=world_size,
                 epoch=epoch_number,
                 batch_cursor=epoch_batches,
-                optimizer_step=optimizer_step if is_camera_query(cfg) else int(_mvpruner_module(accelerator.unwrap_model(model)).beta_step.item())
-                if is_camera_query(cfg) or _mvpruner_module(accelerator.unwrap_model(model)) is not None
-                else global_step,
+                optimizer_step=optimizer_step,
                 sampler_state=_sampler_state(loader),
             )
         accelerator.wait_for_everyone()
@@ -1396,6 +1408,7 @@ def diagnose_train(
         resume_path = Path(resume)
         begin = time.perf_counter()
         checkpoint_metadata = read_checkpoint_metadata(resume, map_location="cpu")
+        validate_accumulation_checkpoint(cfg, checkpoint_metadata)
         validate_checkpoint_signature(checkpoint_metadata, cfg=cfg)
         if is_camera_query(cfg):
             validate_resume_metadata(cfg, checkpoint_metadata)
@@ -1466,7 +1479,7 @@ def diagnose_train(
         loss_finite = bool(torch.isfinite(diagnose_loss.detach()).item())
         if not loss_finite:
             raise FloatingPointError(f"Diagnose forward loss is not finite: {diagnose_loss.detach().cpu().item()}")
-        accelerator.backward(diagnose_loss)
+        accelerator.backward(loss_for_backward(diagnose_loss, cfg.training.gradient_accumulation_steps, 1))
         if mvpruner is not None:
             mvpruner_gradients = mvpruner.diagnostic_report(debug_model.projector)
             if not mvpruner_gradients["ok"]:
@@ -1533,6 +1546,7 @@ def verify_align_checkpoint(
 
     _heartbeat(dbg, started_at, "verify_align_start", checkpoint=str(checkpoint_path), split=split, index=index)
     metadata = read_checkpoint_metadata(checkpoint_path, map_location="cpu")
+    validate_accumulation_checkpoint(cfg, metadata)
     checkpoint_stage = metadata.get("stage")
     if checkpoint_stage != "align":
         raise ValueError(f"metadata.stage must be align, got {checkpoint_stage!r}")
@@ -1689,6 +1703,7 @@ def verify_resume_checkpoint(
     _heartbeat(dbg, started_at, "verify_resume_start", checkpoint=str(checkpoint_path), train_stage=stage, split=split, index=index)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     metadata = dict(payload.get("metadata", {}))
+    validate_accumulation_checkpoint(cfg, metadata)
     checkpoint_stage = metadata.get("stage")
     if is_camera_query(cfg):
         validate_resume_metadata(cfg, metadata)
