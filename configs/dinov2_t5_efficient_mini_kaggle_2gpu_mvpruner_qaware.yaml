@@ -1,0 +1,73 @@
+project:
+  output_dir: outputs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_qaware
+data:
+  hf_repo_id: minhdang0901/drivelm-nuscenes-v1-0
+  revision: main
+  view_order: [Front, Front-Left, Front-Right, Back, Back-Left, Back-Right]
+  expected_counts: {train: 341381, val: 19785, test: 16817}
+cache:
+  dir: outputs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_qaware/cache
+runtime:
+  device: auto
+  precision: fp32
+model:
+  profile: dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_qaware
+  vision:
+    name: dinov2_small_avgpool
+    model_id: facebook/dinov2-small
+    revision: ed25f3a31f01632728cabb09d1542f84ab7b0056
+    output_dim: 384
+    seq_len: 64
+    image_size: 224
+    feature_extraction:
+      output_layer: last_hidden_state
+      prefix_tokens_to_remove: 1
+      source_grid: [16, 16]
+      pooling: avg_pool2d
+      kernel_size: 2
+      stride: 2
+      output_grid: [8, 8]
+  projector:
+    type: linear
+  text:
+    model_id: google/t5-efficient-mini
+    revision: af3816c2dbd386f7786f7757c536f0314084ff8b
+    d_model: 384
+  fusion:
+    name: mvpruner_qaware
+    stage2_scoring: {num_heads: 4, hidden_dim: 64, rms_eps: 1.0e-6}
+    stage1_top_k: 196
+    stage2_top_k: 49
+    stage2_layer: 2
+    min_tokens_per_camera: 1
+    stage1_relevance_mode: shifted_max_cosine
+    beta_start: 0.2
+    beta_end: 0.0
+    beta_schedule: linear
+    tau: 1.0
+    eps: 1.0e-8
+training:
+  vision_training: feature_cache
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  learning_rate: 0.0001
+  weight_decay: 0.05
+  scheduler_gamma: 0.9
+  finetune_epochs: 10
+  entropy_weight: 0.0
+  gradient_checkpointing: false
+  seed: 42
+  max_grad_norm: 1.0
+  num_workers: 2
+  pin_memory: true
+  progress_log_every_steps: 500
+generation:
+  max_new_tokens: 512
+  num_beams: 3
+  early_stopping: true
+  length_penalty: 1.0
+evaluation:
+  eval_batch_size: 16
+  eval_progress_log_every_samples: 256
+  benchmark_max_samples: 200
+  benchmark_progress_log_every_samples: 20

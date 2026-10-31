@@ -10,6 +10,7 @@ from torch.profiler import record_function
 from .camera_query import CameraQueryFusion
 from .question_camera_query import QuestionAwareCameraQueryFusion
 from .mvpruner import MVPrunerTwoStage, gather_position_bias, validate_attention_numerics
+from .mvpruner_qaware import QuestionAwareMVPruner
 
 
 SUPPORTED_TRANSFORMERS = {"4.46.3"}
@@ -148,6 +149,7 @@ class T5SplitEncoder(nn.Module):
     ) -> SplitEncoderResult:
         use_training = self.training if training is None else bool(training)
         is_qaware = isinstance(self.pruner, QuestionAwareCameraQueryFusion)
+        is_qaware_pruning = isinstance(self.pruner, QuestionAwareMVPruner)
         batch, sequence, _ = inputs_embeds.shape
         if sequence != visual_count + question_mask.shape[1]:
             raise ValueError("inputs_embeds length must equal visual_count + question length")
@@ -161,7 +163,7 @@ class T5SplitEncoder(nn.Module):
                 self.encoder.block[0], hidden, extended_mask, position_bias, cache_position
             )
             pre_dropout = None
-            if not is_qaware:
+            if not is_qaware and not is_qaware_pruning:
                 pre_dropout = self._pre_dropout_attention(self.encoder.block[1], hidden, position_bias, attention_mask)
                 self.pruner.capture_tensor("attention", pre_dropout)
             hidden, position_bias = self._run_block(
@@ -196,10 +198,16 @@ class T5SplitEncoder(nn.Module):
                 pruned_position_bias = pruned_position_bias + pruned_extended_mask
         else:
             with record_function("mvpruner.stage2_ira_gumbel"):
-                scores = self._visual_relevance(pre_dropout, visual_count=visual_count, question_mask=question_mask)
-                pruned_visual, selected_indices, selected_cameras, stage2_debug = self.pruner.stage2_from_scores(
-                    hidden[:, :visual_count], scores, visual_camera_ids, training=use_training
-                )
+                if is_qaware_pruning:
+                    pruned_visual, selected_indices, selected_cameras, stage2_debug = self.pruner.stage2_from_question(
+                        hidden[:, :visual_count], hidden[:, visual_count:], question_mask,
+                        visual_camera_ids, training=use_training
+                    )
+                else:
+                    scores = self._visual_relevance(pre_dropout, visual_count=visual_count, question_mask=question_mask)
+                    pruned_visual, selected_indices, selected_cameras, stage2_debug = self.pruner.stage2_from_scores(
+                        hidden[:, :visual_count], scores, visual_camera_ids, training=use_training
+                    )
             text_hidden = hidden[:, visual_count:]
             hidden = torch.cat([pruned_visual, text_hidden], dim=1)
 
@@ -223,7 +231,7 @@ class T5SplitEncoder(nn.Module):
             "position_bias": pruned_position_bias,
             **stage2_debug,
         }
-        if not is_qaware:
+        if not is_qaware and not is_qaware_pruning:
             debug.update(pre_dropout_attention=pre_dropout, visual_relevance=scores)
         if not is_query:
             debug.update(stage2_indices=selected_indices, retained_indices=retained_indices)

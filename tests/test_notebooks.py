@@ -14,6 +14,8 @@ NAMES = {f'kaggle_{kind}_dinov2_mvpruner_finetune.ipynb' for kind in ('debug', '
 NAMES.add('kaggle_train_dinov2_unpruned_finetune.ipynb')
 NAMES.add('kaggle_train_dinov2_camera_query_finetune.ipynb')
 NAMES.add('kaggle_train_dinov2_camera_query_qaware_finetune.ipynb')
+NAMES.add('kaggle_infer_dinov2_camera_query_qaware.ipynb')
+NAMES.add('kaggle_train_dinov2_mvpruner_qaware_finetune.ipynb')
 
 
 def notebook(kind):
@@ -26,7 +28,7 @@ def source(kind):
 
 def test_only_dino_entrypoint_artifacts_remain():
     assert {p.name for p in Path('notebooks').glob('*.ipynb')} == NAMES
-    assert {p.name for p in Path('configs').glob('*.yaml')} == {Path(CONFIG).name, 'dinov2_t5_efficient_mini_kaggle_2gpu_unpruned.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_query.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_query_qaware.yaml'}
+    assert {p.name for p in Path('configs').glob('*.yaml')} == {Path(CONFIG).name, 'dinov2_t5_efficient_mini_kaggle_2gpu_unpruned.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_query.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_query_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_qaware.yaml'}
 
 
 @pytest.mark.parametrize('kind', ['debug', 'train'])

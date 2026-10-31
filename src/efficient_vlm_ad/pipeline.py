@@ -565,7 +565,7 @@ def _module_dict_for_freezing(model) -> torch.nn.ModuleDict:
 
 
 def _build_train_model(cfg: ExperimentConfig):
-    if is_camera_query(cfg):
+    if is_camera_query(cfg) or cfg.model.fusion.name == "mvpruner_qaware":
         seed_model(cfg)
     if _uses_end_to_end_vision(cfg):
         vision, transform = build_vision_encoder(cfg)
@@ -682,6 +682,13 @@ def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
     for key in ("stage1_budgets", "stage2_budgets", "stage1_indices", "stage2_indices"):
         if key in debug:
             payload[key] = debug[key].detach().cpu().tolist()
+    if getattr(mvpruner, "algorithm_version", None) == "qaware_pruning_v1":
+        payload.update(stage2_method="qaware_pruning_v1", loss_type="ce")
+        for key in ("camera_relevance", "qaware_logits_range", "qaware_logits_std",
+                    "qaware_alpha_range", "qaware_alpha_clamp_ratio", "qaware_alpha_row_sum"):
+            if key in debug:
+                value = debug[key]
+                payload[key] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
     return {"mvpruner": payload}
 
 
@@ -805,6 +812,8 @@ def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Mo
 
 
 def _validate_unpruned_stage(cfg: ExperimentConfig, stage: str) -> None:
+    if cfg.model.fusion.name == "mvpruner_qaware" and stage != "finetune":
+        raise ValueError("mvpruner_qaware supports finetune only")
     if is_camera_query(cfg) and stage != "finetune":
         raise ValueError("Camera-query supports finetune only")
     if cfg.model.fusion.name == "unpruned" and stage != "finetune":
