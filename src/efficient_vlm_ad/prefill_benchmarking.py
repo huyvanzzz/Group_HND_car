@@ -25,9 +25,11 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
     camera_query = hasattr(query_fusion, 'compressor')
     question_aware = getattr(query_fusion, 'algorithm_version', None) == 'qaware_prefix_dp_v1'
     question_pruning = getattr(query_fusion, 'algorithm_version', None) == 'qaware_pruning_v1'
+    stage2_only = getattr(query_fusion, 'algorithm_version', None) == 't5_attention_direct_camera_v1'
     return {
         'status': 'supported' if prefill_supported(model) else 'unsupported_synthetic',
-        'scope': ('feature embeddings/projector/Stage 1/question scoring/IRA/token pruning + T5 encoder + first decoder forward including LM head'
+        'scope': ('feature embeddings/projector/T5 attention scoring/direct camera allocation/token pruning + T5 encoder + first decoder forward including LM head'
+                  if stage2_only else 'feature embeddings/projector/Stage 1/question scoring/IRA/token pruning + T5 encoder + first decoder forward including LM head'
                   if question_pruning else 'feature embeddings/projector/Stage 1/question scoring/hard prefix DP/query compression + T5 encoder + first decoder forward including LM head'
                   if question_aware else 'feature embeddings/fusion/projector/query compression + T5 encoder + first decoder forward including LM head'
                   if camera_query else 'feature embeddings/fusion/projector/pruning + T5 encoder + first decoder forward including LM head'),
@@ -35,6 +37,9 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
            if camera_query else {}),
         **({'token_reduction': {'name': 'mvpruner_qaware', 'visual_tokens': query_fusion.stage2_top_k}}
            if question_pruning else {}),
+        **({'token_reduction': {'name': 'mvpruner_stage2_only', 'stage1_enabled': False,
+                               'input_visual_tokens': query_fusion.num_views * query_fusion.tokens_per_view,
+                               'visual_tokens': query_fusion.stage2_top_k}} if stage2_only else {}),
         'excluded_from_scope': ['data loading', 'host-to-device transfer', 'vision extraction',
                                 'subsequent decoding', 'token/beam selection', 'text postprocessing'],
         'flops_method': 'torch.utils.flop_counter.FlopCounterMode; estimated supported major operators',

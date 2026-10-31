@@ -259,6 +259,30 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     def __post_init__(self) -> None:
+        if self.model.fusion.name == "mvpruner_stage2_only":
+            fusion = self.model.fusion
+            total = len(self.data.view_order) * self.model.vision.seq_len
+            if fusion.stage1_top_k != total:
+                raise ValueError("mvpruner_stage2_only requires stage1_top_k equal to the full visual geometry")
+            if fusion.min_tokens_per_camera < 1 or not (
+                    len(self.data.view_order) * fusion.min_tokens_per_camera <= fusion.stage2_top_k <= total):
+                raise ValueError("mvpruner_stage2_only has invalid token budgets")
+            if fusion.stage2_layer != 2:
+                raise ValueError("mvpruner_stage2_only requires stage2_layer=2")
+            if not math.isfinite(fusion.eps) or fusion.eps <= 0:
+                raise ValueError("mvpruner_stage2_only eps must be finite and positive")
+            if (not all(math.isfinite(v) for v in (fusion.beta_start, fusion.beta_end, fusion.tau))
+                    or not fusion.beta_start >= fusion.beta_end >= 0
+                    or fusion.beta_schedule != "linear" or fusion.tau <= 0):
+                raise ValueError("mvpruner_stage2_only requires finite linear beta and positive tau")
+            if self.runtime.precision != "fp32" or self.training.vision_training != "feature_cache":
+                raise ValueError("mvpruner_stage2_only requires fp32 feature_cache training")
+            if self.training.entropy_weight != 0:
+                raise ValueError("mvpruner_stage2_only uses CE only; entropy_weight must be 0")
+            if self.training.gradient_checkpointing:
+                raise ValueError("gradient_checkpointing is not supported for mvpruner_stage2_only")
+            if self.training.batch_size < 1 or self.training.gradient_accumulation_steps < 1:
+                raise ValueError("mvpruner_stage2_only batch size and accumulation must be positive")
         if self.model.fusion.name == "mvpruner_qaware":
             fusion = self.model.fusion
             if self.model.text.d_model % fusion.stage2_scoring.num_heads:
@@ -345,8 +369,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if adapter_name != "none":
         raise ValueError("mvpruner_two_stage requires model.adapter.name=none; adapters are no longer supported")
     fusion_name = str(fusion_raw.get("name", ""))
-    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware"}:
+    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_stage2_only"}:
         raise ValueError("Unknown model.fusion.name")
+    if fusion_name == "mvpruner_stage2_only" and "gamma" in fusion_raw:
+        raise ValueError("mvpruner_stage2_only has no gamma setting")
     if fusion_name == "unpruned" and vision_training != "feature_cache":
         raise ValueError("unpruned currently requires feature_cache vision training")
     gradient_checkpointing = train_raw.get("gradient_checkpointing", False)

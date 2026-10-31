@@ -41,6 +41,14 @@ def architecture_signature(cfg: Any) -> dict[str, Any]:
     """Configuration identity, independent of training state and output paths."""
     model = cfg.model
     fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key not in {"query", "question_scoring", "stage2_scoring"}}
+    if model.fusion.name == "mvpruner_stage2_only":
+        for key in ("stage1_top_k", "stage1_relevance_mode"):
+            fusion.pop(f"fusion.{key}", None)
+        fusion.update({"fusion.stage1_enabled": False,
+                       "fusion.input_visual_tokens": len(cfg.data.view_order) * model.vision.seq_len,
+                       "fusion.stage2_scoring": "t5_pre_dropout_attention",
+                       "fusion.camera_allocation": "direct_minmax_softmax",
+                       "fusion.stage2_algorithm_version": "t5_attention_direct_camera_v1"})
     if model.fusion.name == "mvpruner_qaware":
         fusion.update({"fusion.stage2_scoring": asdict(model.fusion.stage2_scoring),
                        "fusion.stage2_algorithm_version": "qaware_pruning_v1",

@@ -682,6 +682,13 @@ def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
     for key in ("stage1_budgets", "stage2_budgets", "stage1_indices", "stage2_indices"):
         if key in debug:
             payload[key] = debug[key].detach().cpu().tolist()
+    if getattr(mvpruner, "algorithm_version", None) == "t5_attention_direct_camera_v1":
+        payload.update(stage1_enabled=False, stage2_method="t5_attention_direct_camera_v1", loss_type="ce")
+        for key in ("stage2_input_count", "stage2_output_count", "camera_relevance", "camera_shares",
+                    "score_min", "score_max", "score_mean", "score_std", "score_clamp_ratio"):
+            if key in debug:
+                value = debug[key]
+                payload[key] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
     if getattr(mvpruner, "algorithm_version", None) == "qaware_pruning_v1":
         payload.update(stage2_method="qaware_pruning_v1", loss_type="ce")
         for key in ("camera_relevance", "qaware_logits_range", "qaware_logits_std",
@@ -812,6 +819,8 @@ def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Mo
 
 
 def _validate_unpruned_stage(cfg: ExperimentConfig, stage: str) -> None:
+    if cfg.model.fusion.name == "mvpruner_stage2_only" and stage != "finetune":
+        raise ValueError("mvpruner_stage2_only supports finetune only")
     if cfg.model.fusion.name == "mvpruner_qaware" and stage != "finetune":
         raise ValueError("mvpruner_qaware supports finetune only")
     if is_camera_query(cfg) and stage != "finetune":
@@ -891,6 +900,8 @@ def train_stage(
             _heartbeat(dbg, started_at, "checkpoint_metadata_start", path=resume)
         metadata = read_checkpoint_metadata(resume, map_location="cpu")
         validate_accumulation_checkpoint(cfg, metadata)
+        if cfg.model.fusion.name == "mvpruner_stage2_only" and metadata.get("stage") != "finetune":
+            raise ValueError("mvpruner_stage2_only can resume only a finetune checkpoint")
         if cfg.model.fusion.name == "unpruned" and metadata.get("stage") != "finetune":
             raise ValueError("The unpruned baseline can resume only a finetune checkpoint")
         validate_checkpoint_signature(metadata, cfg=cfg)
@@ -1418,6 +1429,8 @@ def diagnose_train(
         begin = time.perf_counter()
         checkpoint_metadata = read_checkpoint_metadata(resume, map_location="cpu")
         validate_accumulation_checkpoint(cfg, checkpoint_metadata)
+        if cfg.model.fusion.name == "mvpruner_stage2_only" and checkpoint_metadata.get("stage") != "finetune":
+            raise ValueError("mvpruner_stage2_only can resume only a finetune checkpoint")
         validate_checkpoint_signature(checkpoint_metadata, cfg=cfg)
         if is_camera_query(cfg):
             validate_resume_metadata(cfg, checkpoint_metadata)

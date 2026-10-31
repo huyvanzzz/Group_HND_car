@@ -10,6 +10,7 @@ from torch.profiler import record_function
 from .multimodal import MultiModalProjector
 from .camera_query import CameraQueryFusion
 from .mvpruner import MVPrunerTwoStage
+from .mvpruner_stage2_only import MVPrunerStage2Only
 from .t5_split_encoder import T5SplitEncoder
 
 
@@ -85,22 +86,31 @@ class EfficientVLMForAD(nn.Module):
             flat = enriched.reshape(enriched.shape[0], -1, enriched.shape[-1])
             projected = self.projector(flat)
             self.visual_fusion.capture_tensor("projector_output", projected)
-        with record_function("mvpruner.stage1_dra_ccts"):
-            selected, _stage1_indices, camera_ids, stage1_debug = self.visual_fusion.stage1(
-                projected, text_tokens, attention_mask
-            )
-        if self.visual_fusion.diagnostics_enabled:
-            # A deterministic counterfactual probe; it does not participate in selection/backward.
-            with torch.no_grad():
-                _, alternate_indices, _, alternate_debug = self.visual_fusion.stage1(
-                    projected.detach(), -text_tokens.detach(), attention_mask
+        if isinstance(self.visual_fusion, MVPrunerStage2Only):
+            if (attention_mask.shape != text_tokens.shape[:2]
+                    or not bool(attention_mask.bool().any(dim=1).all())):
+                raise ValueError("question must contain at least one unmasked token per sample")
+            selected = projected
+            camera_ids = (torch.arange(projected.shape[1], device=projected.device)
+                          .expand(projected.shape[0], -1) // self.visual_fusion.tokens_per_view)
+            stage1_debug = {}
+        else:
+            with record_function("mvpruner.stage1_dra_ccts"):
+                selected, _stage1_indices, camera_ids, stage1_debug = self.visual_fusion.stage1(
+                    projected, text_tokens, attention_mask
                 )
-                stage1_debug["question_response"] = {
-                    "probe": "negated_question_embeddings",
-                    "relevance_mean_absolute_change": float((stage1_debug["raw_relevance"].detach()
-                                                             - alternate_debug["raw_relevance"]).abs().mean()),
-                    "selection_changed_ratio": float((alternate_indices != _stage1_indices).float().mean()),
-                }
+            if self.visual_fusion.diagnostics_enabled:
+                # A deterministic counterfactual probe; it does not participate in selection/backward.
+                with torch.no_grad():
+                    _, alternate_indices, _, alternate_debug = self.visual_fusion.stage1(
+                        projected.detach(), -text_tokens.detach(), attention_mask
+                    )
+                    stage1_debug["question_response"] = {
+                        "probe": "negated_question_embeddings",
+                        "relevance_mean_absolute_change": float((stage1_debug["raw_relevance"].detach()
+                                                                 - alternate_debug["raw_relevance"]).abs().mean()),
+                        "selection_changed_ratio": float((alternate_indices != _stage1_indices).float().mean()),
+                    }
         visual_tokens = selected + self.modal_embeddings(
             torch.ones((selected.shape[0], selected.shape[1]), dtype=torch.long, device=selected.device)
         )
@@ -213,11 +223,19 @@ class EfficientVLMForAD(nn.Module):
             "mvpruner_encoder_output", split.encoder_outputs.last_hidden_state
         )
         report["mvpruner_attention_mask"] = _stats("mvpruner_attention_mask", split.attention_mask)
-        report["mvpruner"] = {
-            "stage1_budgets": split.debug["stage1_budgets"].detach().cpu().tolist(),
-            "stage2_budgets": split.debug["stage2_budgets"].detach().cpu().tolist(),
-            "stage1_indices": split.debug["stage1_indices"].detach().cpu().tolist(),
-        }
+        if isinstance(self.visual_fusion, MVPrunerStage2Only):
+            report["mvpruner"] = {}
+            for name in ("stage1_enabled", "stage2_method", "stage2_input_count", "stage2_output_count",
+                         "stage2_budgets", "camera_relevance", "camera_shares",
+                         "score_min", "score_max", "score_mean", "score_std", "score_clamp_ratio"):
+                value = split.debug[name]
+                report["mvpruner"][name] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
+        else:
+            report["mvpruner"] = {
+                "stage1_budgets": split.debug["stage1_budgets"].detach().cpu().tolist(),
+                "stage2_budgets": split.debug["stage2_budgets"].detach().cpu().tolist(),
+                "stage1_indices": split.debug["stage1_indices"].detach().cpu().tolist(),
+            }
         if isinstance(self.visual_fusion, CameraQueryFusion):
             report["mvpruner"]["stage2_method"] = split.debug.get("stage2_method", "camera_query")
             for name in ("camera_shares", "expected_budgets", "soft_row_mass_error", "beta", "tau", "gamma", "score_std", "alpha_entropy"):
