@@ -154,8 +154,14 @@ class FusionConfig:
     query: CameraQueryConfig | None = None
     question_scoring: QuestionScoringConfig | None = None
     stage2_scoring: Stage2ScoringConfig | None = None
+    context_tokens: int = 0
 
     def __post_init__(self) -> None:
+        if self.name == "mvpruner_ccts_context":
+            if type(self.context_tokens) is not int or self.context_tokens <= 0:
+                raise ValueError("fusion.context_tokens must be a positive integer")
+        elif self.context_tokens != 0:
+            raise ValueError("fusion.context_tokens is supported only by mvpruner_ccts_context")
         if self.name == "mvpruner_qaware":
             if self.stage2_scoring is None:
                 object.__setattr__(self, "stage2_scoring", Stage2ScoringConfig())
@@ -259,6 +265,33 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     def __post_init__(self) -> None:
+        if self.model.fusion.name == "mvpruner_ccts_context":
+            fusion = self.model.fusion
+            views = len(self.data.view_order)
+            total = views * self.model.vision.seq_len
+            if (any(type(value) is not int for value in (fusion.stage1_top_k, fusion.stage2_top_k,
+                                                        fusion.min_tokens_per_camera))
+                    or fusion.min_tokens_per_camera < 1
+                    or not views * fusion.min_tokens_per_camera <= fusion.stage2_top_k < fusion.stage1_top_k <= total):
+                raise ValueError("mvpruner_ccts_context has invalid token budgets")
+            if not views <= fusion.context_tokens <= fusion.stage1_top_k - fusion.stage2_top_k:
+                raise ValueError("context_tokens must cover all views and fit the residual capacity")
+            if fusion.stage2_layer != 2 or fusion.stage1_relevance_mode not in {"shifted_max_cosine", "diversity_only"}:
+                raise ValueError("mvpruner_ccts_context requires stage2_layer=2 and supported Stage 1 relevance")
+            if not math.isfinite(fusion.eps) or fusion.eps <= 0:
+                raise ValueError("mvpruner_ccts_context eps must be finite and positive")
+            if (not all(math.isfinite(v) for v in (fusion.beta_start, fusion.beta_end, fusion.tau))
+                    or not fusion.beta_start >= fusion.beta_end >= 0
+                    or fusion.beta_schedule != "linear" or fusion.tau <= 0):
+                raise ValueError("mvpruner_ccts_context requires finite linear beta and positive tau")
+            if self.runtime.precision != "fp32" or self.training.vision_training != "feature_cache":
+                raise ValueError("mvpruner_ccts_context requires fp32 feature_cache training")
+            if self.training.entropy_weight != 0:
+                raise ValueError("mvpruner_ccts_context uses CE only; entropy_weight must be 0")
+            if self.training.gradient_checkpointing:
+                raise ValueError("gradient_checkpointing is not supported for mvpruner_ccts_context")
+            if self.training.batch_size < 1 or self.training.gradient_accumulation_steps < 1:
+                raise ValueError("mvpruner_ccts_context batch size and accumulation must be positive")
         if self.model.fusion.name == "mvpruner_stage2_only":
             fusion = self.model.fusion
             total = len(self.data.view_order) * self.model.vision.seq_len
@@ -369,10 +402,15 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if adapter_name != "none":
         raise ValueError("mvpruner_two_stage requires model.adapter.name=none; adapters are no longer supported")
     fusion_name = str(fusion_raw.get("name", ""))
-    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_stage2_only"}:
+    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_stage2_only", "mvpruner_ccts_context"}:
         raise ValueError("Unknown model.fusion.name")
-    if fusion_name == "mvpruner_stage2_only" and "gamma" in fusion_raw:
-        raise ValueError("mvpruner_stage2_only has no gamma setting")
+    if fusion_name in {"mvpruner_stage2_only", "mvpruner_ccts_context"} and "gamma" in fusion_raw:
+        raise ValueError(f"{fusion_name} has no gamma setting")
+    context_tokens = fusion_raw.get("context_tokens", 15 if fusion_name == "mvpruner_ccts_context" else 0)
+    if type(context_tokens) is not int:
+        raise ValueError("fusion.context_tokens must be an integer")
+    if fusion_name != "mvpruner_ccts_context" and context_tokens != 0:
+        raise ValueError("fusion.context_tokens is supported only by mvpruner_ccts_context")
     if fusion_name == "unpruned" and vision_training != "feature_cache":
         raise ValueError("unpruned currently requires feature_cache vision training")
     gradient_checkpointing = train_raw.get("gradient_checkpointing", False)
@@ -380,6 +418,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("training.gradient_checkpointing must be a boolean")
     if gradient_checkpointing and fusion_name != "unpruned":
         raise ValueError("training.gradient_checkpointing is currently supported only for unpruned")
+    if fusion_name == "mvpruner_ccts_context":
+        for key in ("stage1_top_k", "stage2_top_k", "stage2_layer", "min_tokens_per_camera"):
+            if key in fusion_raw and type(fusion_raw[key]) is not int:
+                raise ValueError(f"fusion.{key} must be an integer")
     stage1_top_k = int(fusion_raw.get("stage1_top_k", len(view_order) * int(vision_raw.get("seq_len", 49))))
     stage2_top_k = int(fusion_raw.get("stage2_top_k", fusion_raw.get("top_k", vision_raw.get("seq_len", 49))))
     minimum_per_camera = int(fusion_raw.get("min_tokens_per_camera", 1))
@@ -474,6 +516,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 eps=float(fusion_raw.get("eps", 1e-8)),
                 stage1_top_k=stage1_top_k,
                 stage2_top_k=stage2_top_k,
+                context_tokens=context_tokens,
                 stage2_layer=int(fusion_raw.get("stage2_layer", 2)),
                 min_tokens_per_camera=minimum_per_camera,
                 stage1_relevance_mode=relevance_mode,

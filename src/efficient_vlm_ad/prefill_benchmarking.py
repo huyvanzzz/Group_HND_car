@@ -26,9 +26,11 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
     question_aware = getattr(query_fusion, 'algorithm_version', None) == 'qaware_prefix_dp_v1'
     question_pruning = getattr(query_fusion, 'algorithm_version', None) == 'qaware_pruning_v1'
     stage2_only = getattr(query_fusion, 'algorithm_version', None) == 't5_attention_direct_camera_v1'
+    ccts_context = getattr(query_fusion, 'algorithm_version', None) == 'ccts_context_v1'
     return {
         'status': 'supported' if prefill_supported(model) else 'unsupported_synthetic',
-        'scope': ('feature embeddings/projector/T5 attention scoring/direct camera allocation/token pruning + T5 encoder + first decoder forward including LM head'
+        'scope': ('feature embeddings/projector/Stage 1/T5 attention scoring/IRA/token pruning/context allocation/CCTS/assignment/merge/group mask + T5 encoder + first decoder forward including LM head'
+                  if ccts_context else 'feature embeddings/projector/T5 attention scoring/direct camera allocation/token pruning + T5 encoder + first decoder forward including LM head'
                   if stage2_only else 'feature embeddings/projector/Stage 1/question scoring/IRA/token pruning + T5 encoder + first decoder forward including LM head'
                   if question_pruning else 'feature embeddings/projector/Stage 1/question scoring/hard prefix DP/query compression + T5 encoder + first decoder forward including LM head'
                   if question_aware else 'feature embeddings/fusion/projector/query compression + T5 encoder + first decoder forward including LM head'
@@ -40,6 +42,12 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
         **({'token_reduction': {'name': 'mvpruner_stage2_only', 'stage1_enabled': False,
                                'input_visual_tokens': query_fusion.num_views * query_fusion.tokens_per_view,
                                'visual_tokens': query_fusion.stage2_top_k}} if stage2_only else {}),
+        **({'token_reduction': {'name': 'mvpruner_ccts_context', 'stage1_enabled': True,
+                               'main_tokens': query_fusion.stage2_top_k,
+                               'context_tokens': query_fusion.context_tokens,
+                               'visual_tokens': query_fusion.output_visual_tokens,
+                               'group_mask': 'main_context_blocked_prompt_shared',
+                               'position_policy': 'reset_contiguous_pretrained_relative_bias'}} if ccts_context else {}),
         'excluded_from_scope': ['data loading', 'host-to-device transfer', 'vision extraction',
                                 'subsequent decoding', 'token/beam selection', 'text postprocessing'],
         'flops_method': 'torch.utils.flop_counter.FlopCounterMode; estimated supported major operators',

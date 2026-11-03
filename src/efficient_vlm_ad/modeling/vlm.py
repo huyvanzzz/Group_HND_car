@@ -11,6 +11,7 @@ from .multimodal import MultiModalProjector
 from .camera_query import CameraQueryFusion
 from .mvpruner import MVPrunerTwoStage
 from .mvpruner_stage2_only import MVPrunerStage2Only
+from .mvpruner_ccts_context import MVPrunerCCTSContext
 from .t5_split_encoder import T5SplitEncoder
 
 
@@ -67,7 +68,7 @@ class EfficientVLMForAD(nn.Module):
 
     @property
     def visual_token_len(self) -> int:
-        return self.visual_fusion.stage2_top_k
+        return getattr(self.visual_fusion, "output_visual_tokens", self.visual_fusion.stage2_top_k)
 
     def _mvpruner_encode(
         self,
@@ -130,6 +131,11 @@ class EfficientVLMForAD(nn.Module):
             compute_entropy=compute_entropy,
         )
         split.debug.update(stage1_debug)
+        if isinstance(self.visual_fusion, MVPrunerCCTSContext):
+            for source, target in (("stage2_indices", "main_source_indices"),
+                                   ("context_center_indices", "context_center_source_indices"),
+                                   ("context_residual_indices", "context_residual_source_indices")):
+                split.debug[target] = torch.gather(_stage1_indices, 1, split.debug[source])
         self.visual_fusion.last_debug = {
             name: value.detach() if isinstance(value, torch.Tensor) else value
             for name, value in split.debug.items()
@@ -163,7 +169,7 @@ class EfficientVLMForAD(nn.Module):
             attention_mask=attention_mask,
         )
         decoder_kwargs = {}
-        if labels is None and isinstance(self.visual_fusion, CameraQueryFusion):
+        if labels is None and isinstance(self.visual_fusion, (CameraQueryFusion, MVPrunerCCTSContext)):
             decoder_kwargs["decoder_input_ids"] = torch.full(
                 (input_ids.shape[0], 1), self.text_model.config.decoder_start_token_id,
                 dtype=input_ids.dtype, device=input_ids.device)
@@ -208,7 +214,7 @@ class EfficientVLMForAD(nn.Module):
             attention_mask=attention_mask,
         )
         decoder_kwargs = {}
-        if labels is None and isinstance(self.visual_fusion, CameraQueryFusion):
+        if labels is None and isinstance(self.visual_fusion, (CameraQueryFusion, MVPrunerCCTSContext)):
             decoder_kwargs["decoder_input_ids"] = torch.full(
                 (input_ids.shape[0], 1), self.text_model.config.decoder_start_token_id,
                 dtype=input_ids.dtype, device=input_ids.device)
@@ -256,6 +262,11 @@ class EfficientVLMForAD(nn.Module):
             report["mvpruner"]["beta"] = self.visual_fusion.current_beta()
             report["mvpruner"]["stage2_indices"] = split.debug["stage2_indices"].detach().cpu().tolist()
         report["logits"] = _stats("logits", output.logits)
+        if isinstance(self.visual_fusion, MVPrunerCCTSContext):
+            for key, value in split.debug.items():
+                if key.startswith("context_") or key in {"stage2_method", "main_tokens", "output_visual_tokens",
+                        "group_mask_policy", "position_policy", "loss_type", "main_source_indices"}:
+                    report["mvpruner"][key] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
         report["loss"] = _stats("loss", output.loss.detach().reshape(1)) if output.loss is not None else None
         return report
 

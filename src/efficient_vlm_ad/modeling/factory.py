@@ -188,6 +188,18 @@ def build_vision_encoder(cfg):
 
 
 def build_visual_fusion(cfg):
+    if cfg.model.fusion.name == "mvpruner_ccts_context":
+        from .mvpruner_ccts_context import MVPrunerCCTSContext
+        fusion = cfg.model.fusion
+        return MVPrunerCCTSContext(
+            d_model=cfg.model.text.d_model, vision_dim=cfg.model.vision.output_dim,
+            num_views=len(cfg.data.view_order), tokens_per_view=cfg.model.vision.seq_len,
+            stage1_top_k=fusion.stage1_top_k, stage2_top_k=fusion.stage2_top_k,
+            min_tokens_per_camera=fusion.min_tokens_per_camera,
+            relevance_mode=fusion.stage1_relevance_mode, eps=fusion.eps,
+            beta_start=fusion.beta_start, beta_end=fusion.beta_end, tau=fusion.tau,
+            context_tokens=fusion.context_tokens,
+        )
     if cfg.model.fusion.name == "mvpruner_stage2_only":
         from .mvpruner_stage2_only import MVPrunerStage2Only
         fusion = cfg.model.fusion

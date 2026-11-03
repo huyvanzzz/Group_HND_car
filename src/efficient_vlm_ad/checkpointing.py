@@ -40,7 +40,17 @@ def _normalize_mvpruner_signature(signature: dict[str, Any]) -> dict[str, Any]:
 def architecture_signature(cfg: Any) -> dict[str, Any]:
     """Configuration identity, independent of training state and output paths."""
     model = cfg.model
-    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key not in {"query", "question_scoring", "stage2_scoring"}}
+    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key not in {"query", "question_scoring", "stage2_scoring", "context_tokens"}}
+    if model.fusion.name == "mvpruner_ccts_context":
+        fusion.update({"fusion.context_tokens": model.fusion.context_tokens,
+                       "fusion.context_algorithm_version": "ccts_context_v1",
+                       "fusion.context_allocation": "residual_attention_mass_bounded_v1",
+                       "fusion.context_relevance": "camera_dot_softmax_prompt_masked_mean",
+                       "fusion.context_center_selection": "relevance_times_min_cosine_distance",
+                       "fusion.context_assignment": "hidden_cosine_nearest_center",
+                       "fusion.context_merge": "center_plus_assigned_mean",
+                       "fusion.group_mask": "main_context_blocked_prompt_shared",
+                       "fusion.position_policy": "reset_contiguous_pretrained_relative_bias"})
     if model.fusion.name == "mvpruner_stage2_only":
         for key in ("stage1_top_k", "stage1_relevance_mode"):
             fusion.pop(f"fusion.{key}", None)
@@ -67,7 +77,7 @@ def architecture_signature(cfg: Any) -> dict[str, Any]:
             fusion.update({"fusion.question_scoring": asdict(model.fusion.question_scoring),
                            "fusion.allocation_algorithm": "qaware_prefix_dp_v1"})
     return {
-        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name in {"mvpruner_two_stage", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware"} else {}),
+        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name in {"mvpruner_two_stage", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_ccts_context"} else {}),
         **{f"vision.{key}": value for key, value in asdict(model.vision).items()},
         "projector.type": model.projector.type,
         **{f"text.{key}": value for key, value in asdict(model.text).items()},

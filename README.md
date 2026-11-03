@@ -72,3 +72,7 @@ python -m pytest tests -q
 Question-aware camera-query has a separate [research guide](docs/research/question-aware-camera-query.md), [config](configs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_query_qaware.yaml), and [two-GPU finetune notebook](notebooks/kaggle_train_dinov2_camera_query_qaware_finetune.ipynb). It uses question-conditioned scoring and prefix-DP allocation; GPU performance and quality require measurement.
 
 All four Kaggle finetune notebooks retain accumulation steps of 2, use the original profile output directory for cache, prepared data, debug logs and checkpoints, and default to fresh pretrained training with `RESUME_TRAINING = False`. Existing checkpoint directories are guarded against accidental overwrite; explicit resume requires compatible training metadata. Cache validation stays unchanged. See [gradient accumulation v2 (Vietnamese)](docs/research/gradient-accumulation-v2.md).
+
+## MVPruner CCTS context
+
+[49 main + 15 context finetuning notebook](notebooks/kaggle_train_dinov2_mvpruner_ccts_context_finetune.ipynb) uses the isolated [CCTS context profile](configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_ccts_context.yaml). Original Stage 1 and the 49-token Stage 2 selector are retained; 147 residual tokens yield 15 per-camera CCTS summaries with VisionZip-style merging. See [method, masks, resume and measurement limits](docs/research/mvpruner-ccts-context.md).

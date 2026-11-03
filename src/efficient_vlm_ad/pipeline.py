@@ -682,6 +682,13 @@ def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
     for key in ("stage1_budgets", "stage2_budgets", "stage1_indices", "stage2_indices"):
         if key in debug:
             payload[key] = debug[key].detach().cpu().tolist()
+    if getattr(mvpruner, "context_tokens", 0):
+        payload.update(stage2_method="ccts_context_v1", loss_type="ce", stage1_enabled=True,
+                       main_tokens=mvpruner.stage2_top_k, context_tokens=mvpruner.context_tokens,
+                       output_visual_tokens=mvpruner.output_visual_tokens)
+        for key, value in debug.items():
+            if key.startswith("context_") or key in {"group_mask_policy", "position_policy"}:
+                payload[key] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
     if getattr(mvpruner, "algorithm_version", None) == "t5_attention_direct_camera_v1":
         payload.update(stage1_enabled=False, stage2_method="t5_attention_direct_camera_v1", loss_type="ce")
         for key in ("stage2_input_count", "stage2_output_count", "camera_relevance", "camera_shares",
@@ -819,6 +826,8 @@ def _load_model_weights_allowing_new_vision(path: str | Path, model: torch.nn.Mo
 
 
 def _validate_unpruned_stage(cfg: ExperimentConfig, stage: str) -> None:
+    if cfg.model.fusion.name == "mvpruner_ccts_context" and stage != "finetune":
+        raise ValueError("mvpruner_ccts_context supports finetune only")
     if cfg.model.fusion.name == "mvpruner_stage2_only" and stage != "finetune":
         raise ValueError("mvpruner_stage2_only supports finetune only")
     if cfg.model.fusion.name == "mvpruner_qaware" and stage != "finetune":
@@ -900,8 +909,8 @@ def train_stage(
             _heartbeat(dbg, started_at, "checkpoint_metadata_start", path=resume)
         metadata = read_checkpoint_metadata(resume, map_location="cpu")
         validate_accumulation_checkpoint(cfg, metadata)
-        if cfg.model.fusion.name == "mvpruner_stage2_only" and metadata.get("stage") != "finetune":
-            raise ValueError("mvpruner_stage2_only can resume only a finetune checkpoint")
+        if cfg.model.fusion.name in {"mvpruner_stage2_only", "mvpruner_ccts_context"} and metadata.get("stage") != "finetune":
+            raise ValueError(f"{cfg.model.fusion.name} can resume only a finetune checkpoint")
         if cfg.model.fusion.name == "unpruned" and metadata.get("stage") != "finetune":
             raise ValueError("The unpruned baseline can resume only a finetune checkpoint")
         validate_checkpoint_signature(metadata, cfg=cfg)
@@ -1273,6 +1282,13 @@ def train_stage(
                     "beta_target_steps": int(mvpruner.beta_target_steps.item()),
                     "tau": float(mvpruner.tau.item()),
                 }
+                if getattr(mvpruner, "context_tokens", 0):
+                    metadata["mvpruner"].update(
+                        context_tokens=mvpruner.context_tokens,
+                        output_visual_tokens=mvpruner.output_visual_tokens,
+                        context_algorithm_version="ccts_context_v1",
+                        group_mask_policy="main_context_blocked_prompt_shared",
+                        position_policy="reset_contiguous_pretrained_relative_bias")
             save_checkpoint(
                 latest_ckpt,
                 model=unwrapped,
@@ -1429,8 +1445,8 @@ def diagnose_train(
         begin = time.perf_counter()
         checkpoint_metadata = read_checkpoint_metadata(resume, map_location="cpu")
         validate_accumulation_checkpoint(cfg, checkpoint_metadata)
-        if cfg.model.fusion.name == "mvpruner_stage2_only" and checkpoint_metadata.get("stage") != "finetune":
-            raise ValueError("mvpruner_stage2_only can resume only a finetune checkpoint")
+        if cfg.model.fusion.name in {"mvpruner_stage2_only", "mvpruner_ccts_context"} and checkpoint_metadata.get("stage") != "finetune":
+            raise ValueError(f"{cfg.model.fusion.name} can resume only a finetune checkpoint")
         validate_checkpoint_signature(checkpoint_metadata, cfg=cfg)
         if is_camera_query(cfg):
             validate_resume_metadata(cfg, checkpoint_metadata)

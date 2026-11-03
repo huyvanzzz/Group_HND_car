@@ -11,6 +11,7 @@ from .camera_query import CameraQueryFusion
 from .question_camera_query import QuestionAwareCameraQueryFusion
 from .mvpruner import MVPrunerTwoStage, gather_position_bias, validate_attention_numerics
 from .mvpruner_qaware import QuestionAwareMVPruner
+from .mvpruner_ccts_context import MVPrunerCCTSContext
 
 
 SUPPORTED_TRANSFORMERS = {"4.46.3"}
@@ -150,6 +151,7 @@ class T5SplitEncoder(nn.Module):
         use_training = self.training if training is None else bool(training)
         is_qaware = isinstance(self.pruner, QuestionAwareCameraQueryFusion)
         is_qaware_pruning = isinstance(self.pruner, QuestionAwareMVPruner)
+        is_context = isinstance(self.pruner, MVPrunerCCTSContext)
         batch, sequence, _ = inputs_embeds.shape
         if sequence != visual_count + question_mask.shape[1]:
             raise ValueError("inputs_embeds length must equal visual_count + question length")
@@ -209,14 +211,39 @@ class T5SplitEncoder(nn.Module):
                         hidden[:, :visual_count], scores, visual_camera_ids, training=use_training
                     )
             text_hidden = hidden[:, visual_count:]
-            hidden = torch.cat([pruned_visual, text_hidden], dim=1)
-
-            text_indices = torch.arange(visual_count, sequence, device=hidden.device).expand(batch, -1)
-            retained_indices = torch.cat([selected_indices, text_indices], dim=1)
-            pruned_mask = torch.gather(attention_mask, 1, retained_indices)
-            pruned_position_bias = gather_position_bias(position_bias, retained_indices)
-            pruned_extended_mask = self.encoder.get_extended_attention_mask(pruned_mask, pruned_mask.shape)
-            pruned_cache_position = torch.arange(hidden.shape[1], device=hidden.device)
+            if is_context:
+                with record_function("mvpruner.context_merge"):
+                    context = self.pruner.merge_context(hidden[:, :visual_count], text_hidden,
+                        question_mask, scores, visual_camera_ids, selected_indices)
+                hidden = torch.cat([pruned_visual, context.values, text_hidden], dim=1)
+                selected_cameras = torch.cat([selected_cameras, context.camera_ids], dim=1)
+                stage2_debug.update(context.debug)
+                stage2_debug.update(stage2_method=self.pruner.algorithm_version,
+                    main_tokens=pruned_visual.shape[1], context_tokens=context.values.shape[1],
+                    output_visual_tokens=pruned_visual.shape[1] + context.values.shape[1],
+                    group_mask_policy="block_direct_main_context",
+                    position_policy="new_sequence_pretrained_t5_bias", loss_type="ce")
+                with record_function("mvpruner.context_mask_bias"):
+                    visual_out = self.pruner.output_visual_tokens
+                    pruned_mask = torch.cat([attention_mask.new_ones(batch, visual_out), question_mask], dim=1)
+                    allowed = torch.ones(hidden.shape[1], hidden.shape[1], dtype=torch.bool, device=hidden.device)
+                    main = self.pruner.stage2_top_k
+                    allowed[:main, main:visual_out] = False
+                    allowed[main:visual_out, :main] = False
+                    encoder_mask = allowed[None] & pruned_mask[:, None, :].bool()
+                    pruned_extended_mask = self.encoder.get_extended_attention_mask(encoder_mask, pruned_mask.shape)
+                    pruned_cache_position = torch.arange(hidden.shape[1], device=hidden.device)
+                    pruned_position_bias = self.encoder.block[0].layer[0].SelfAttention.compute_bias(
+                        hidden.shape[1], hidden.shape[1], device=hidden.device, cache_position=pruned_cache_position)
+                    pruned_position_bias = pruned_position_bias + pruned_extended_mask
+            else:
+                hidden = torch.cat([pruned_visual, text_hidden], dim=1)
+                text_indices = torch.arange(visual_count, sequence, device=hidden.device).expand(batch, -1)
+                retained_indices = torch.cat([selected_indices, text_indices], dim=1)
+                pruned_mask = torch.gather(attention_mask, 1, retained_indices)
+                pruned_position_bias = gather_position_bias(position_bias, retained_indices)
+                pruned_extended_mask = self.encoder.get_extended_attention_mask(pruned_mask, pruned_mask.shape)
+                pruned_cache_position = torch.arange(hidden.shape[1], device=hidden.device)
         with record_function("mvpruner.t5_blocks_2_3"):
             for block in self.encoder.block[self.split_layer :]:
                 hidden, pruned_position_bias = self._run_block(
@@ -234,7 +261,9 @@ class T5SplitEncoder(nn.Module):
         if not is_qaware and not is_qaware_pruning:
             debug.update(pre_dropout_attention=pre_dropout, visual_relevance=scores)
         if not is_query:
-            debug.update(stage2_indices=selected_indices, retained_indices=retained_indices)
+            debug.update(stage2_indices=selected_indices)
+            if not is_context:
+                debug["retained_indices"] = retained_indices
         return SplitEncoderResult(
             encoder_outputs=BaseModelOutput(last_hidden_state=hidden),
             attention_mask=pruned_mask,
