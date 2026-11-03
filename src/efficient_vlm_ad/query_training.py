@@ -12,7 +12,10 @@ from .training_accumulation import window_size, window_boundary
 LOOP_VERSION = 'camera_query_manual_accumulation_v2'
 
 def is_camera_query(cfg):
-    return getattr(cfg.model.fusion, 'name', None) in {'mvpruner_camera_query', 'mvpruner_camera_query_qaware'}
+    return getattr(cfg.model.fusion, 'name', None) in {'mvpruner_camera_query', 'mvpruner_camera_query_qaware', 'mvpruner_camera_pool_qaware'}
+
+def is_spatial_pool_query(cfg):
+    return getattr(cfg.model.fusion, 'name', None) == 'mvpruner_camera_pool_qaware'
 
 def is_question_aware_camera_query(cfg):
     return getattr(cfg.model.fusion, 'name', None) == 'mvpruner_camera_query_qaware'
@@ -34,6 +37,20 @@ def seed_model(cfg, rank=0):
         torch.cuda.manual_seed_all(seed)
 
 def training_recipe(cfg):
+    if is_spatial_pool_query(cfg):
+        return {
+            'training_loop_version': 'qaware_spatial_pool_manual_accumulation_v2',
+            'accumulation_normalization': 'backend_with_tail_correction',
+            'scheduler_cadence': 'epoch', 'seed': int(cfg.training.seed),
+            'entropy_weight': float(cfg.training.entropy_weight),
+            'rng_policy': 'model_and_sampler_seed_then_post_prepare_seed_plus_rank_v1',
+            'initialization_recipe': {
+                'query_key_std': 1 / math.sqrt(cfg.model.fusion.pooled_query.dim),
+                'query_key_equal_independent': True, 'omega': 1.0,
+                'attention_and_scorer_hidden': 'xavier_uniform_gain_1',
+                'scorer_hidden_bias': 0.0, 'scorer_output_std': 0.02,
+            },
+        }
     query = cfg.model.fusion.query
     recipe = {
         'training_loop_version': LOOP_VERSION,

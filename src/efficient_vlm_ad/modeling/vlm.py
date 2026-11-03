@@ -9,6 +9,7 @@ from torch.profiler import record_function
 
 from .multimodal import MultiModalProjector
 from .camera_query import CameraQueryFusion
+from .camera_pool_query import CameraPoolQueryFusion
 from .mvpruner import MVPrunerTwoStage
 from .mvpruner_stage2_only import MVPrunerStage2Only
 from .mvpruner_ccts_context import MVPrunerCCTSContext
@@ -87,7 +88,7 @@ class EfficientVLMForAD(nn.Module):
             flat = enriched.reshape(enriched.shape[0], -1, enriched.shape[-1])
             projected = self.projector(flat)
             self.visual_fusion.capture_tensor("projector_output", projected)
-        if isinstance(self.visual_fusion, MVPrunerStage2Only):
+        if isinstance(self.visual_fusion, (MVPrunerStage2Only, CameraPoolQueryFusion)):
             if (attention_mask.shape != text_tokens.shape[:2]
                     or not bool(attention_mask.bool().any(dim=1).all())):
                 raise ValueError("question must contain at least one unmasked token per sample")
@@ -169,7 +170,7 @@ class EfficientVLMForAD(nn.Module):
             attention_mask=attention_mask,
         )
         decoder_kwargs = {}
-        if labels is None and isinstance(self.visual_fusion, (CameraQueryFusion, MVPrunerCCTSContext)):
+        if labels is None and isinstance(self.visual_fusion, (CameraQueryFusion, CameraPoolQueryFusion, MVPrunerCCTSContext)):
             decoder_kwargs["decoder_input_ids"] = torch.full(
                 (input_ids.shape[0], 1), self.text_model.config.decoder_start_token_id,
                 dtype=input_ids.dtype, device=input_ids.device)
@@ -182,11 +183,13 @@ class EfficientVLMForAD(nn.Module):
         return self._with_auxiliary_loss(output, split)
 
     def _with_auxiliary_loss(self, output, split):
-        if isinstance(self.visual_fusion, CameraQueryFusion):
+        if isinstance(self.visual_fusion, (CameraQueryFusion, CameraPoolQueryFusion)):
             answer = output.loss
             entropy = split.auxiliary_losses.get("entropy_loss")
             total = answer
-            if answer is not None and self.training and entropy is not None:
+            include_entropy = (self.visual_fusion.entropy_weight != 0
+                               or not isinstance(self.visual_fusion, CameraPoolQueryFusion))
+            if answer is not None and self.training and entropy is not None and include_entropy:
                 total = answer + self.visual_fusion.entropy_weight * entropy
             fields = dict(output)
             fields["loss"] = total
@@ -214,7 +217,7 @@ class EfficientVLMForAD(nn.Module):
             attention_mask=attention_mask,
         )
         decoder_kwargs = {}
-        if labels is None and isinstance(self.visual_fusion, (CameraQueryFusion, MVPrunerCCTSContext)):
+        if labels is None and isinstance(self.visual_fusion, (CameraQueryFusion, CameraPoolQueryFusion, MVPrunerCCTSContext)):
             decoder_kwargs["decoder_input_ids"] = torch.full(
                 (input_ids.shape[0], 1), self.text_model.config.decoder_start_token_id,
                 dtype=input_ids.dtype, device=input_ids.device)
@@ -229,7 +232,22 @@ class EfficientVLMForAD(nn.Module):
             "mvpruner_encoder_output", split.encoder_outputs.last_hidden_state
         )
         report["mvpruner_attention_mask"] = _stats("mvpruner_attention_mask", split.attention_mask)
-        if isinstance(self.visual_fusion, MVPrunerStage2Only):
+        if isinstance(self.visual_fusion, CameraPoolQueryFusion):
+            report["mvpruner"] = {}
+            for name in ("stage1_enabled", "stage2_method", "algorithm_version", "stage2_budgets",
+                         "camera_rank", "rank_quotas", "camera_shares", "camera_relevance", "pooling",
+                         "position_policy", "gamma", "score_range", "score_std", "query_camera_ids",
+                         "max_probability", "output_norm", "output_overlap"):
+                if name in split.debug:
+                    value = split.debug[name]
+                    report["mvpruner"][name] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
+            report["mvpruner"].update(stage2_input_count=384, stage2_output_count=46)
+            for name in ("answer_loss", "entropy_loss"):
+                value = getattr(output, name)
+                report[name] = float(value.detach()) if value is not None else None
+            report["weighted_entropy_loss"] = (report["entropy_loss"] * self.visual_fusion.entropy_weight
+                                                if report["entropy_loss"] is not None else None)
+        elif isinstance(self.visual_fusion, MVPrunerStage2Only):
             report["mvpruner"] = {}
             for name in ("stage1_enabled", "stage2_method", "stage2_input_count", "stage2_output_count",
                          "stage2_budgets", "camera_relevance", "camera_shares",
@@ -258,7 +276,7 @@ class EfficientVLMForAD(nn.Module):
                 report[name] = float(value.detach()) if value is not None else None
             report["weighted_entropy_loss"] = (report["entropy_loss"] * self.visual_fusion.entropy_weight
                                                   if report["entropy_loss"] is not None else None)
-        else:
+        elif not isinstance(self.visual_fusion, CameraPoolQueryFusion):
             report["mvpruner"]["beta"] = self.visual_fusion.current_beta()
             report["mvpruner"]["stage2_indices"] = split.debug["stage2_indices"].detach().cpu().tolist()
         report["logits"] = _stats("logits", output.logits)

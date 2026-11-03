@@ -40,7 +40,7 @@ from .modeling.multimodal import set_trainable_for_stage
 from .modeling.vision import dinov2_processor_policy
 from .modeling.mvpruner import MVPrunerTwoStage
 from .query_training import (
-    is_camera_query, is_question_aware_camera_query, qaware_beta_horizon, seed_model, training_recipe,
+    is_camera_query, is_question_aware_camera_query, is_spatial_pool_query, qaware_beta_horizon, seed_model, training_recipe,
     validate_resume_metadata, validate_rank_sidecars,
 )
 from .training_accumulation import (
@@ -661,6 +661,17 @@ def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
     if mvpruner is None:
         return {}
     debug = getattr(mvpruner, "last_debug", {}) or {}
+    if getattr(mvpruner, 'algorithm_version', None) == 'qaware_spatial_pool_v1':
+        fields = ('stage1_enabled', 'stage2_method', 'algorithm_version', 'stage2_budgets',
+                  'camera_rank', 'rank_quotas', 'camera_shares', 'camera_relevance', 'pooling',
+                  'position_policy', 'gamma', 'score_range', 'score_std', 'max_probability',
+                  'output_norm', 'output_overlap')
+        return {'camera_query': {
+            **{key: value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
+               for key, value in debug.items() if key in fields},
+            'stage2_input_count': 384, 'stage2_output_count': 46,
+            'loss_type': 'ce' if mvpruner.entropy_weight == 0 else 'ce_entropy',
+        }}
     if hasattr(mvpruner, "compressor"):
         fields = {
             "stage1_budgets", "stage2_budgets", "budgets", "query_usage",
@@ -999,12 +1010,17 @@ def train_stage(
         )
         if resume_training_payload is None:
             seed_model(cfg, rank=accelerator.process_index)
+    elif is_spatial_pool_query(cfg) and resume_training_payload is None:
+        seed_model(cfg, rank=accelerator.process_index)
+    if is_spatial_pool_query(cfg) and resume_training_payload is not None:
+        rank_resume_payload = validate_rank_sidecars(resume, metadata, accelerator.num_processes)[accelerator.process_index]
     if rank_resume_payload is not None:
         _restore_sampler_state(loader, rank_resume_payload.get("sampler_state"))
     if accelerator.is_main_process:
         _heartbeat(dbg, started_at, "accelerator_prepare_done")
     if is_camera_query(cfg) and resume_training_payload is not None:
-        rank_resume_payload = validate_rank_sidecars(resume, metadata, accelerator.num_processes)[accelerator.process_index]
+        if not is_spatial_pool_query(cfg):
+            rank_resume_payload = validate_rank_sidecars(resume, metadata, accelerator.num_processes)[accelerator.process_index]
         _restore_rng_state(rank_resume_payload["rng_state"])
     optimizer_step = int(resume_training_payload.get("metadata", {}).get("optimizer_step", 0)) if resume_training_payload else 0
     global_step = start_step
@@ -1083,7 +1099,7 @@ def train_stage(
                     numerics = {}
                     debug_model = accelerator.unwrap_model(model)
                     if debug_numerics and hasattr(debug_model, "forward_debug"):
-                        with (_preserve_rng() if is_question_aware_camera_query(cfg) else nullcontext()), torch.no_grad():
+                        with (_preserve_rng() if (is_question_aware_camera_query(cfg) or is_spatial_pool_query(cfg)) else nullcontext()), torch.no_grad():
                             numerics = debug_model.forward_debug(
                                 **_batch_model_inputs(batch, cfg),
                                 target_optimizer_steps=target_mvpruner_steps,
@@ -1500,7 +1516,7 @@ def diagnose_train(
     numerics = None
     debug_model = accelerator.unwrap_model(model)
     if debug_numerics and accelerator.is_main_process and hasattr(debug_model, "forward_debug"):
-        with (_preserve_rng() if is_question_aware_camera_query(cfg) else nullcontext()), torch.no_grad(), accelerator.autocast():
+        with (_preserve_rng() if (is_question_aware_camera_query(cfg) or is_spatial_pool_query(cfg)) else nullcontext()), torch.no_grad(), accelerator.autocast():
             numerics = debug_model.forward_debug(
                 **_batch_model_inputs(batch, cfg),
             )
@@ -1827,7 +1843,7 @@ def verify_resume_checkpoint(
     loss_finite = bool(torch.isfinite(raw_loss.detach()).item())
     numerics = None
     if debug_numerics and hasattr(model, "forward_debug"):
-        with (_preserve_rng() if is_question_aware_camera_query(cfg) else nullcontext()), torch.no_grad():
+        with (_preserve_rng() if (is_question_aware_camera_query(cfg) or is_spatial_pool_query(cfg)) else nullcontext()), torch.no_grad():
             numerics = model.forward_debug(**_batch_model_inputs(batch, cfg))
         dbg.log("NUMERICS", {"stage": "verify_resume_forward", **numerics})
     if not loss_finite:

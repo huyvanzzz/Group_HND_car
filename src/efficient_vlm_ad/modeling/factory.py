@@ -188,6 +188,20 @@ def build_vision_encoder(cfg):
 
 
 def build_visual_fusion(cfg):
+    if cfg.model.fusion.name == "mvpruner_camera_pool_qaware":
+        from .camera_pool_query import CameraPoolQueryFusion
+        fusion = cfg.model.fusion
+        query, scoring = fusion.pooled_query, fusion.question_scoring
+        return CameraPoolQueryFusion(
+            d_model=cfg.model.text.d_model, vision_dim=cfg.model.vision.output_dim,
+            num_views=len(cfg.data.view_order), tokens_per_view=cfg.model.vision.seq_len,
+            stage1_top_k=fusion.stage1_top_k, stage2_top_k=fusion.stage2_top_k,
+            min_tokens_per_camera=1, eps=fusion.eps,
+            query_dim=query.dim, query_rms_eps=query.rms_eps, rank_quotas=query.rank_quotas,
+            entropy_weight=cfg.training.entropy_weight,
+            scoring_num_heads=scoring.num_heads, scoring_hidden_dim=scoring.hidden_dim,
+            scoring_gamma=scoring.gamma, scoring_rms_eps=scoring.rms_eps,
+        )
     if cfg.model.fusion.name == "mvpruner_ccts_context":
         from .mvpruner_ccts_context import MVPrunerCCTSContext
         fusion = cfg.model.fusion

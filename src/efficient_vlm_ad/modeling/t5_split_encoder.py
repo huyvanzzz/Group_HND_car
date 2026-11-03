@@ -9,6 +9,7 @@ from torch.profiler import record_function
 
 from .camera_query import CameraQueryFusion
 from .question_camera_query import QuestionAwareCameraQueryFusion
+from .camera_pool_query import CameraPoolQueryFusion
 from .mvpruner import MVPrunerTwoStage, gather_position_bias, validate_attention_numerics
 from .mvpruner_qaware import QuestionAwareMVPruner
 from .mvpruner_ccts_context import MVPrunerCCTSContext
@@ -149,7 +150,7 @@ class T5SplitEncoder(nn.Module):
         compute_entropy: bool = True,
     ) -> SplitEncoderResult:
         use_training = self.training if training is None else bool(training)
-        is_qaware = isinstance(self.pruner, QuestionAwareCameraQueryFusion)
+        is_qaware = isinstance(self.pruner, (QuestionAwareCameraQueryFusion, CameraPoolQueryFusion))
         is_qaware_pruning = isinstance(self.pruner, QuestionAwareMVPruner)
         is_context = isinstance(self.pruner, MVPrunerCCTSContext)
         batch, sequence, _ = inputs_embeds.shape
@@ -173,7 +174,7 @@ class T5SplitEncoder(nn.Module):
             )
 
         auxiliary_losses = {}
-        is_query = isinstance(self.pruner, CameraQueryFusion)
+        is_query = isinstance(self.pruner, (CameraQueryFusion, CameraPoolQueryFusion))
         if is_query:
             if getattr(self.encoder, "gradient_checkpointing", False):
                 raise ValueError("camera-query gradient checkpointing is not supported")

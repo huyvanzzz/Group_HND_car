@@ -40,7 +40,25 @@ def _normalize_mvpruner_signature(signature: dict[str, Any]) -> dict[str, Any]:
 def architecture_signature(cfg: Any) -> dict[str, Any]:
     """Configuration identity, independent of training state and output paths."""
     model = cfg.model
-    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key not in {"query", "question_scoring", "stage2_scoring", "context_tokens"}}
+    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key not in {"query", "question_scoring", "stage2_scoring", "context_tokens", "pooled_query"}}
+    if model.fusion.name == "mvpruner_camera_pool_qaware":
+        pooled = asdict(model.fusion.pooled_query)
+        pooled["rank_quotas"] = list(pooled["rank_quotas"])
+        fusion = {
+            "fusion.name": model.fusion.name,
+            "fusion.stage1_enabled": False,
+            "fusion.input_visual_tokens": len(cfg.data.view_order) * model.vision.seq_len,
+            "fusion.stage2_top_k": model.fusion.stage2_top_k,
+            "fusion.stage2_layer": model.fusion.stage2_layer,
+            "fusion.pooled_query": pooled,
+            "fusion.question_scoring": asdict(model.fusion.question_scoring),
+            "fusion.pool_algorithm_version": 1,
+            "fusion.camera_ranking": "descending_logmeanexp_scores",
+            "fusion.camera_tie_policy": "stable_camera_order",
+            "fusion.output_order": "camera_order_row_major",
+            "fusion.pooling": "adaptive_avg_pool2d_rms_source",
+            "fusion.compression": "camera_local_score_biased_attention_raw_values",
+        }
     if model.fusion.name == "mvpruner_ccts_context":
         fusion.update({"fusion.context_tokens": model.fusion.context_tokens,
                        "fusion.context_algorithm_version": "ccts_context_v1",

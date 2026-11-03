@@ -107,6 +107,28 @@ class CameraQueryConfig:
 
 
 @dataclass(frozen=True)
+class PooledQueryConfig:
+    dim: int = 64
+    rms_eps: float = 1e-6
+    position_policy: str = "new_sequence"
+    rank_quotas: tuple[int, ...] = (16, 9, 9, 4, 4, 4)
+
+    def __post_init__(self) -> None:
+        if type(self.dim) is not int or self.dim <= 0:
+            raise ValueError("fusion.pooled_query.dim must be a positive integer")
+        if (isinstance(self.rms_eps, bool) or not isinstance(self.rms_eps, (int, float))
+                or not math.isfinite(self.rms_eps) or self.rms_eps <= 0):
+            raise ValueError("fusion.pooled_query.rms_eps must be finite and positive")
+        if self.position_policy != "new_sequence":
+            raise ValueError("fusion.pooled_query.position_policy must be new_sequence")
+        if (not isinstance(self.rank_quotas, (list, tuple))
+                or any(type(value) is not int for value in self.rank_quotas)
+                or tuple(self.rank_quotas) != (16, 9, 9, 4, 4, 4)):
+            raise ValueError("fusion.pooled_query.rank_quotas must be [16,9,9,4,4,4]")
+        object.__setattr__(self, "rank_quotas", tuple(self.rank_quotas))
+
+
+@dataclass(frozen=True)
 class QuestionScoringConfig:
     num_heads: int = 4
     hidden_dim: int = 64
@@ -155,8 +177,16 @@ class FusionConfig:
     question_scoring: QuestionScoringConfig | None = None
     stage2_scoring: Stage2ScoringConfig | None = None
     context_tokens: int = 0
+    pooled_query: PooledQueryConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.name == "mvpruner_camera_pool_qaware":
+            if self.pooled_query is None:
+                object.__setattr__(self, "pooled_query", PooledQueryConfig())
+            elif not isinstance(self.pooled_query, PooledQueryConfig):
+                raise ValueError("fusion.pooled_query must be a PooledQueryConfig")
+        elif self.pooled_query is not None:
+            raise ValueError("fusion.pooled_query is supported only by mvpruner_camera_pool_qaware")
         if self.name == "mvpruner_ccts_context":
             if type(self.context_tokens) is not int or self.context_tokens <= 0:
                 raise ValueError("fusion.context_tokens must be a positive integer")
@@ -176,13 +206,15 @@ class FusionConfig:
                 raise ValueError("fusion.query must be a CameraQueryConfig")
         elif self.query is not None:
             raise ValueError("fusion.query is supported only by mvpruner_camera_query")
-        if self.name == "mvpruner_camera_query_qaware":
+        if self.name in {"mvpruner_camera_query_qaware", "mvpruner_camera_pool_qaware"}:
             if self.question_scoring is None:
                 object.__setattr__(self, "question_scoring", QuestionScoringConfig())
             elif not isinstance(self.question_scoring, QuestionScoringConfig):
                 raise ValueError("fusion.question_scoring must be a QuestionScoringConfig")
-            if not all(math.isfinite(v) for v in (self.beta_start, self.beta_end, self.tau)) or not self.beta_start >= self.beta_end >= 0 or self.tau != 1.0 or self.beta_schedule != "linear":
+            if self.name == "mvpruner_camera_query_qaware" and (not all(math.isfinite(v) for v in (self.beta_start, self.beta_end, self.tau)) or not self.beta_start >= self.beta_end >= 0 or self.tau != 1.0 or self.beta_schedule != "linear"):
                 raise ValueError("question-aware allocation requires finite beta_start >= beta_end >= 0, linear beta and tau=1")
+            if self.name == "mvpruner_camera_pool_qaware" and self.question_scoring.gamma <= 0:
+                raise ValueError("pooled-query question_scoring.gamma must be positive")
         elif self.question_scoring is not None:
             raise ValueError("fusion.question_scoring is supported only by mvpruner_camera_query_qaware")
 
@@ -265,6 +297,27 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     def __post_init__(self) -> None:
+        if self.model.fusion.name == "mvpruner_camera_pool_qaware":
+            fusion = self.model.fusion
+            grid = self.model.vision.feature_extraction.output_grid
+            if (self.data.view_order != CAMERA_ORDER or type(self.model.vision.seq_len) is not int
+                    or self.model.vision.seq_len != 64 or grid != [8, 8]
+                    or any(type(value) is not int for value in grid)):
+                raise ValueError("pooled query requires six cameras with an 8x8 grid")
+            if any(type(value) is not int or value <= 0 for value in
+                   (self.model.text.d_model, self.model.vision.output_dim)):
+                raise ValueError("pooled query requires positive integer model dimensions")
+            if (any(type(value) is not int for value in (fusion.stage1_top_k, fusion.stage2_top_k, fusion.stage2_layer))
+                    or (fusion.stage1_top_k, fusion.stage2_top_k, fusion.stage2_layer) != (384, 46, 2)):
+                raise ValueError("pooled query requires stage1_top_k=384, stage2_top_k=46, stage2_layer=2")
+            if self.model.text.d_model % fusion.question_scoring.num_heads:
+                raise ValueError("text.d_model must be divisible by question_scoring.num_heads")
+            if self.runtime.precision != "fp32" or self.training.vision_training != "feature_cache":
+                raise ValueError("pooled query requires fp32 feature_cache training")
+            if self.training.gradient_checkpointing:
+                raise ValueError("pooled query does not support gradient_checkpointing")
+            if any(type(v) is not int or v < 1 for v in (self.training.batch_size, self.training.gradient_accumulation_steps)):
+                raise ValueError("pooled query requires positive integer batch size and accumulation")
         if self.model.fusion.name == "mvpruner_ccts_context":
             fusion = self.model.fusion
             views = len(self.data.view_order)
@@ -402,7 +455,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if adapter_name != "none":
         raise ValueError("mvpruner_two_stage requires model.adapter.name=none; adapters are no longer supported")
     fusion_name = str(fusion_raw.get("name", ""))
-    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_stage2_only", "mvpruner_ccts_context"}:
+    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_stage2_only", "mvpruner_ccts_context", "mvpruner_camera_pool_qaware"}:
         raise ValueError("Unknown model.fusion.name")
     if fusion_name in {"mvpruner_stage2_only", "mvpruner_ccts_context"} and "gamma" in fusion_raw:
         raise ValueError(f"{fusion_name} has no gamma setting")
@@ -418,12 +471,30 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("training.gradient_checkpointing must be a boolean")
     if gradient_checkpointing and fusion_name != "unpruned":
         raise ValueError("training.gradient_checkpointing is currently supported only for unpruned")
-    if fusion_name == "mvpruner_ccts_context":
+    if fusion_name in {"mvpruner_ccts_context", "mvpruner_camera_pool_qaware"}:
         for key in ("stage1_top_k", "stage2_top_k", "stage2_layer", "min_tokens_per_camera"):
             if key in fusion_raw and type(fusion_raw[key]) is not int:
                 raise ValueError(f"fusion.{key} must be an integer")
+    if fusion_name == "mvpruner_camera_pool_qaware":
+        for key in ("batch_size", "gradient_accumulation_steps"):
+            if type(train_raw.get(key)) is not int:
+                raise ValueError(f"training.{key} must be an integer")
+        for mapping, key in ((vision_raw, "seq_len"), (vision_raw, "output_dim"), (text_raw, "d_model")):
+            if type(mapping.get(key)) is not int:
+                raise ValueError(f"model.{key} must be an integer")
+    pooled_query = None
+    pooled_raw = fusion_raw.get("pooled_query")
+    if fusion_name == "mvpruner_camera_pool_qaware":
+        if pooled_raw is not None and not isinstance(pooled_raw, dict):
+            raise ValueError("fusion.pooled_query must be a mapping")
+        try:
+            pooled_query = PooledQueryConfig(**(pooled_raw or {}))
+        except TypeError as exc:
+            raise ValueError(f"Invalid fusion.pooled_query: {exc}") from exc
+    elif pooled_raw is not None:
+        raise ValueError("fusion.pooled_query is supported only by mvpruner_camera_pool_qaware")
     stage1_top_k = int(fusion_raw.get("stage1_top_k", len(view_order) * int(vision_raw.get("seq_len", 49))))
-    stage2_top_k = int(fusion_raw.get("stage2_top_k", fusion_raw.get("top_k", vision_raw.get("seq_len", 49))))
+    stage2_top_k = int(fusion_raw.get("stage2_top_k", fusion_raw.get("top_k", 46 if fusion_name == "mvpruner_camera_pool_qaware" else vision_raw.get("seq_len", 49))))
     minimum_per_camera = int(fusion_raw.get("min_tokens_per_camera", 1))
     relevance_mode = str(fusion_raw.get("stage1_relevance_mode", "shifted_max_cosine"))
     beta_start = float(fusion_raw.get("beta_start", 0.2))
@@ -443,7 +514,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("fusion.query is supported only by mvpruner_camera_query")
     question_scoring = None
     scoring_raw = fusion_raw.get("question_scoring")
-    if fusion_name == "mvpruner_camera_query_qaware":
+    if fusion_name in {"mvpruner_camera_query_qaware", "mvpruner_camera_pool_qaware"}:
         if scoring_raw is not None and not isinstance(scoring_raw, dict):
             raise ValueError("fusion.question_scoring must be a mapping")
         try:
@@ -525,6 +596,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 beta_schedule=beta_schedule,
                 tau=tau,
                 query=query,
+                pooled_query=pooled_query,
                 question_scoring=question_scoring,
                 stage2_scoring=stage2_scoring,
             ),
