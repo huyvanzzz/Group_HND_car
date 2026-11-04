@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -224,12 +225,17 @@ class EfficientVLMForAD(nn.Module):
         report["text_embedding_tokens"] = _stats("text_embedding_tokens", text_tokens)
         visual_features = self.add_spatial_embeddings(visual_features)
         report["spatial_visual_features"] = _stats("spatial_visual_features", visual_features)
-        split = self._mvpruner_encode(
-            visual_features=visual_features,
-            text_tokens=text_tokens,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
+        fusion = self.visual_fusion
+        capture = (fusion.capture_diagnostics()
+                   if isinstance(fusion, QuestionAwareCameraQueryFusion) and not fusion.diagnostics_enabled
+                   else nullcontext())
+        with capture:
+            split = self._mvpruner_encode(
+                visual_features=visual_features,
+                text_tokens=text_tokens,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
         output = self._decode_with_answer_loss(split, input_ids, labels)
         if isinstance(self.visual_fusion, QuestionAwareCameraQueryFusion):
             report["answer_loss_implementation"] = "target_excluded_softplus_v1"

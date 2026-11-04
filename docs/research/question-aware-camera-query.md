@@ -214,6 +214,12 @@ mvpruner.text_pool_max_weight_mean
 ```
 
 Hai thống kê text chỉ tính trong diagnostic capture, không cộng vào loss.
+`forward_debug` tự mở capture cho qaware nếu chưa có capture bên ngoài. Khi chạy
+cell diagnose hiện có, JSONL xuất hai trường trong
+`NUMERICS[stage=diagnose_forward].mvpruner` và
+`NUMERICS[stage=diagnose_backward].mvpruner_gradients`. Lượt backward cũng có
+`question_scorer.text_pool.*` để xem gradient. Không cần thêm cell hoặc thay
+config. Việc xuất thống kê không thêm encode/attention hay optimizer step.
 Báo cáo gradient scorer có `text_pool.*` với `present`, `finite`, `grad_norm`,
 `nonzero_ratio`, `ok`. Zero hữu hạn được chấp nhận; thiếu gradient hoặc NaN/Inf
 bị đánh dấu không đạt. Không dump toàn bộ `a` vào JSONL hoặc lưu graph trong head.

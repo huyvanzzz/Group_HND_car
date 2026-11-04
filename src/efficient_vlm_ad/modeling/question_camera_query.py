@@ -124,5 +124,7 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
                             "nonzero_ratio": float((grad != 0).float().mean()) if grad is not None else 0.,
                             "required": parameter.requires_grad, "ok": finite or not parameter.requires_grad}
         report["question_scorer"] = scorer
+        for name in ("text_pool_entropy", "text_pool_max_weight_mean"):
+            report[name] = float(self.last_debug[name])
         report["ok"] = report["ok"] and all(row["ok"] for row in scorer.values())
         return report

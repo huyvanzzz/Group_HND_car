@@ -194,8 +194,14 @@ def test_one_pool_and_native_sdpa_per_encode_no_persistent_diagnostics(monkeypat
     assert len(attention_calls) == 1
     assert 'text_pool_entropy' not in model.visual_fusion.last_debug
     calls.clear()
+    report = model.forward_debug(**args)
+    assert len(calls) == 1
+    assert not model.visual_fusion.diagnostics_enabled
+    assert not hasattr(model.visual_fusion, '_diagnostic_tensors')
     with model.visual_fusion.capture_diagnostics():
-        report = model.forward_debug(**args)
+        nested_report = model.forward_debug(**args)
+        assert model.visual_fusion.diagnostics_enabled
+        assert nested_report['mvpruner']['text_pool_entropy'] == report['mvpruner']['text_pool_entropy']
     assert report['question_pooling_implementation'] == 'masked_attentive_mlp_v1'
     assert report['scorer_attention_backend'] == 'native_sdpa'
     assert report['mvpruner']['text_pool_max_weight_mean'] == pytest.approx((.5+1/3)/2, abs=1e-6)
@@ -218,6 +224,9 @@ def test_head_diagnostics_accept_zero_but_detect_missing_and_nonfinite_gradients
     with fusion.capture_diagnostics():
         model(**batch()).loss.backward()
         rows = fusion.diagnostic_report(model.projector)['question_scorer']
+        report = fusion.diagnostic_report(model.projector)
+        assert report['text_pool_entropy'] == pytest.approx((torch.log(torch.tensor(2.))+torch.log(torch.tensor(3.))).item()/2, abs=1e-6)
+        assert report['text_pool_max_weight_mean'] == pytest.approx((.5+1/3)/2, abs=1e-6)
         for name in ('fc1.weight', 'fc1.bias', 'fc2.weight'):
             row = rows['text_pool.' + name]
             assert row['present'] and row['finite'] and row['ok']

@@ -86,6 +86,15 @@ def test_text_pool_offline_cli_checkpoint_resume(tmp_path):
     run('prepare-data', '--subset', 'smoke')
     run('prepare-features', '--subset', 'smoke')
     run('diagnose-train', '--stage', 'finetune', '--debug', '--debug-numerics')
+    events = [json.loads(line) for line in (out / 'debug' / 'debug_events.jsonl').read_text().splitlines()]
+    numerics = {event['payload']['stage']: event['payload'] for event in events
+                if event['section'] == 'NUMERICS'}
+    forward = numerics['diagnose_forward']
+    assert forward['question_pooling_implementation'] == 'masked_attentive_mlp_v1'
+    for summary in (forward['mvpruner'], numerics['diagnose_backward']['mvpruner_gradients']):
+        assert 0 <= summary['text_pool_entropy'] < float('inf')
+        assert 0 < summary['text_pool_max_weight_mean'] <= 1
+        assert 'text_pool_weights' not in summary
     run(module='efficient_vlm_ad.accumulation_debug')
     accumulation = json.loads((out / 'debug' / 'gradient_accumulation_verify.json').read_text())
     assert accumulation['ok']
