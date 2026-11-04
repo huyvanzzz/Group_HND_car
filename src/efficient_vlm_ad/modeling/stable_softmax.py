@@ -1,103 +1,133 @@
-"""Paper Eq. 5, scoped to the original camera-query-qaware execution path.
+"""Paper Eq. 5 with compact analytic backward and direct instance-local routing.
 
-TorchFunctionMode is thread-local and never replaces framework globals. It also
-opens SDPA into the same scaled attention math so its internal softmax is fixed.
-Autograd records ordinary tensor operations; backward needs no active mode.
+No dispatch mode, framework-global patches, or SDPA replacements are used.
 """
 from functools import wraps
-from contextvars import ContextVar
-import math
-from types import FunctionType
+from types import FunctionType, MethodType
 
 import torch
+from torch import nn
 from torch.nn import functional as F
-from torch.overrides import TorchFunctionMode
 
 
-_active = ContextVar('camera_query_qaware_paper_softmax', default=False)
+class _StableNormalize(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, z, dim, logarithmic):
+        maximum, indices = z.max(dim=dim, keepdim=True)
+        # This custom forward records no subtraction graph. Its backward below
+        # explicitly treats the argmax slot as constant, as required by Eq. 5.
+        shifted = z - maximum
+        exponentials = shifted.exp()
+        exponentials.scatter_(dim, indices, 0.)
+        other_sum = exponentials.sum(dim=dim, keepdim=True)
+        # softplus(log(sum(exp(others)))) == log1p(sum(exp(others))).
+        # Max-shifting bounds exp <= 1; this avoids a second max reduction,
+        # log, and exp while preserving the small correction near probability 1.
+        if logarithmic:
+            result = shifted - torch.log1p(other_sum)
+        else:
+            # exp(shifted-log1p(s)) == exp(shifted)/(1+s). The analytic
+            # backward never subtracts a rounded maximum probability from 1.
+            exponentials.scatter_(dim, indices, 1.)
+            result = exponentials / (1. + other_sum)
+        result.masked_fill_(~torch.isfinite(maximum), torch.nan)
+        ctx.save_for_backward(result, indices)
+        ctx.dim, ctx.logarithmic = dim, logarithmic
+        return result
+
+    @staticmethod
+    def backward(ctx, gradient):
+        output, indices = ctx.saved_tensors
+        dim = ctx.dim
+        probability = output.exp() if ctx.logarithmic else output
+        if ctx.logarithmic:
+            other_gradients = gradient - probability * gradient.sum(dim=dim, keepdim=True)
+        else:
+            # Center on g_argmax, not sum(p*g), so a rounded p_argmax=1
+            # cannot erase its gradient. The centered argmax slot is zero.
+            difference = gradient - gradient.gather(dim, indices)
+            average = (probability * difference).sum(dim=dim, keepdim=True)
+            other_gradients = probability * (difference - average)
+        other_gradients = other_gradients.scatter(dim, indices, 0.)
+        maximum_gradient = -other_gradients.sum(dim=dim, keepdim=True)
+        return other_gradients.scatter(dim, indices, maximum_gradient), None, None
 
 
 def stable_log_softmax(input, dim=-1, *, dtype=None, _stacklevel=3):
-    """Max-excluded logsumexp + softplus, with a constant zero at argmax."""
+    """Eq. 5 with analytic backward saving only output/argmax.
+
+    First and second derivatives are supported. Single-valid-key rows do not
+    differentiate an all-minus-infinity logsumexp; nonfinite maxima retain NaN.
+    """
     if dim is None:
         dim = F._get_softmax_dim('log_softmax', input.ndim, _stacklevel)
     z = input.to(dtype) if dtype is not None else input
-    maximum = z.argmax(dim=dim, keepdim=True)
-    shifted = (z - z.gather(dim, maximum)).scatter(dim, maximum, 0.)
-    others = shifted.scatter(dim, maximum, -torch.inf)
-    # One valid key is common with causal/padding masks. Avoid differentiating
-    # logsumexp([-inf,...]) in that row (its backward would otherwise be NaN).
-    has_others = torch.isfinite(others).any(dim=dim, keepdim=True)
-    safe = torch.where(has_others, others, torch.zeros_like(others))
-    correction = F.softplus(torch.logsumexp(safe, dim=dim, keepdim=True))
-    correction = torch.where(has_others, correction, torch.zeros_like(correction))
-    result = shifted - correction
-    # Preserve native undefined behavior for all-masked/nonfinite maxima.
-    return result.masked_fill(~torch.isfinite(z.gather(dim, maximum)), torch.nan)
+    return _StableNormalize.apply(z, dim, True)
 
 
 def stable_softmax(input, dim=-1, *, dtype=None, _stacklevel=3):
-    return stable_log_softmax(input, dim, dtype=dtype, _stacklevel=_stacklevel).exp()
+    if dim is None:
+        dim = F._get_softmax_dim('softmax', input.ndim, _stacklevel)
+    z = input.to(dtype) if dtype is not None else input
+    return _StableNormalize.apply(z, dim, False)
 
 
-def _attention(query, key, value, attn_mask=None, dropout_p=0., is_causal=False,
-               *, scale=None, enable_gqa=False):
-    """SDPA reference math with fixed softmax, including boolean/additive masks."""
-    if enable_gqa:
-        key = key.repeat_interleave(query.shape[-3] // key.shape[-3], dim=-3)
-        value = value.repeat_interleave(query.shape[-3] // value.shape[-3], dim=-3)
-    dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
-    q, k, v = query.to(dtype), key.to(dtype), value.to(dtype)
-    logits = q @ k.transpose(-2, -1) * (scale if scale is not None else 1 / math.sqrt(q.shape[-1]))
-    if is_causal:
-        causal = torch.ones(q.shape[-2], k.shape[-2], device=q.device, dtype=torch.bool).tril()
-        logits = logits.masked_fill(~causal, -torch.inf)
-    if attn_mask is not None:
-        logits = (logits.masked_fill(~attn_mask, -torch.inf) if attn_mask.dtype == torch.bool
-                  else logits + attn_mask)
-    valid = ~torch.isneginf(logits).all(-1, keepdim=True)
-    # SDPA defines fully masked queries as zero, rather than standalone NaN.
-    weights = stable_softmax(torch.where(valid, logits, torch.zeros_like(logits)), -1)
-    weights = weights.masked_fill(~valid, 0.)
-    weights = F.dropout(weights, dropout_p, training=True)
-    return (weights @ v).to(query.dtype)
+class _FixedFunctional:
+    """Private dependencies for existing upstream Python functions."""
+    @staticmethod
+    def softmax(*args, **kwargs):
+        return stable_softmax(*args, **kwargs)
+
+    @staticmethod
+    def log_softmax(*args, **kwargs):
+        return stable_log_softmax(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(F, name)
 
 
-class PaperSoftmaxMode(TorchFunctionMode):
-    def __torch_function__(self, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        if func in (torch.softmax, F.softmax, torch.Tensor.softmax):
-            return stable_softmax(*args, **kwargs)
-        if func in (torch.log_softmax, F.log_softmax, torch.Tensor.log_softmax):
-            return stable_log_softmax(*args, **kwargs)
-        if func is F.scaled_dot_product_attention:
-            return _attention(*args, **kwargs)
-        if func is F.multi_head_attention_forward:
-            # TorchFunctionMode treats this Python helper as one operation, so
-            # its internals run outside the mode. Specialize its two numerical
-            # dependencies in a PRIVATE globals dict, leaving upstream code,
-            # projections, masks, dropout and framework globals untouched.
-            native = F.multi_head_attention_forward
-            namespace = dict(native.__globals__, softmax=stable_softmax,
-                             scaled_dot_product_attention=_attention)
-            fixed = FunctionType(native.__code__, namespace, native.__name__,
-                                 native.__defaults__, native.__closure__)
-            fixed.__kwdefaults__ = native.__kwdefaults__
-            return fixed(*args, **kwargs)
-        return func(*args, **kwargs)
+class _FixedNN:
+    functional = _FixedFunctional()
+
+    def __getattr__(self, name):
+        return getattr(nn, name)
 
 
-def with_profile_softmax(method):
-    """Enable only on objects explicitly marked by QuestionAwareCameraQueryFusion."""
-    @wraps(method)
-    def wrapped(self, *args, **kwargs):
-        owner = getattr(self, 'visual_fusion', self)
-        if getattr(owner, '_paper_softmax', False) and not _active.get():
-            token = _active.set(True)
-            try:
-                with PaperSoftmaxMode():
-                    return method(self, *args, **kwargs)
-            finally:
-                _active.reset(token)
-        return method(self, *args, **kwargs)
-    return wrapped
+def _direct_method(original):
+    # Specialize once at installation. Reusing upstream code preserves T5
+    # cache, masks, dropout and generation without operator interception.
+    namespace = dict(original.__globals__, nn=_FixedNN())
+    fixed = FunctionType(original.__code__, namespace, original.__name__,
+                         original.__defaults__, original.__closure__)
+    fixed.__kwdefaults__ = original.__kwdefaults__
+
+    @wraps(original)
+    def call(self, *args, **kwargs):
+        function = fixed if getattr(self, '_paper_softmax', False) else original
+        return function(self, *args, **kwargs)
+    return call
+
+
+def install_t5_softmax(text_model):
+    """Bind fixed T5/generation functions to this qaware model instance only.
+
+    Native scorer MHA/SDPA is untouched. State dict/architecture stay identical.
+    """
+    from transformers.models.t5.modeling_t5 import T5Attention
+    from transformers.generation.utils import GenerationMixin
+
+    if getattr(getattr(text_model, 'config', None), 'model_type', None) != 't5':
+        return  # Offline synthetic models have no T5 attention to replace.
+    if getattr(text_model, '_direct_paper_softmax_installed', False):
+        return
+    attention_forward = _direct_method(T5Attention.forward)
+    for attention in text_model.modules():
+        if isinstance(attention, T5Attention):
+            attention._paper_softmax = True
+            attention.forward = MethodType(attention_forward, attention)
+    text_model._paper_softmax = True
+    for name in ('_sample', '_beam_search', '_group_beam_search',
+                 '_constrained_beam_search', '_contrastive_search', '_dola_decoding'):
+        original = getattr(GenerationMixin, name)
+        setattr(text_model, name, MethodType(_direct_method(original), text_model))
+    text_model._direct_paper_softmax_installed = True

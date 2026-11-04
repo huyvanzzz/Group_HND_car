@@ -60,7 +60,7 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
                                 'subsequent decoding', 'token/beam selection', 'text postprocessing'],
         'flops_method': 'torch.utils.flop_counter.FlopCounterMode; estimated supported major operators',
         'flops_per_mac': 2,
-        'flops_attention_backend': ('explicit scaled attention with max-excluded softplus softmax for FLOPs and latency'
+        'flops_attention_backend': ('native scorer SDPA; direct fixed T5 softmax; FLOPs uses math SDPA'
                                     if question_aware else 'math SDPA with native MHA fastpath disabled; latency uses original backend'),
         'flops_excluded_ops': ['normalization', 'softmax', 'activation/elementwise operations',
                                'sorting/indexing/gather', 'CPU control flow'] + (['dynamic programming', 'logsumexp'] if question_aware else [])

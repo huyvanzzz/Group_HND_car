@@ -49,7 +49,7 @@ Values are original X. Gamma = 0.1 is fixed; allocation noise never enters compr
 
 The parenthesized subtraction preserves finite hard forward values. The allocation gradient is a biased STE surrogate. Only active compression retains its activation graph; scorer and DP retain separate graphs, and the auxiliary candidate pool still consumes memory and time. Inactive query rows receive no direct compression gradient; Gumbel does not guarantee every row is used. Evaluation and generation use only hard-DP and 49 active queries, without soft-DP, candidate pool, or Gumbel draws.
 
-Training loss is answer CE + 0.5 H(P_active), where H is mean entropy across batch and 49 active queries, using log(max(P,1e-8)). Entropy uses hard membership and does not traverse soft allocation. Answer CE directly trains allocation through the bridge; entropy still trains the scorer through the active compression bias. There is no alpha entropy loss. Validation/best-checkpoint selection uses answer CE. The final sequence is [49 visual; question], with new relative position bias and padding mask applied once. Generation encodes once and omits entropy.
+Training loss is answer CE + lambda H(P_active), with lambda from `training.entropy_weight` (currently 0.0 in the tracked profile), where H is mean entropy across batch and 49 active queries, using log(max(P,1e-8)). Entropy uses hard membership and does not traverse soft allocation. Answer CE directly trains allocation through the bridge; entropy still trains the scorer through the active compression bias. There is no alpha entropy loss. Validation/best-checkpoint selection uses answer CE. The final sequence is [49 visual; question], with new relative position bias and padding mask applied once. Generation encodes once and omits entropy.
 
 ## Training and resume
 
@@ -64,45 +64,88 @@ arXiv:2610.31642v1). Standalone softmax/log-softmax now use Eq. 5:
     log_softmax_fixed(z) = d - softplus(u)
     softmax_fixed(z) = exp(log_softmax_fixed(z))
 
-The implementation covers Stage-1 camera weights, question-scorer cross-attention,
-token alpha, camera log-shares, active compression and detached candidate
-compression, every T5 encoder/decoder self-attention and decoder cross-attention,
-and generation beam log-softmax (or sampling softmax). A thread-local
-`TorchFunctionMode` selects these operations only while this profile executes;
-it does not monkey-patch PyTorch or Transformers globals. Because PyTorch MHA
-dispatches its functional helper as one operation, that helper receives a private
-copy of its globals with only softmax/SDPA dependencies specialized. Its upstream
-projection/mask/dropout logic and all parameter/state-dict names stay unchanged.
-Other profiles continue to use their existing implementations.
+The optimized implementation covers Stage-1 camera weights, token alpha, camera
+log-shares, active compression and detached candidate compression, every native
+T5 encoder/decoder self-attention and decoder cross-attention, and generation
+beam log-softmax (or sampling softmax). The scorer's MultiheadAttention is the
+explicit exception: it keeps its original fused/native SDPA and its internal
+softmax. T5 4.46.3 attention is already eager; its existing mask/cache/dropout
+implementation is reused with only its normalization dependency specialized.
 
-Masks, normalization axes, dropout, quotas, Gumbel/STE, beta, entropy definition
-and weight, and generation settings are unchanged. The DP log-partition and
-posterior arithmetic are not standalone softmax calls and remain unchanged.
-Fully masked SDPA queries return zero; single-valid-key rows have finite zero
-softmax gradients. DINO extraction is offline and outside this VLM execution
-scope. No checkpoint migration, architecture-signature or configuration change
-is required; rerunning inference can still differ slightly because numerical
-rounding changes.
+There is no TorchFunctionMode or operator interception. Repository call sites
+call the fixed functions directly. T5/generation functions are specialized once
+per model instance with a private `nn.functional` dependency; neither PyTorch nor
+Transformers globals are patched. No parameters or state-dict keys are added,
+and other profiles keep their existing implementations.
 
-SDPA is evaluated explicitly as scaled QK, fixed softmax and weighted V inside
-this profile, including evaluation/benchmark. This gives up the fused SDPA kernel;
-additional time and memory are possible and require actual GPU measurements.
-Diagnostics report `softmax_implementation: max_excluded_softplus_v1` alongside
-`answer_loss_implementation: target_excluded_softplus_v1`. This is a numerical
-implementation change, not evidence that the previous run suffered collapse or
-that task metrics will improve.
+The forward calculation uses the equivalent, max-shifted expressions:
 
-Verification for this change (CPU, Transformers 4.46.3): targeted numerical,
-scorer/allocation, T5, accumulation, training and prefill regression passed
-(116 passed, one optional skip before the extra metadata assertion); separate
-other-profile regression passed 40 tests. CLI lifecycle plus two-rank Gloo
-checks passed all three tests. The tightened beam-vocabulary routing assertion
-and backend-metadata check also passed. A separate random-weight production-shape
-probe used six cameras, 384 -> 196 -> 49 tokens, T5 width 384, four encoder and
-four decoder blocks, vocabulary 32128: forward/backward had 103 finite gradient
-tensors and two-beam generation completed. This establishes offline execution,
-not GPU memory/speed or trained-model quality. Syntax compilation and
-`git diff --check` passed; the full repository suite was not rerun for this change.
+    S = sum_{i != a} exp(d_i)
+    log_softmax_fixed(z) = d - log1p(S)
+    softmax_fixed(z) = exp(d) / (1 + S)
+
+This avoids redundant logsumexp max reductions and exponentials. The softmax
+probability at a can still round to 1, so autodiff through that ratio is NOT used.
+The custom analytic backward computes all non-maximum gradients first and sets
+the maximum gradient to their negative sum. For upstream gradient g:
+
+    softmax: h_i = g_i - g_a; mu = sum_i p_i h_i
+             dz_i = p_i (h_i - mu), i != a
+    log-softmax: dz_i = g_i - p_i sum_j g_j, i != a
+    both: dz_a = -sum_{i != a} dz_i
+
+Only output and argmax indices are saved for backward. Tests check FP64 first
+and second derivatives, arbitrary upstream gradients, tied logits, padding,
+one-valid-key rows, and gradients beyond both FP32 and FP64 precision cliffs.
+The answer-CE fix remains unchanged. Masks, normalization axes, dropout rates,
+quotas, Gumbel/STE, beta, entropy definition/weight and generation settings are
+unchanged. DP log-partition/posterior arithmetic remains unchanged. DINO
+extraction is offline and outside this VLM execution scope. No config,
+notebook, checkpoint migration or architecture-signature change is required.
+
+Diagnostics now report:
+
+    softmax_implementation: max_excluded_softplus_direct_v2
+    scorer_attention_backend: native_sdpa
+    answer_loss_implementation: target_excluded_softplus_v1
+
+The numeric marker identifies an implementation change, not a new model
+architecture or proof of improved task metrics. Benchmark metadata distinguishes
+native scorer SDPA from direct fixed T5 normalization. GPU measurements are
+still required before drawing speed or VRAM conclusions.
+
+CPU smoke comparison used identical initial weights, inputs, Gumbel seeds,
+FP32, dropout zero, batch two, six cameras, 384 -> 196 -> 49 tokens, T5 width
+384, four encoder/four decoder blocks and vocabulary 32128. Alternating timing
+order, warmup and median measurements gave:
+
+| Operation | Native softmax/CE | Previous full fix | Optimized fix + native scorer SDPA |
+|---|---:|---:|---:|
+| Forward + backward | 427.61 ms | 556.65 ms | 502.48 ms |
+| Generate 8 tokens, beam 1 | 200.75 ms | 319.11 ms | 239.19 ms |
+| Generate 8 tokens, beam 3 | 284.45 ms | 377.29 ms | 286.05 ms |
+
+These are synthetic random-weight CPU measurements, with substantial sample
+timing variation, not GPU latency estimates. Compared with the previous full
+fix, initial logits differed by at most 4.06e-6 and gradients by 1.38e-7
+(relative L2 8.62e-7). Camera budgets and generated token IDs matched in this
+probe; three paired optimizer updates completed with finite gradients and
+nearly identical losses. These observations do not establish model quality.
+Raw benchmark output is in the session's temporary `huy-softmax-opt-*` folder.
+
+Verification after optimization: the complete offline suite ran 804 tests,
+with **782 passed, 3 skipped, 19 existing failures** in 963.15 seconds. Failed
+node IDs exactly matched the 18 previously recorded baseline failures plus
+`test_camera_pool_query_artifacts.py::test_config_geometry_and_training_protocol`.
+The latter was separately reproduced with the pre-optimization source snapshot:
+its assertion expects entropy 0.0 while that separate profile currently has 1.0.
+Neither its config nor its assertion was changed. The 18 older failures concern
+removed notebook resume flags and stale entropy/token-budget/signature expectations.
+No additional failed node IDs appeared. The full suite includes the numeric
+fix/gradgrad/mask checks, native-SDPA routing, T5 and beam routing, state identity,
+CLI lifecycle, accumulation, checkpoint/resume and two-process CPU/Gloo tests.
+Syntax compilation and `git diff --check` passed. There was no GPU run, pretrained
+model/data download, config/notebook edit, commit or push for this optimization.
 
 The dedicated profile uses FP32 feature-cache training, frozen/offline DINO, trainable T5/projector/embeddings/scorer/compressor, ten epochs, batch 16 per process, accumulation 2, AdamW lr 1e-4 and weight decay 0.05, epoch scheduler gamma 0.9, clipping 1.0, seed 42, and gradient checkpointing false. Gradient checkpointing is unsupported for this profile. The notebook starts from pretrained T5; it has no alignment or cross-profile warm start.
 

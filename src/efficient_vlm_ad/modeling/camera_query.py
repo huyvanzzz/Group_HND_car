@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from torch.profiler import record_function
 
 from .mvpruner import MVPrunerTwoStage
-from .stable_softmax import with_profile_softmax
+from . import stable_softmax as normalization
 
 
 @dataclass
@@ -65,7 +65,6 @@ class CameraQueryCompressor(nn.Module):
         nn.init.normal_(self.query_bank, std=query_init_std)
         nn.init.normal_(self.key_projection.weight, std=1 / math.sqrt(d_model))
 
-    @with_profile_softmax
     def forward(
         self,
         values: torch.Tensor,
@@ -138,7 +137,8 @@ class CameraQueryCompressor(nn.Module):
                 if score_bias.shape != values.shape[:2] or not bool(torch.isfinite(score_bias).all()):
                     raise ValueError("score_bias must be finite [B,N]")
                 logits = logits + score_bias.float().unsqueeze(1)
-            probabilities = torch.softmax(logits.masked_fill(~valid, -torch.inf), -1)
+            softmax = normalization.stable_softmax if getattr(self, '_paper_softmax', False) else torch.softmax
+            probabilities = softmax(logits.masked_fill(~valid, -torch.inf), -1)
             if not bool(torch.isfinite(probabilities).all()):
                 raise FloatingPointError("camera-query probabilities must be finite")
             compressed = torch.matmul(probabilities, source).to(values.dtype)

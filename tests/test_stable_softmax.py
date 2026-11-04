@@ -6,7 +6,7 @@ import torch
 from torch.nn import functional as F
 
 from efficient_vlm_ad.modeling.stable_softmax import (
-    PaperSoftmaxMode, stable_softmax, stable_log_softmax,
+    stable_softmax, stable_log_softmax,
 )
 
 
@@ -41,25 +41,19 @@ def test_normal_ties_masks_single_valid_gradcheck(dim):
     assert not grad[1].any()
 
 
-def test_mode_covers_functional_tensor_torch_and_sdpa_without_global_patch():
-    original = F.softmax
-    z = torch.tensor([[9., -9., -9.]], requires_grad=True)
-    with PaperSoftmaxMode():
-        for call in (lambda: F.softmax(z, -1), lambda: torch.softmax(z, -1), lambda: z.softmax(-1)):
-            assert torch.autograd.grad(call()[0, 0], z, retain_graph=True)[0][0, 0] > 0
-        q = torch.randn(2, 3, 4, 5, requires_grad=True)
-        k = torch.randn(2, 3, 6, 5, requires_grad=True)
-        v = torch.randn(2, 3, 6, 7, requires_grad=True)
-        mask = torch.ones(4, 6, dtype=torch.bool)
-        mask[:, -1] = False
-        actual = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        assert F.softmax is original
-    expected = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-    torch.testing.assert_close(actual, expected)
-    for a, b in zip(torch.autograd.grad(actual.sum(), (q, k, v)),
-                    torch.autograd.grad(expected.sum(), (q, k, v))):
-        torch.testing.assert_close(a, b, atol=2e-6, rtol=2e-5)
-    assert torch.autograd.grad(F.softmax(z, -1)[0, 0], z)[0][0, 0] == 0
+def test_scorer_keeps_native_sdpa_and_no_dispatch_mode(monkeypatch):
+    from test_question_camera_query import fusion, inputs
+    import efficient_vlm_ad.modeling.stable_softmax as module
+    calls = []
+    original = F.scaled_dot_product_attention
+    def record(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(F, 'scaled_dot_product_attention', record)
+    f = fusion()
+    f.question_scorer(*inputs(), f.num_views)
+    assert calls, 'scorer must execute native SDPA, not explicit attention'
+    assert not hasattr(module, 'PaperSoftmaxMode')
 
 
 def test_qaware_routes_scorer_compressor_t5_and_generation(monkeypatch):
@@ -81,11 +75,12 @@ def test_qaware_routes_scorer_compressor_t5_and_generation(monkeypatch):
     # Encoder self-attention: 4 blocks; decoder: self + cross for every block.
     assert sum(len(s) == 4 and s[-2:] == (11, 11) for s in calls) >= 2
     assert sum(len(s) == 4 and s[-2:] == (7, 7) for s in calls) >= 2
-    assert any(len(s) == 4 and s[-2:] == (3, 8) for s in calls)  # scorer
+    assert not any(len(s) == 4 and s[-2:] == (3, 8) for s in calls)  # native scorer SDPA
     assert any(len(s) == 3 and s[-2:] == (4, 8) for s in calls)  # compression
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
     report = model.forward_debug(**args)
-    assert report['softmax_implementation'] == 'max_excluded_softplus_v1'
+    assert report['softmax_implementation'] == 'max_excluded_softplus_direct_v2'
+    assert report['scorer_attention_backend'] == 'native_sdpa'
     logs = []
     native_log = module.stable_log_softmax
     def record_log(z, dim=-1, **kwargs):
@@ -161,31 +156,40 @@ def test_stage1_and_detached_candidates_are_covered(monkeypatch):
     assert all(s == (2, 3, 4) for s in calls)
 
 
-def test_sdpa_confident_and_fully_masked_queries():
-    q = torch.ones(1, 1, 2, 1, requires_grad=True)
-    k = torch.tensor([[[[9.], [-9.], [-9.]]]], requires_grad=True)
-    v = torch.tensor([[[[1.], [0.], [0.]]]], requires_grad=True)
-    mask = torch.tensor([[True, True, True], [False, False, False]])
-    with PaperSoftmaxMode():
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-    gradients = torch.autograd.grad(out.sum(), (q, k, v))
-    assert gradients[0][0, 0, 0, 0] > 0
-    assert out[0, 0, 1, 0] == 0
-    assert gradients[0][0, 0, 1, 0] == 0
-    assert all(torch.isfinite(g).all() for g in gradients)
+@pytest.mark.parametrize('fn', [stable_softmax, stable_log_softmax])
+def test_general_upstream_gradient_and_double_backward(fn):
+    z = torch.randn(2, 4, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradgradcheck(lambda x: fn(x, -1), (z,))
+    confident = torch.tensor([[9., -9., -9.]], requires_grad=True)
+    reference = confident.detach().double().requires_grad_()
+    upstream = torch.tensor([[1., .5, -.3]])
+    native = F.softmax if fn is stable_softmax else F.log_softmax
+    a = torch.autograd.grad((fn(confident, -1) * upstream).sum(), confident)[0]
+    b = torch.autograd.grad((native(reference, -1) * upstream.double()).sum(), reference)[0]
+    torch.testing.assert_close(a.double(), b, atol=2e-8, rtol=1e-6)
 
 
-def test_scope_is_restored_after_exception():
-    from efficient_vlm_ad.modeling.stable_softmax import with_profile_softmax
-    class Owner:
-        _paper_softmax = True
-        @with_profile_softmax
-        def run(self):
-            raise RuntimeError('test')
-    with pytest.raises(RuntimeError, match='test'):
-        Owner().run()
-    z = torch.tensor([9., -9., -9.], requires_grad=True)
-    assert torch.autograd.grad(z.softmax(-1)[0], z)[0][0] == 0
+@pytest.mark.parametrize('fn', [stable_softmax, stable_log_softmax])
+def test_equivalent_paper_forward_and_far_beyond_precision_cliff(fn):
+    z = torch.randn(2, 3, 17, dtype=torch.float64, requires_grad=True)
+    idx = z.argmax(-1, keepdim=True)
+    shifted = (z-z.gather(-1, idx)).scatter(-1, idx, 0.)
+    log_paper = shifted-F.softplus(torch.logsumexp(shifted.scatter(-1, idx, -torch.inf), -1, keepdim=True))
+    paper = log_paper.exp() if fn is stable_softmax else log_paper
+    torch.testing.assert_close(fn(z, -1), paper, atol=2e-15, rtol=2e-14)
+    extreme = torch.tensor([[40., -40., -40.]], requires_grad=True)
+    derivative = torch.autograd.grad(fn(extreme, -1)[0, 0], extreme)[0]
+    expected = torch.tensor([[2., -1., -1.]], dtype=torch.float64) * torch.exp(torch.tensor(-80., dtype=torch.float64))
+    assert derivative[0, 0] > 0
+    torch.testing.assert_close(derivative.double(), expected, atol=1e-40, rtol=2e-6)
+
+
+def test_backward_saves_only_output_and_row_indices():
+    saved = []
+    z = torch.randn(2, 4, 8, requires_grad=True)
+    with torch.autograd.graph.saved_tensors_hooks(lambda x: saved.append(x.shape) or x, lambda x: x):
+        stable_softmax(z, -1).sum().backward()
+    assert saved == [torch.Size([2, 4, 8]), torch.Size([2, 4, 1])]
 
 
 def test_prefill_metadata_reports_actual_attention_backend():
@@ -195,4 +199,4 @@ def test_prefill_metadata_reports_actual_attention_backend():
     metadata = prefill_measurement_metadata(_tiny_qaware_model(),
         SimpleNamespace(num_beams=1, early_stopping=False, length_penalty=1., max_new_tokens=3), warmup_samples=1)
     assert metadata['flops_attention_backend'] == (
-        'explicit scaled attention with max-excluded softplus softmax for FLOPs and latency')
+        'native scorer SDPA; direct fixed T5 softmax; FLOPs uses math SDPA')

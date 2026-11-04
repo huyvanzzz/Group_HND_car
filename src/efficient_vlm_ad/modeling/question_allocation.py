@@ -6,7 +6,7 @@ in production. All budget/slot axes are vectorized; only cameras are looped.
 from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
-from .stable_softmax import with_profile_softmax
+from . import stable_softmax as normalization
 
 
 @dataclass
@@ -43,7 +43,6 @@ class QuestionConditionedScorer(nn.Module):
         nn.init.zeros_(self.fc1.bias)
         nn.init.normal_(self.fc2.weight, std=.02)
 
-    @with_profile_softmax
     def forward(self, values, question_states, question_mask, camera_ids, num_cameras):
         if values.ndim != 3 or question_states.ndim != 3:
             raise ValueError('Expected batched visual and question states')
@@ -68,10 +67,13 @@ class QuestionConditionedScorer(nn.Module):
             if (counts == 0).any():
                 raise ValueError('Every camera must have visual tokens')
             camera_logits = torch.logsumexp(scores.unsqueeze(1).masked_fill(~membership, -torch.inf), -1) - counts.to(dtype).log()
-            log_shares = camera_logits.log_softmax(-1)
+            fixed = getattr(self, '_paper_softmax', False)
+            log_shares = (normalization.stable_log_softmax(camera_logits, -1) if fixed
+                          else camera_logits.log_softmax(-1))
             if not torch.isfinite(scores).all() or not torch.isfinite(log_shares).all():
                 raise FloatingPointError('Nonfinite question scores or camera shares')
-            return QuestionScores(scores, scores.softmax(-1), log_shares, log_shares.exp(), counts)
+            alpha = normalization.stable_softmax(scores, -1) if fixed else scores.softmax(-1)
+            return QuestionScores(scores, alpha, log_shares, log_shares.exp(), counts)
 
 
 def build_prefix_utilities(log_shares, capacities, bank_size, beta=0., training=False, noise=None):
