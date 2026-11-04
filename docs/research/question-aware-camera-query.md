@@ -4,6 +4,21 @@ This experimental profile adds question-conditioned camera allocation after the 
 
 Use `configs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_query_qaware.yaml` with `notebooks/kaggle_train_dinov2_camera_query_qaware_finetune.ipynb`. Fusion identity is `mvpruner_camera_query_qaware`; its architecture version is `qaware_prefix_dp_v1`. Existing camera-query, MVPruner and unpruned artifacts retain their own identities.
 
+## Decoder CE ổn định số học
+
+Riêng fusion `mvpruner_camera_query_qaware`, answer loss dùng target-excluded logsumexp và softplus:
+
+\[
+L_t=\operatorname{softplus}\left(
+\operatorname{LogSumExp}_{j\ne y_t}(z_j-z_{y_t})\right).
+\]
+
+Đây vẫn là hard-target CE, đổi cách tính số học theo [A Fix for Softmax and Cross-Entropy](https://arxiv.org/abs/2610.31642). Loss lấy trung bình trên các label hợp lệ, bỏ `-100`; teacher forcing giữ nguyên T5 `_shift_right`. Forward và forward-debug dùng chung implementation, không tính CE native dư thừa. Tổng loss vẫn ghép entropy theo trọng số config hiện có; không sửa scorer, softmax compression, allocation, beta hoặc hai stage.
+
+Không cần thêm/sửa config. Các profile khác, kể cả `mvpruner_camera_pool_qaware`, tiếp tục dùng CE hiện tại. Generation không gọi fixed CE. Debug numerics ghi `answer_loss_implementation: target_excluded_softplus_v1` để nhận biết implementation.
+
+Signature, state-dict keys và điều kiện resume không đổi; checkpoint cùng profile vẫn nạp theo validator hiện có. Khi tiếp tục train bằng code mới, phép tính CE mới được áp dụng, không cam kết tái hiện bitwise trajectory của lượt dùng CE cũ. Chưa có bằng chứng cải thiện metric DriveLM hoặc số đo GPU/VRAM.
+
 ## Question scorer
 
 Let X be the retained visual states and T the prompt/question states after T5 block 1. No labels or decoder states enter scoring. Define non-affine RMS(x) = x / sqrt(mean(x**2) + 1e-6). Four-head, bias-free cross-attention uses RMS(T) as queries and RMS(X) as keys/values, without dropout. Its question-mask-weighted mean m excludes question padding; an empty valid question is rejected.

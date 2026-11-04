@@ -9,6 +9,8 @@ from torch.profiler import record_function
 
 from .multimodal import MultiModalProjector
 from .camera_query import CameraQueryFusion
+from .question_camera_query import QuestionAwareCameraQueryFusion
+from .losses import stable_cross_entropy
 from .camera_pool_query import CameraPoolQueryFusion
 from .mvpruner import MVPrunerTwoStage
 from .mvpruner_stage2_only import MVPrunerStage2Only
@@ -169,7 +171,14 @@ class EfficientVLMForAD(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
+        return self._decode_with_answer_loss(split, input_ids, labels)
+
+    def _decode_with_answer_loss(self, split, input_ids, labels):
+        fixed_ce = isinstance(self.visual_fusion, QuestionAwareCameraQueryFusion) and labels is not None
         decoder_kwargs = {}
+        if fixed_ce:
+            # Preserve T5 teacher forcing, but avoid computing its native CE too.
+            decoder_kwargs["decoder_input_ids"] = self.text_model._shift_right(labels)
         if labels is None and isinstance(self.visual_fusion, (CameraQueryFusion, CameraPoolQueryFusion, MVPrunerCCTSContext)):
             decoder_kwargs["decoder_input_ids"] = torch.full(
                 (input_ids.shape[0], 1), self.text_model.config.decoder_start_token_id,
@@ -178,8 +187,10 @@ class EfficientVLMForAD(nn.Module):
             **decoder_kwargs,
             encoder_outputs=split.encoder_outputs,
             attention_mask=split.attention_mask,
-            labels=labels,
+            labels=None if fixed_ce else labels,
         )
+        if fixed_ce:
+            output["loss"] = stable_cross_entropy(output.logits, labels)
         return self._with_auxiliary_loss(output, split)
 
     def _with_auxiliary_loss(self, output, split):
@@ -216,18 +227,9 @@ class EfficientVLMForAD(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        decoder_kwargs = {}
-        if labels is None and isinstance(self.visual_fusion, (CameraQueryFusion, CameraPoolQueryFusion, MVPrunerCCTSContext)):
-            decoder_kwargs["decoder_input_ids"] = torch.full(
-                (input_ids.shape[0], 1), self.text_model.config.decoder_start_token_id,
-                dtype=input_ids.dtype, device=input_ids.device)
-        output = self.text_model(
-            **decoder_kwargs,
-            encoder_outputs=split.encoder_outputs,
-            attention_mask=split.attention_mask,
-            labels=labels,
-        )
-        output = self._with_auxiliary_loss(output, split)
+        output = self._decode_with_answer_loss(split, input_ids, labels)
+        if isinstance(self.visual_fusion, QuestionAwareCameraQueryFusion):
+            report["answer_loss_implementation"] = "target_excluded_softplus_v1"
         report["mvpruner_encoder_output"] = _stats(
             "mvpruner_encoder_output", split.encoder_outputs.last_hidden_state
         )
