@@ -159,6 +159,109 @@ Resume supports this same profile at an epoch boundary with the same world size.
 
 Both allocator environment variables are set before Torch/CUDA imports. Dependency pins remain transformers 4.46.3, tokenizers 0.20.4 and accelerate 1.15.0. The notebook writes a distinct runtime YAML, uses separate output/cache/archive paths, validates prepared counts and feature manifest v2/model revisions/prepared-file identity/index coverage, and archives runtime YAML, the checkpoint directory with sidecars, metrics, benchmark, predictions and debug records.
 
+## Learned text pooling (2026-11-04)
+
+Chỉ profile `mvpruner_camera_query_qaware` thay masked mean bằng learned pooling.
+Scorer vẫn chạy đúng một cross-attention SDPA sẵn có, tạo
+`M = CrossAttention(RMS(T), RMS(X), RMS(X))` có shape `[B,Lq,D]`.
+Head nhận trực tiếp `M`, chưa thêm normalization:
+
+```text
+u = tanh(Linear(D, H)(M))
+e = Linear(H, 1, bias=False)(u).squeeze(-1)
+a = StableSoftmax(e.masked_fill(~question_mask, -inf), dim=text)
+m = bmm(a.unsqueeze(1), M).squeeze(1)
+s_j = scorer_MLP(concat(RMS(X_j), RMS(m)))
+```
+
+`H` dùng `question_scoring.hidden_dim` hiện có: production D=384, H=64,
+thêm 24.704 tham số trong ba tensor. Đây là head độc lập với MLP chấm visual
+token. Mọi token prompt có mask 1 đều tham gia; padding có trọng số 0, câu hỏi
+không có token hợp lệ vẫn bị từ chối. Không dùng decoder `<pad>`, không thêm
+attention hoặc entropy loss cho trọng số text. `a_t` là trọng số text, khác
+`alpha_j` của visual tokens. Allocation, candidate pool và compression dùng lại
+scores hiện có; generation chỉ encode/pool một lần, không chạy head mỗi token sinh.
+
+Khởi tạo lớp đầu Xavier uniform gain 1, bias 0; lớp cuối zero. Vì vậy `a` ban đầu
+uniform trên token hợp lệ, output gần masked mean trong sai số số học, không
+cam kết bitwise. Toàn bộ khởi tạo head ở trong `fork_rng(devices=[])`, sau các
+module cũ, giữ nguyên RNG CPU và khởi tạo các weight chung. Không đổi seed.
+Backward đầu có gradient tensor zero hợp lệ ở lớp đầu; lớp cuối có thể học ngay.
+AdamW vẫn có thể decay weight lớp đầu dù gradient zero. Sau cập nhật lớp cuối,
+lớp đầu có thể nhận tín hiệu; mẫu chỉ một token hợp lệ hoặc mọi `M_t` giống nhau
+không bảo đảm gradient khác zero. Ý tưởng tanh attention tham khảo
+[HAN, mục 2.2](https://aclanthology.org/N16-1174/); khởi tạo uniform là lựa chọn
+thực nghiệm này, không phải khởi tạo nguyên bản của HAN.
+
+Chỉ `QuestionAwareCameraQueryFusion` bật tùy chọn constructor nội bộ.
+Scorer mặc định, profile spatial pooled-query và qaware-pruning vẫn dùng mean,
+không thêm tham số hoặc state-dict keys. Giữ 384 → 196 → 49 token, các chuẩn hóa
+và CE đã có, native SDPA, optimizer/LR/weight decay, beta/Gumbel/STE và detach.
+Không đổi config, notebook, signature, recipe hoặc checkpoint loader.
+
+Lượt mới finetune từ pretrained T5 bằng notebook hiện có. Checkpoint mới tự lưu
+head trong `visual_fusion.question_scorer.text_pool.{fc1.weight,fc1.bias,fc2.weight}`
+và dùng lifecycle resume hiện có. Checkpoint cũ thiếu head sẽ bị strict loading
+từ chối; không migration hoặc bỏ qua missing keys.
+
+Marker trong `forward_debug`:
+
+```text
+question_pooling_implementation: masked_attentive_mlp_v1
+scorer_attention_backend: native_sdpa
+mvpruner.text_pool_entropy
+mvpruner.text_pool_max_weight_mean
+```
+
+Hai thống kê text chỉ tính trong diagnostic capture, không cộng vào loss.
+Báo cáo gradient scorer có `text_pool.*` với `present`, `finite`, `grad_norm`,
+`nonzero_ratio`, `ok`. Zero hữu hạn được chấp nhận; thiếu gradient hoặc NaN/Inf
+bị đánh dấu không đạt. Không dump toàn bộ `a` vào JSONL hoặc lưu graph trong head.
+
+Kiểm chứng offline mới: 45 test liên quan pass, gồm công thức/reference độc lập,
+FP64 input/parameter gradcheck, masking/permutation, khởi tạo/RNG, CE qua T5 nhỏ,
+optimizer đăng ký mỗi tensor đúng một lần, native SDPA và đúng một lần pooling
+mỗi encode. Diagnostic test chấp nhận gradient zero, phát hiện thiếu/NaN.
+Hai test lifecycle riêng pass: CLI prepare/features → diagnose → accumulation
+verify → finetune → verify/resume → evaluate/benchmark; kiểm tra khôi phục chính
+xác ba tensor head và Adam slots ở update 2/4. Hai rank CPU/Gloo có gradient và
+head state đồng bộ sau cập nhật, kể cả hard quota khác nhau giữa các rank.
+Fixture SGD riêng dùng LR head 1 để quan sát thay đổi rất nhỏ của lớp đầu ở
+FP32; đây không phải thay đổi LR production.
+
+CPU smoke dùng cùng common weights, features, mask, seed, FP32, dropout 0,
+batch 2, D384, sáu camera 64 token, 196 → 49, prompt tensor 16, labels 12,
+vocabulary 32128, T5 bốn encoder/bốn decoder blocks. Hai lượt warmup, tám mẫu
+timing luân phiên thứ tự, median (ms):
+
+| Thời điểm | Phép đo | Mean | Learned |
+|---|---|---:|---:|
+| Khởi tạo | Forward + backward | 472.38 | 466.22 |
+| Khởi tạo | Generate tối đa 8 token, beam 1 | 212.22 | 215.99 |
+| Khởi tạo | Generate tối đa 8 token, beam 3 | 347.62 | 327.15 |
+| Sau 3 update | Forward + backward | 479.15 | 462.42 |
+| Sau 3 update | Generate tối đa 8 token, beam 1 | 192.00 | 189.03 |
+| Sau 3 update | Generate tối đa 8 token, beam 3 | 285.22 | 284.13 |
+
+Đo riêng pooling `[16,38,384]`, H64, 80 mẫu: mean 0.151 ms, learned 0.677 ms
+lúc khởi tạo; sau ba update là 0.151/0.672 ms. Head thêm công việc; các median
+toàn mô hình nhỏ hơn ở một số lượt không chứng minh head làm mô hình nhanh hơn.
+Độ dao động timing CPU và chi phí toàn pipeline lớn hơn phần pooling nhỏ này.
+Ban đầu max absolute logit difference 4.29e-6, loss 10.573593/10.573594, quota
+giống nhau. Ba cặp update có loss hữu hạn gần nhau và head lớp cuối học được
+(norm 0.00124). Đây là model/features ngẫu nhiên, không đo chất lượng DriveLM,
+VRAM, latency GPU hoặc train hai GPU. Raw smoke script/results nằm trong thư
+mục tạm của phiên `huy-text-pool-*`; không thêm công cụ benchmark vào repo.
+
+Full offline suite sau thay đổi: **793 passed, 3 skipped, 19 failed** trên 815
+test, 992.18 giây. Cả 11 test mới trong `test_text_pooling.py` và
+`test_text_pool_lifecycle.py` pass trong lượt tổng. Chạy lại riêng 19 test lỗi
+trên snapshot source trước thay đổi cũng tái hiện đúng 19 test ID đó: assertion
+cũ về notebook resume flag, entropy, token budget và signature. Không phát sinh
+test ID lỗi mới; không sửa config/assertion ngoài phạm vi để làm suite xanh.
+Syntax compilation và `git diff --check` pass. Không tải model/dataset lớn,
+chạy full training, sửa notebook/config/checkpoint loader hoặc commit/push.
+
 ## Evidence and measurement limits
 
 The design review established small-case hard/soft mathematics and bridge-gradient checks, plus a six-camera/49-query FP32 numerical probe; these are not evidence of model quality, GPU speed, or VRAM capacity. Offline implementation tests should cover exhaustive DP oracles, FP64 gradient checks, FP32 stress, hard-forward/bridge gradients, question padding/permutation, split T5 behavior, active entropy, lifecycle schedules and same-horizon replay. Record actual executed checks separately from these design requirements.

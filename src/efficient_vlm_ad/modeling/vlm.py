@@ -235,6 +235,7 @@ class EfficientVLMForAD(nn.Module):
             report["answer_loss_implementation"] = "target_excluded_softplus_v1"
             report["softmax_implementation"] = "max_excluded_softplus_direct_v2"
             report["scorer_attention_backend"] = "native_sdpa"
+            report["question_pooling_implementation"] = "masked_attentive_mlp_v1"
         report["mvpruner_encoder_output"] = _stats(
             "mvpruner_encoder_output", split.encoder_outputs.last_hidden_state
         )
@@ -269,7 +270,7 @@ class EfficientVLMForAD(nn.Module):
             }
         if isinstance(self.visual_fusion, CameraQueryFusion):
             report["mvpruner"]["stage2_method"] = split.debug.get("stage2_method", "camera_query")
-            for name in ("camera_shares", "expected_budgets", "soft_row_mass_error", "beta", "tau", "gamma", "score_std", "alpha_entropy"):
+            for name in ("camera_shares", "expected_budgets", "soft_row_mass_error", "beta", "tau", "gamma", "score_std", "alpha_entropy", "text_pool_entropy", "text_pool_max_weight_mean"):
                 if name in split.debug:
                     value = split.debug[name]
                     report["mvpruner"][name] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value

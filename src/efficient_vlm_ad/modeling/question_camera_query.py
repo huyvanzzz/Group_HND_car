@@ -27,6 +27,7 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
         self.question_scorer = QuestionConditionedScorer(
             dim=self.d_model, num_heads=scoring_num_heads,
             hidden_dim=scoring_hidden_dim, rms_eps=scoring_rms_eps,
+            learned_text_pooling=True,
         )
         self.question_scorer._paper_softmax = True
         self.compressor._paper_softmax = True
@@ -101,6 +102,12 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
             score_std=scoring.scores.detach().std(unbiased=False),
             alpha_entropy=-(scoring.alpha.detach() * scoring.alpha.detach().clamp_min(1e-8).log()).sum(-1).mean(),
         )
+        if self.diagnostics_enabled:
+            weights = scoring.text_pool_weights.detach()
+            result.debug.update(
+                text_pool_entropy=-(weights * weights.clamp_min(1e-8).log()).sum(-1).mean(),
+                text_pool_max_weight_mean=weights.max(-1).values.mean(),
+            )
         if soft is not None:
             result.debug.update(expected_budgets=soft.expected_budgets.detach(),
                                 soft_row_mass_error=soft.soft_row_mass_error.detach())
@@ -113,6 +120,7 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
             grad = parameter.grad
             finite = grad is not None and bool(torch.isfinite(grad).all())
             scorer[name] = {"present": grad is not None, "finite": finite,
+                            "grad_norm": float(grad.norm()) if grad is not None else None,
                             "nonzero_ratio": float((grad != 0).float().mean()) if grad is not None else 0.,
                             "required": parameter.requires_grad, "ok": finite or not parameter.requires_grad}
         report["question_scorer"] = scorer

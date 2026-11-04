@@ -16,6 +16,7 @@ class QuestionScores:
     log_camera_shares: Tensor
     camera_shares: Tensor
     counts: Tensor
+    text_pool_weights: Tensor | None = None
 
 
 @dataclass
@@ -30,8 +31,26 @@ def _rms(x: Tensor, eps: float) -> Tensor:
     return x * (x.square().mean(-1, keepdim=True) + eps).rsqrt()
 
 
+class MaskedAttentiveQuestionPool(nn.Module):
+    """Pool already image-conditioned text states; masks are validated by the scorer."""
+
+    def __init__(self, dim=384, hidden_dim=64):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1, bias=False)
+        nn.init.xavier_uniform_(self.fc1.weight, gain=1.)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.weight)
+
+    def forward(self, states, mask):
+        logits = self.fc2(torch.tanh(self.fc1(states))).squeeze(-1)
+        weights = normalization.stable_softmax(logits.masked_fill(~mask.bool(), -torch.inf), -1)
+        return torch.bmm(weights.unsqueeze(1), states).squeeze(1), weights
+
+
 class QuestionConditionedScorer(nn.Module):
-    def __init__(self, dim=384, num_heads=4, hidden_dim=64, rms_eps=1e-6):
+    def __init__(self, dim=384, num_heads=4, hidden_dim=64, rms_eps=1e-6,
+                 *, learned_text_pooling=False):
         super().__init__()
         self.rms_eps = rms_eps
         self.attention = nn.MultiheadAttention(dim, num_heads, dropout=0., bias=False, batch_first=True)
@@ -42,6 +61,11 @@ class QuestionConditionedScorer(nn.Module):
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.zeros_(self.fc1.bias)
         nn.init.normal_(self.fc2.weight, std=.02)
+        self.text_pool = None
+        if learned_text_pooling:
+            # Keep existing weights and subsequent CPU RNG draws identical to mean pooling.
+            with torch.random.fork_rng(devices=[]):
+                self.text_pool = MaskedAttentiveQuestionPool(dim, hidden_dim)
 
     def forward(self, values, question_states, question_mask, camera_ids, num_cameras):
         if values.ndim != 3 or question_states.ndim != 3:
@@ -59,7 +83,11 @@ class QuestionConditionedScorer(nn.Module):
             x = _rms(values.to(dtype), self.rms_eps)
             q = _rms(question_states.to(dtype), self.rms_eps)
             attended, _ = self.attention(q, x, x, need_weights=False)
-            mean = (attended * mask.unsqueeze(-1)).sum(1) / mask.sum(-1, keepdim=True)
+            text_pool_weights = None
+            if self.text_pool is None:
+                mean = (attended * mask.unsqueeze(-1)).sum(1) / mask.sum(-1, keepdim=True)
+            else:
+                mean, text_pool_weights = self.text_pool(attended, mask)
             mean = _rms(mean, self.rms_eps).unsqueeze(1).expand_as(x)
             scores = self.fc2(torch.relu(self.fc1(torch.cat((x, mean), -1)))).squeeze(-1)
             membership = camera_ids.unsqueeze(1) == torch.arange(num_cameras, device=values.device)[None, :, None]
@@ -73,7 +101,7 @@ class QuestionConditionedScorer(nn.Module):
             if not torch.isfinite(scores).all() or not torch.isfinite(log_shares).all():
                 raise FloatingPointError('Nonfinite question scores or camera shares')
             alpha = normalization.stable_softmax(scores, -1) if fixed else scores.softmax(-1)
-            return QuestionScores(scores, alpha, log_shares, log_shares.exp(), counts)
+            return QuestionScores(scores, alpha, log_shares, log_shares.exp(), counts, text_pool_weights)
 
 
 def build_prefix_utilities(log_shares, capacities, bank_size, beta=0., training=False, noise=None):
