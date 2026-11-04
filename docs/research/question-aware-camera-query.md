@@ -53,6 +53,57 @@ Training loss is answer CE + 0.5 H(P_active), where H is mean entropy across bat
 
 ## Training and resume
 
+### Numerical softmax and answer-CE implementation
+
+For this profile only, answer CE uses the target-excluded `logsumexp` +
+`softplus` expression (Eq. 6 of *A Fix for Softmax and Cross-Entropy*,
+arXiv:2610.31642v1). Standalone softmax/log-softmax now use Eq. 5:
+
+    a = argmax(z); d_a = constant(0); d_i = z_i - z_a for i != a
+    u = logsumexp_{i != a}(d_i)
+    log_softmax_fixed(z) = d - softplus(u)
+    softmax_fixed(z) = exp(log_softmax_fixed(z))
+
+The implementation covers Stage-1 camera weights, question-scorer cross-attention,
+token alpha, camera log-shares, active compression and detached candidate
+compression, every T5 encoder/decoder self-attention and decoder cross-attention,
+and generation beam log-softmax (or sampling softmax). A thread-local
+`TorchFunctionMode` selects these operations only while this profile executes;
+it does not monkey-patch PyTorch or Transformers globals. Because PyTorch MHA
+dispatches its functional helper as one operation, that helper receives a private
+copy of its globals with only softmax/SDPA dependencies specialized. Its upstream
+projection/mask/dropout logic and all parameter/state-dict names stay unchanged.
+Other profiles continue to use their existing implementations.
+
+Masks, normalization axes, dropout, quotas, Gumbel/STE, beta, entropy definition
+and weight, and generation settings are unchanged. The DP log-partition and
+posterior arithmetic are not standalone softmax calls and remain unchanged.
+Fully masked SDPA queries return zero; single-valid-key rows have finite zero
+softmax gradients. DINO extraction is offline and outside this VLM execution
+scope. No checkpoint migration, architecture-signature or configuration change
+is required; rerunning inference can still differ slightly because numerical
+rounding changes.
+
+SDPA is evaluated explicitly as scaled QK, fixed softmax and weighted V inside
+this profile, including evaluation/benchmark. This gives up the fused SDPA kernel;
+additional time and memory are possible and require actual GPU measurements.
+Diagnostics report `softmax_implementation: max_excluded_softplus_v1` alongside
+`answer_loss_implementation: target_excluded_softplus_v1`. This is a numerical
+implementation change, not evidence that the previous run suffered collapse or
+that task metrics will improve.
+
+Verification for this change (CPU, Transformers 4.46.3): targeted numerical,
+scorer/allocation, T5, accumulation, training and prefill regression passed
+(116 passed, one optional skip before the extra metadata assertion); separate
+other-profile regression passed 40 tests. CLI lifecycle plus two-rank Gloo
+checks passed all three tests. The tightened beam-vocabulary routing assertion
+and backend-metadata check also passed. A separate random-weight production-shape
+probe used six cameras, 384 -> 196 -> 49 tokens, T5 width 384, four encoder and
+four decoder blocks, vocabulary 32128: forward/backward had 103 finite gradient
+tensors and two-beam generation completed. This establishes offline execution,
+not GPU memory/speed or trained-model quality. Syntax compilation and
+`git diff --check` passed; the full repository suite was not rerun for this change.
+
 The dedicated profile uses FP32 feature-cache training, frozen/offline DINO, trainable T5/projector/embeddings/scorer/compressor, ten epochs, batch 16 per process, accumulation 2, AdamW lr 1e-4 and weight decay 0.05, epoch scheduler gamma 0.9, clipping 1.0, seed 42, and gradient checkpointing false. Gradient checkpointing is unsupported for this profile. The notebook starts from pretrained T5; it has no alignment or cross-profile warm start.
 
 The automatic beta horizon H is epochs times ceil(len(prepared loader)/accumulation), computed after accelerator preparation. `training.beta_decay_updates` can override it; null chooses automatic for a fresh run and stored H on resume. For t completed optimizer updates:

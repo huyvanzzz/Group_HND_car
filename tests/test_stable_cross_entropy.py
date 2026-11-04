@@ -121,5 +121,7 @@ def test_qaware_logits_and_teacher_forcing_match_native_t5(monkeypatch):
     with torch.no_grad():
         fixed = model(**args)
         native = original(**dict(captured, decoder_input_ids=None, labels=args['labels']))
-    torch.testing.assert_close(fixed.logits, native.logits, rtol=0, atol=0)
+    # Qaware now also uses the paper's standalone attention softmax. Native T5
+    # remains mathematically equivalent, with normal FP32 rounding differences.
+    torch.testing.assert_close(fixed.logits, native.logits, rtol=2e-5, atol=2e-6)
     torch.testing.assert_close(fixed.answer_loss, native.loss)

@@ -11,6 +11,7 @@ from .multimodal import MultiModalProjector
 from .camera_query import CameraQueryFusion
 from .question_camera_query import QuestionAwareCameraQueryFusion
 from .losses import stable_cross_entropy
+from .stable_softmax import with_profile_softmax
 from .camera_pool_query import CameraPoolQueryFusion
 from .mvpruner import MVPrunerTwoStage
 from .mvpruner_stage2_only import MVPrunerStage2Only
@@ -73,6 +74,7 @@ class EfficientVLMForAD(nn.Module):
     def visual_token_len(self) -> int:
         return getattr(self.visual_fusion, "output_visual_tokens", self.visual_fusion.stage2_top_k)
 
+    @with_profile_softmax
     def _mvpruner_encode(
         self,
         *,
@@ -154,6 +156,7 @@ class EfficientVLMForAD(nn.Module):
         spatial = self.row_embeddings(rows) + self.col_embeddings(cols)
         return visual_features + spatial.view(1, 1, self.seq_len, -1)
 
+    @with_profile_softmax
     def forward_from_features(
         self,
         *,
@@ -173,6 +176,7 @@ class EfficientVLMForAD(nn.Module):
         )
         return self._decode_with_answer_loss(split, input_ids, labels)
 
+    @with_profile_softmax
     def _decode_with_answer_loss(self, split, input_ids, labels):
         fixed_ce = isinstance(self.visual_fusion, QuestionAwareCameraQueryFusion) and labels is not None
         decoder_kwargs = {}
@@ -207,6 +211,7 @@ class EfficientVLMForAD(nn.Module):
             output = CameraQueryLMOutput(**fields, answer_loss=answer, entropy_loss=entropy)
         return output
 
+    @with_profile_softmax
     def forward_debug(
         self,
         *,
@@ -230,6 +235,7 @@ class EfficientVLMForAD(nn.Module):
         output = self._decode_with_answer_loss(split, input_ids, labels)
         if isinstance(self.visual_fusion, QuestionAwareCameraQueryFusion):
             report["answer_loss_implementation"] = "target_excluded_softplus_v1"
+            report["softmax_implementation"] = "max_excluded_softplus_v1"
         report["mvpruner_encoder_output"] = _stats(
             "mvpruner_encoder_output", split.encoder_outputs.last_hidden_state
         )
@@ -307,6 +313,7 @@ class EfficientVLMForAD(nn.Module):
             target_optimizer_steps=target_optimizer_steps,
         )
 
+    @with_profile_softmax
     def generate_from_features(
         self,
         *,

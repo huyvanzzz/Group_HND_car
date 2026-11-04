@@ -10,6 +10,7 @@ from torch.nn import functional as F
 from torch.profiler import record_function
 
 from .mvpruner import MVPrunerTwoStage
+from .stable_softmax import with_profile_softmax
 
 
 @dataclass
@@ -64,6 +65,7 @@ class CameraQueryCompressor(nn.Module):
         nn.init.normal_(self.query_bank, std=query_init_std)
         nn.init.normal_(self.key_projection.weight, std=1 / math.sqrt(d_model))
 
+    @with_profile_softmax
     def forward(
         self,
         values: torch.Tensor,

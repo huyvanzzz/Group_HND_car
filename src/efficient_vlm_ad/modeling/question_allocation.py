@@ -6,6 +6,7 @@ in production. All budget/slot axes are vectorized; only cameras are looped.
 from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
+from .stable_softmax import with_profile_softmax
 
 
 @dataclass
@@ -42,6 +43,7 @@ class QuestionConditionedScorer(nn.Module):
         nn.init.zeros_(self.fc1.bias)
         nn.init.normal_(self.fc2.weight, std=.02)
 
+    @with_profile_softmax
     def forward(self, values, question_states, question_mask, camera_ids, num_cameras):
         if values.ndim != 3 or question_states.ndim != 3:
             raise ValueError('Expected batched visual and question states')

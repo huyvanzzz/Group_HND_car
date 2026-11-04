@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.profiler import record_function
+from .stable_softmax import with_profile_softmax
 
 
 def _require_finite(name: str, value: torch.Tensor) -> None:
@@ -271,6 +272,7 @@ class MVPrunerTwoStage(nn.Module):
         diagonal = torch.eye(self.tokens_per_view, dtype=torch.bool, device=visual.device)
         return distance.masked_fill(diagonal.view(1, 1, self.tokens_per_view, self.tokens_per_view), float("inf"))
 
+    @with_profile_softmax
     def stage1(
         self, visual: torch.Tensor, question: torch.Tensor, question_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:

@@ -8,6 +8,7 @@ from torch.nn import functional as F
 from torch.profiler import record_function
 
 from .camera_query import CameraQueryFusion
+from .stable_softmax import with_profile_softmax
 from .question_allocation import (
     QuestionConditionedScorer, build_prefix_utilities, hard_prefix_dp, soft_prefix_dp,
 )
@@ -15,6 +16,7 @@ from .question_allocation import (
 
 class QuestionAwareCameraQueryFusion(CameraQueryFusion):
     algorithm_version = "qaware_prefix_dp_v1"
+    _paper_softmax = True
 
     def __init__(self, *, scoring_num_heads=4, scoring_hidden_dim=64,
                  scoring_gamma=0.1, scoring_rms_eps=1e-6, **kwargs):
@@ -26,8 +28,11 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
             dim=self.d_model, num_heads=scoring_num_heads,
             hidden_dim=scoring_hidden_dim, rms_eps=scoring_rms_eps,
         )
+        self.question_scorer._paper_softmax = True
+        self.compressor._paper_softmax = True
 
     @torch.no_grad()
+    @with_profile_softmax
     def _candidate_pool(self, values, camera_ids, scores, capacities):
         """Detached, camera-local prefix candidates; does not touch diagnostics/RNG."""
         compressor = self.compressor
@@ -57,6 +62,7 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
             candidates.append(output.masked_fill(~active.unsqueeze(-1), 0))
         return torch.stack(candidates, dim=1).reshape(batch, self.num_views * rows, dim)
 
+    @with_profile_softmax
     def compress_from_question(self, values, question_states, question_mask, camera_ids,
                                *, training, compute_entropy=True):
         self.capture_tensor("stage2_values", values)
