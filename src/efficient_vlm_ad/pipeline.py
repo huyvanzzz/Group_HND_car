@@ -661,6 +661,16 @@ def _mvpruner_train_payload(model: torch.nn.Module) -> dict[str, Any]:
     if mvpruner is None:
         return {}
     debug = getattr(mvpruner, "last_debug", {}) or {}
+    if getattr(mvpruner, 'algorithm_version', None) == 'mvpruner_three_stage_qaware_v1':
+        from .modeling.three_stage_qaware import diagnostic_scalars
+        return {'mvpruner': {
+            'algorithm_version': mvpruner.algorithm_version, 'loss_type': 'ce',
+            'stage1_budgets': diagnostic_scalars(debug.get('stage1_budgets')),
+            'stage2_prune': diagnostic_scalars(debug.get('stage2_prune', {})),
+            'stage3_merge': diagnostic_scalars(debug.get('stage3_merge', {})),
+            'beta': mvpruner.current_beta(), 'beta_step': int(mvpruner.beta_step),
+            'beta_target_steps': int(mvpruner.beta_target_steps),
+        }}
     if getattr(mvpruner, 'algorithm_version', None) == 'qaware_spatial_pool_v1':
         fields = ('stage1_enabled', 'stage2_method', 'algorithm_version', 'stage2_budgets',
                   'camera_rank', 'rank_quotas', 'camera_shares', 'camera_relevance', 'pooling',

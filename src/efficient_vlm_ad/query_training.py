@@ -12,13 +12,13 @@ from .training_accumulation import window_size, window_boundary
 LOOP_VERSION = 'camera_query_manual_accumulation_v2'
 
 def is_camera_query(cfg):
-    return getattr(cfg.model.fusion, 'name', None) in {'mvpruner_camera_query', 'mvpruner_camera_query_qaware', 'mvpruner_camera_pool_qaware'}
+    return getattr(cfg.model.fusion, 'name', None) in {'mvpruner_camera_query', 'mvpruner_camera_query_qaware', 'mvpruner_camera_pool_qaware', 'mvpruner_three_stage_qaware'}
 
 def is_spatial_pool_query(cfg):
     return getattr(cfg.model.fusion, 'name', None) == 'mvpruner_camera_pool_qaware'
 
 def is_question_aware_camera_query(cfg):
-    return getattr(cfg.model.fusion, 'name', None) == 'mvpruner_camera_query_qaware'
+    return getattr(cfg.model.fusion, 'name', None) in {'mvpruner_camera_query_qaware', 'mvpruner_three_stage_qaware'}
 
 def qaware_beta_horizon(cfg, prepared_batches, stored_horizon=None):
     explicit = getattr(cfg.training, 'beta_decay_updates', None)
@@ -71,6 +71,13 @@ def training_recipe(cfg):
         recipe['initialization_recipe'] = {**recipe['initialization_recipe'],
             'attention_and_scorer_hidden': 'xavier_uniform_gain_1',
             'scorer_hidden_bias': 0.0, 'scorer_output_std': 0.02}
+    if getattr(cfg.model.fusion, 'name', None) == 'mvpruner_three_stage_qaware':
+        recipe.update(training_loop_version='three_stage_qaware_manual_accumulation_v1',
+                      reduction_recipe={'stage1_top_k': cfg.model.fusion.stage1_top_k,
+                                        'stage2_top_k': cfg.model.fusion.stage2_top_k,
+                                        'stage3_top_k': cfg.model.fusion.stage3_top_k,
+                                        'stage2_after_blocks': 2, 'stage3_after_blocks': 4,
+                                        'beta_policy': 'shared_optimizer_update_counter_horizon_minus_one'})
     return recipe
 
 def validate_resume_metadata(cfg, metadata):

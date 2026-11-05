@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.profiler import record_function
-from . import stable_softmax as normalization
 
 
 def _require_finite(name: str, value: torch.Tensor) -> None:
@@ -309,8 +308,7 @@ class MVPrunerTwoStage(nn.Module):
         diversity = uniqueness.mean(dim=-1)
         high = diversity.max(dim=1, keepdim=True).values
         low = diversity.min(dim=1, keepdim=True).values
-        softmax = normalization.stable_softmax if getattr(self, '_paper_softmax', False) else torch.softmax
-        camera_weights = softmax((diversity - high) / (high - low + 1e-5), dim=1)
+        camera_weights = torch.softmax((diversity - high) / (high - low + 1e-5), dim=1)
         capacity = torch.full_like(camera_weights, self.tokens_per_view, dtype=torch.long)
         with record_function("mvpruner.stage1_allocation"):
             budgets = allocate_bounded_budget(

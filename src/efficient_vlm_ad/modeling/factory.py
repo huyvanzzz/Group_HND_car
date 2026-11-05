@@ -238,11 +238,18 @@ def build_visual_fusion(cfg):
             scoring_num_heads=scoring.num_heads, scoring_hidden_dim=scoring.hidden_dim,
             scoring_rms_eps=scoring.rms_eps,
         )
-    if cfg.model.fusion.name == "mvpruner_camera_query_qaware":
+    if cfg.model.fusion.name in {"mvpruner_camera_query_qaware", "mvpruner_three_stage_qaware"}:
         from .question_camera_query import QuestionAwareCameraQueryFusion
+        constructor = QuestionAwareCameraQueryFusion
+        extra = {}
+        if cfg.model.fusion.name == "mvpruner_three_stage_qaware":
+            from .three_stage_qaware import MVPrunerThreeStageQaware
+            constructor = MVPrunerThreeStageQaware
+            extra["stage3_top_k"] = cfg.model.fusion.stage3_top_k
         fusion = cfg.model.fusion
         query, scoring = fusion.query, fusion.question_scoring
-        return QuestionAwareCameraQueryFusion(
+        return constructor(
+            **extra,
             d_model=cfg.model.text.d_model, vision_dim=cfg.model.vision.output_dim,
             num_views=len(cfg.data.view_order), tokens_per_view=cfg.model.vision.seq_len,
             stage1_top_k=fusion.stage1_top_k, stage2_top_k=fusion.stage2_top_k,

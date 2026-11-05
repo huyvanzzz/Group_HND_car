@@ -22,6 +22,7 @@ def prefill_supported(model) -> bool:
 
 def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> dict[str, Any]:
     query_fusion = getattr(model, 'visual_fusion', None)
+    three_stage = getattr(query_fusion, 'algorithm_version', None) == 'mvpruner_three_stage_qaware_v1'
     camera_query = hasattr(query_fusion, 'compressor')
     question_aware = getattr(query_fusion, 'algorithm_version', None) == 'qaware_prefix_dp_v1'
     question_pruning = getattr(query_fusion, 'algorithm_version', None) == 'qaware_pruning_v1'
@@ -30,7 +31,8 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
     spatial_pool = getattr(query_fusion, 'algorithm_version', None) == 'qaware_spatial_pool_v1'
     return {
         'status': 'supported' if prefill_supported(model) else 'unsupported_synthetic',
-        'scope': ('feature embeddings/projector/question scoring/camera ranking/spatial pooling/query compression + T5 encoder + first decoder forward including LM head'
+        'scope': ('feature embeddings/projector/Stage 1/T5 attention scoring/IRA/token pruning/final encoder norm/question scoring/prefix DP/query compression + T5 encoder + first decoder forward including LM head'
+                  if three_stage else 'feature embeddings/projector/question scoring/camera ranking/spatial pooling/query compression + T5 encoder + first decoder forward including LM head'
                   if spatial_pool else 'feature embeddings/projector/Stage 1/T5 attention scoring/IRA/token pruning/context allocation/CCTS/assignment/merge/group mask + T5 encoder + first decoder forward including LM head'
                   if ccts_context else 'feature embeddings/projector/T5 attention scoring/direct camera allocation/token pruning + T5 encoder + first decoder forward including LM head'
                   if stage2_only else 'feature embeddings/projector/Stage 1/question scoring/IRA/token pruning + T5 encoder + first decoder forward including LM head'
@@ -38,7 +40,13 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
                   if question_aware else 'feature embeddings/fusion/projector/query compression + T5 encoder + first decoder forward including LM head'
                   if camera_query else 'feature embeddings/fusion/projector/pruning + T5 encoder + first decoder forward including LM head'),
         **({'token_reduction': {'name': 'camera_query_qaware' if question_aware else 'camera_query', 'visual_tokens': query_fusion.stage2_top_k}}
-           if camera_query else {}),
+           if camera_query and not three_stage else {}),
+        **({'token_reduction': {'name': 'mvpruner_three_stage_qaware', 'stage1_enabled': True,
+                               'stage1_visual_tokens': query_fusion.stage1_top_k,
+                               'late_encoder_visual_tokens': query_fusion.stage2_top_k,
+                               'visual_tokens': query_fusion.output_visual_tokens,
+                               'stage3_position': 'after_encoder_final_norm_dropout',
+                               'decoder_memory': 'visual_tokens_plus_prompt'}} if three_stage else {}),
         **({'token_reduction': {'name': 'mvpruner_qaware', 'visual_tokens': query_fusion.stage2_top_k}}
            if question_pruning else {}),
         **({'token_reduction': {'name': 'mvpruner_stage2_only', 'stage1_enabled': False,
@@ -60,10 +68,11 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
                                 'subsequent decoding', 'token/beam selection', 'text postprocessing'],
         'flops_method': 'torch.utils.flop_counter.FlopCounterMode; estimated supported major operators',
         'flops_per_mac': 2,
-        'flops_attention_backend': ('native scorer SDPA; direct fixed T5 softmax; FLOPs uses math SDPA'
+        'flops_attention_backend': ('native scorer SDPA; native T5 softmax; FLOPs uses math SDPA'
+                                    if three_stage else 'native scorer SDPA; direct fixed T5 softmax; FLOPs uses math SDPA'
                                     if question_aware else 'math SDPA with native MHA fastpath disabled; latency uses original backend'),
         'flops_excluded_ops': ['normalization', 'softmax', 'activation/elementwise operations',
-                               'sorting/indexing/gather', 'CPU control flow'] + (['dynamic programming', 'logsumexp'] if question_aware else [])
+                               'sorting/indexing/gather', 'CPU control flow'] + (['dynamic programming', 'logsumexp'] if question_aware or three_stage else [])
                               + (['adaptive average pooling', 'logsumexp'] if spatial_pool else []),
         'num_beams': generation.num_beams,
         'warmup_samples': warmup_samples,

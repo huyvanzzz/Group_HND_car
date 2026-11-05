@@ -91,6 +91,8 @@ def test_text_pool_offline_cli_checkpoint_resume(tmp_path):
                 if event['section'] == 'NUMERICS'}
     forward = numerics['diagnose_forward']
     assert forward['question_pooling_implementation'] == 'masked_attentive_mlp_v1'
+    assert forward['softmax_implementation'] == 'native_pytorch'
+    assert forward['answer_loss_implementation'] == 'target_excluded_softplus_v1'
     for summary in (forward['mvpruner'], numerics['diagnose_backward']['mvpruner_gradients']):
         assert 0 <= summary['text_pool_entropy'] < float('inf')
         assert 0 < summary['text_pool_max_weight_mean'] <= 1

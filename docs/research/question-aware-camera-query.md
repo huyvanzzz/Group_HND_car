@@ -21,7 +21,7 @@ Signature, state-dict keys và điều kiện resume không đổi; checkpoint c
 
 ## Question scorer
 
-Let X be the retained visual states and T the prompt/question states after T5 block 1. No labels or decoder states enter scoring. Define non-affine RMS(x) = x / sqrt(mean(x**2) + 1e-6). Four-head, bias-free cross-attention uses RMS(T) as queries and RMS(X) as keys/values, without dropout. Its question-mask-weighted mean m excludes question padding; an empty valid question is rejected.
+Let X be the retained visual states and T the prompt/question states after T5 block 1. No labels or decoder states enter scoring. Define non-affine RMS(x) = x / sqrt(mean(x**2) + 1e-6). Four-head, bias-free cross-attention uses RMS(T) as queries and RMS(X) as keys/values, without dropout. Learned text pooling (described below) produces m from its outputs, excluding question padding; an empty valid question is rejected.
 
 A shared 768 -> 64 -> 1 ReLU MLP scores concatenated [RMS(X_j); RMS(m)]. The last linear layer has no bias. Let s_j be scores and alpha = softmax(s). Camera shares average alpha over that camera, then normalize across cameras. Allocation computes the equivalent stable log shares:
 
@@ -53,7 +53,61 @@ Training loss is answer CE + lambda H(P_active), with lambda from `training.entr
 
 ## Training and resume
 
-### Numerical softmax and answer-CE implementation
+### Current implementation: native softmax + fixed CE + learned pooling (2026-11-05)
+
+All standalone softmax/log-softmax operations now use native PyTorch, including
+Stage-1 camera weights, visual alpha, camera log-shares, active/detached
+compression and learned text pooling. T5 attention and generation use the
+original Transformers methods; no instance wrappers or custom normalization
+flags are installed. The custom normalization module has been removed.
+
+Only the existing target-excluded answer CE fix remains, restricted to
+`mvpruner_camera_query_qaware`. Its teacher forcing, reduction and ignore index
+are unchanged. The tanh learned pooling head, initialization/RNG, native scorer
+SDPA, 384 -> 196 -> 49 tokens, DP/Gumbel/STE, entropy loss and debug capture
+remain unchanged. DP `logsumexp` is part of allocation and is not removed.
+
+Current diagnostic markers are:
+
+```text
+softmax_implementation: native_pytorch
+answer_loss_implementation: target_excluded_softplus_v1
+scorer_attention_backend: native_sdpa
+question_pooling_implementation: masked_attentive_mlp_v1
+```
+
+Both diagnose forward and backward retain `text_pool_entropy`,
+`text_pool_max_weight_mean` and the existing head gradient report. Config,
+notebook, loaders, architecture signature, recipe, accumulation, beta and
+generation settings are unchanged. Existing checkpoints with learned pooling
+strict-load with the same keys/shapes; no migration is required. Old checkpoints
+without that head still follow the existing strict-loading policy. Native
+normalization can change numerical training/generation results; bitwise replay
+of the custom-softmax run is not promised.
+
+Verification after removal: 41 focused tests passed. The full offline suite
+ran 803 tests: **781 passed, 3 skipped, 19 existing failures** in 1033.23 seconds.
+All 23 native-routing, learned-pooling, fixed-CE and pooling-lifecycle tests
+passed within that run. The lifecycle covers prepare/features, diagnose JSONL,
+accumulation verification, finetune, strict checkpoint/Adam restoration, resume,
+evaluate/benchmark and two CPU/Gloo ranks. Both forward/backward JSONL records
+contain the pooling statistics and current markers. The 19 failed test IDs
+exactly match a fresh rerun against the pre-removal source snapshot (stale
+notebook resume/config entropy/token-budget/signature assertions).
+
+A separately captured pre-removal tiny-model state has exactly the same 88
+keys and bitwise-identical initial values after removal, and strict-loads into
+the native model. The committed schema test avoids pinning random parameter
+values across PyTorch versions. All source outside the five normalization
+callers and deleted custom module is byte-identical, including fixed CE,
+training, checkpointing and signature code. Syntax and `git diff --check` pass.
+These CPU checks do not establish GPU latency, VRAM or DriveLM quality. No
+config/notebook edit, large download, full training, commit or push was made.
+
+### Historical custom-softmax experiment (removed 2026-11-05)
+
+The following formulas, implementation details, markers and measurements record
+the previous experiment. They do not describe the current normalization path.
 
 For this profile only, answer CE uses the target-excluded `logsumexp` +
 `softplus` expression (Eq. 6 of *A Fix for Softmax and Cross-Entropy*,
@@ -169,7 +223,7 @@ Head nhận trực tiếp `M`, chưa thêm normalization:
 ```text
 u = tanh(Linear(D, H)(M))
 e = Linear(H, 1, bias=False)(u).squeeze(-1)
-a = StableSoftmax(e.masked_fill(~question_mask, -inf), dim=text)
+a = torch.softmax(e.masked_fill(~question_mask, -inf), dim=text)
 m = bmm(a.unsqueeze(1), M).squeeze(1)
 s_j = scorer_MLP(concat(RMS(X_j), RMS(m)))
 ```
@@ -235,6 +289,8 @@ head state đồng bộ sau cập nhật, kể cả hard quota khác nhau giữa
 Fixture SGD riêng dùng LR head 1 để quan sát thay đổi rất nhỏ của lớp đầu ở
 FP32; đây không phải thay đổi LR production.
 
+Các số đo pooling/toàn mô hình ngày 2026-11-04 dưới đây là lịch sử, dùng custom
+softmax trước khi gỡ; không đại diện tốc độ bản native hiện tại.
 CPU smoke dùng cùng common weights, features, mask, seed, FP32, dropout 0,
 batch 2, D384, sáu camera 64 token, 196 → 49, prompt tensor 16, labels 12,
 vocabulary 32128, T5 bốn encoder/bốn decoder blocks. Hai lượt warmup, tám mẫu

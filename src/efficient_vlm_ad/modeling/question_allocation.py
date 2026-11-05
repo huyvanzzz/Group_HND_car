@@ -6,7 +6,6 @@ in production. All budget/slot axes are vectorized; only cameras are looped.
 from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
-from . import stable_softmax as normalization
 
 
 @dataclass
@@ -44,7 +43,7 @@ class MaskedAttentiveQuestionPool(nn.Module):
 
     def forward(self, states, mask):
         logits = self.fc2(torch.tanh(self.fc1(states))).squeeze(-1)
-        weights = normalization.stable_softmax(logits.masked_fill(~mask.bool(), -torch.inf), -1)
+        weights = torch.softmax(logits.masked_fill(~mask.bool(), -torch.inf), -1)
         return torch.bmm(weights.unsqueeze(1), states).squeeze(1), weights
 
 
@@ -95,12 +94,10 @@ class QuestionConditionedScorer(nn.Module):
             if (counts == 0).any():
                 raise ValueError('Every camera must have visual tokens')
             camera_logits = torch.logsumexp(scores.unsqueeze(1).masked_fill(~membership, -torch.inf), -1) - counts.to(dtype).log()
-            fixed = getattr(self, '_paper_softmax', False)
-            log_shares = (normalization.stable_log_softmax(camera_logits, -1) if fixed
-                          else camera_logits.log_softmax(-1))
+            log_shares = camera_logits.log_softmax(-1)
             if not torch.isfinite(scores).all() or not torch.isfinite(log_shares).all():
                 raise FloatingPointError('Nonfinite question scores or camera shares')
-            alpha = normalization.stable_softmax(scores, -1) if fixed else scores.softmax(-1)
+            alpha = scores.softmax(-1)
             return QuestionScores(scores, alpha, log_shares, log_shares.exp(), counts, text_pool_weights)
 
 

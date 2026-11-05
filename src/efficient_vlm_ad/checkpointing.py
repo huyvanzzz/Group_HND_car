@@ -40,7 +40,7 @@ def _normalize_mvpruner_signature(signature: dict[str, Any]) -> dict[str, Any]:
 def architecture_signature(cfg: Any) -> dict[str, Any]:
     """Configuration identity, independent of training state and output paths."""
     model = cfg.model
-    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key not in {"query", "question_scoring", "stage2_scoring", "context_tokens", "pooled_query"}}
+    fusion = {f"fusion.{key}": value for key, value in asdict(model.fusion).items() if key not in {"query", "question_scoring", "stage2_scoring", "context_tokens", "pooled_query", "stage3_top_k"}}
     if model.fusion.name == "mvpruner_camera_pool_qaware":
         pooled = asdict(model.fusion.pooled_query)
         pooled["rank_quotas"] = list(pooled["rank_quotas"])
@@ -81,6 +81,24 @@ def architecture_signature(cfg: Any) -> dict[str, Any]:
         fusion.update({"fusion.stage2_scoring": asdict(model.fusion.stage2_scoring),
                        "fusion.stage2_algorithm_version": "qaware_pruning_v1",
                        "fusion.stage2_pooling": "masked_mean"})
+    if model.fusion.name == "mvpruner_three_stage_qaware":
+        query = asdict(model.fusion.query)
+        query.pop("init_std")
+        fusion.update({
+            "fusion.stage3_top_k": model.fusion.stage3_top_k,
+            "fusion.stage2_after_blocks": 2, "fusion.stage3_after_blocks": 4,
+            "fusion.stage2_scoring": "t5_pre_dropout_attention",
+            "fusion.stage2_algorithm_version": "mvpruner_attention_ira_gumbel_ste_v1",
+            "fusion.stage2_position_policy": "gather_stage1_source_bias_and_mask",
+            "fusion.stage3_algorithm_version": "qaware_prefix_dp_v1",
+            "fusion.stage3_pooling": "learned_masked_attention",
+            "fusion.stage3_input": "encoder_final_norm_dropout_states",
+            "fusion.stage3_position_policy": "decoder_memory_no_new_position_bias",
+            "fusion.query": query,
+            "fusion.question_scoring": asdict(model.fusion.question_scoring),
+            "fusion.query_bank_policy": "shared_prefix",
+            "fusion.query_bank_size": model.fusion.stage3_top_k - (len(cfg.data.view_order) - 1) * model.fusion.min_tokens_per_camera,
+        })
     if model.fusion.name == "unpruned":
         fusion = {"fusion.name": "unpruned"}
     elif model.fusion.name in {"mvpruner_camera_query", "mvpruner_camera_query_qaware"}:
@@ -95,7 +113,7 @@ def architecture_signature(cfg: Any) -> dict[str, Any]:
             fusion.update({"fusion.question_scoring": asdict(model.fusion.question_scoring),
                            "fusion.allocation_algorithm": "qaware_prefix_dp_v1"})
     return {
-        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name in {"mvpruner_two_stage", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_ccts_context"} else {}),
+        **({"mvpruner.stage1_algorithm_version": 2} if model.fusion.name in {"mvpruner_two_stage", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_ccts_context", "mvpruner_three_stage_qaware"} else {}),
         **{f"vision.{key}": value for key, value in asdict(model.vision).items()},
         "projector.type": model.projector.type,
         **{f"text.{key}": value for key, value in asdict(model.text).items()},

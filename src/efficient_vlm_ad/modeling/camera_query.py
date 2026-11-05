@@ -10,7 +10,6 @@ from torch.nn import functional as F
 from torch.profiler import record_function
 
 from .mvpruner import MVPrunerTwoStage
-from . import stable_softmax as normalization
 
 
 @dataclass
@@ -137,8 +136,7 @@ class CameraQueryCompressor(nn.Module):
                 if score_bias.shape != values.shape[:2] or not bool(torch.isfinite(score_bias).all()):
                     raise ValueError("score_bias must be finite [B,N]")
                 logits = logits + score_bias.float().unsqueeze(1)
-            softmax = normalization.stable_softmax if getattr(self, '_paper_softmax', False) else torch.softmax
-            probabilities = softmax(logits.masked_fill(~valid, -torch.inf), -1)
+            probabilities = torch.softmax(logits.masked_fill(~valid, -torch.inf), -1)
             if not bool(torch.isfinite(probabilities).all()):
                 raise FloatingPointError("camera-query probabilities must be finite")
             compressed = torch.matmul(probabilities, source).to(values.dtype)
@@ -192,6 +190,7 @@ class CameraQueryFusion(MVPrunerTwoStage):
         query_init_std: float = 1.0,
         query_rms_eps: float = 1e-6,
         entropy_weight: float = 0.5,
+        compression_output_tokens: int | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -201,7 +200,7 @@ class CameraQueryFusion(MVPrunerTwoStage):
         self.compressor = CameraQueryCompressor(
             d_model=self.d_model,
             num_views=self.num_views,
-            output_tokens=self.stage2_top_k,
+            output_tokens=self.stage2_top_k if compression_output_tokens is None else compression_output_tokens,
             minimum=self.min_tokens_per_camera,
             query_dim=query_dim,
             query_init_std=query_init_std,

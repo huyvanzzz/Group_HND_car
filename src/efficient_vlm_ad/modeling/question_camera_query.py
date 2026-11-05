@@ -8,7 +8,6 @@ from torch.nn import functional as F
 from torch.profiler import record_function
 
 from .camera_query import CameraQueryFusion
-from . import stable_softmax as normalization
 from .question_allocation import (
     QuestionConditionedScorer, build_prefix_utilities, hard_prefix_dp, soft_prefix_dp,
 )
@@ -16,7 +15,6 @@ from .question_allocation import (
 
 class QuestionAwareCameraQueryFusion(CameraQueryFusion):
     algorithm_version = "qaware_prefix_dp_v1"
-    _paper_softmax = True
 
     def __init__(self, *, scoring_num_heads=4, scoring_hidden_dim=64,
                  scoring_gamma=0.1, scoring_rms_eps=1e-6, **kwargs):
@@ -29,8 +27,6 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
             hidden_dim=scoring_hidden_dim, rms_eps=scoring_rms_eps,
             learned_text_pooling=True,
         )
-        self.question_scorer._paper_softmax = True
-        self.compressor._paper_softmax = True
 
     @torch.no_grad()
     def _candidate_pool(self, values, camera_ids, scores, capacities):
@@ -57,16 +53,15 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
             logits = queries.unsqueeze(0) @ local_keys.transpose(1, 2) / math.sqrt(compressor.query_dim)
             logits = logits + self.gamma * local_scores.unsqueeze(1)
             masked = logits.masked_fill(~valid.unsqueeze(1), -torch.inf)
-            probabilities = (normalization.stable_softmax(masked, -1) if self._paper_softmax
-                             else masked.softmax(-1))
+            probabilities = torch.softmax(masked, -1)
             output = probabilities @ local_values
             active = torch.arange(rows, device=source.device).unsqueeze(0) < capacities[:, camera:camera + 1]
             candidates.append(output.masked_fill(~active.unsqueeze(-1), 0))
         return torch.stack(candidates, dim=1).reshape(batch, self.num_views * rows, dim)
 
     def compress_from_question(self, values, question_states, question_mask, camera_ids,
-                               *, training, compute_entropy=True):
-        self.capture_tensor("stage2_values", values)
+                               *, training, compute_entropy=True, value_probe_name="stage2_values"):
+        self.capture_tensor(value_probe_name, values)
         with torch.autocast(device_type=values.device.type, enabled=False):
             with record_function("mvpruner.stage2_question_scoring"):
                 scoring = self.question_scorer(values.float(), question_states.float(), question_mask,
@@ -77,12 +72,12 @@ class QuestionAwareCameraQueryFusion(CameraQueryFusion):
                     scoring.log_camera_shares, capacities, self.compressor.query_bank.shape[0],
                     beta=self.current_beta(), training=training,
                 )
-                budgets = hard_prefix_dp(utilities, self.stage2_top_k, minimum=self.min_tokens_per_camera)
+                budgets = hard_prefix_dp(utilities, self.compressor.output_tokens, minimum=self.min_tokens_per_camera)
             use_bridge = training and torch.is_grad_enabled()
             soft = None
             if use_bridge:
                 with record_function("mvpruner.stage2_prefix_soft_dp"):
-                    soft = soft_prefix_dp(utilities, self.stage2_top_k,
+                    soft = soft_prefix_dp(utilities, self.compressor.output_tokens,
                                           minimum=self.min_tokens_per_camera, tau=float(self.tau))
                 with record_function("mvpruner.stage2_candidate_pool"):
                     pool = self._candidate_pool(values, camera_ids, scoring.scores.detach(), capacities)

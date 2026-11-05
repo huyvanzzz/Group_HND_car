@@ -11,8 +11,8 @@ from torch.profiler import record_function
 from .multimodal import MultiModalProjector
 from .camera_query import CameraQueryFusion
 from .question_camera_query import QuestionAwareCameraQueryFusion
+from .three_stage_qaware import MVPrunerThreeStageQaware, diagnostic_scalars
 from .losses import stable_cross_entropy
-from .stable_softmax import install_t5_softmax
 from .camera_pool_query import CameraPoolQueryFusion
 from .mvpruner import MVPrunerTwoStage
 from .mvpruner_stage2_only import MVPrunerStage2Only
@@ -70,8 +70,6 @@ class EfficientVLMForAD(nn.Module):
         self.row_embeddings = nn.Embedding(side, vision_dim) if side * side == seq_len else None
         self.col_embeddings = nn.Embedding(side, vision_dim) if side * side == seq_len else None
         self.t5_split_encoder = T5SplitEncoder(text_model.encoder, visual_fusion, split_layer=2)
-        if isinstance(visual_fusion, QuestionAwareCameraQueryFusion):
-            install_t5_softmax(text_model)
 
     @property
     def visual_token_len(self) -> int:
@@ -138,6 +136,9 @@ class EfficientVLMForAD(nn.Module):
             compute_entropy=compute_entropy,
         )
         split.debug.update(stage1_debug)
+        if isinstance(self.visual_fusion, MVPrunerThreeStageQaware):
+            source_indices = torch.gather(_stage1_indices, 1, split.debug["stage2_indices"])
+            split.debug["stage2_prune"]["source_indices"] = source_indices.detach()
         if isinstance(self.visual_fusion, MVPrunerCCTSContext):
             for source, target in (("stage2_indices", "main_source_indices"),
                                    ("context_center_indices", "context_center_source_indices"),
@@ -239,14 +240,23 @@ class EfficientVLMForAD(nn.Module):
         output = self._decode_with_answer_loss(split, input_ids, labels)
         if isinstance(self.visual_fusion, QuestionAwareCameraQueryFusion):
             report["answer_loss_implementation"] = "target_excluded_softplus_v1"
-            report["softmax_implementation"] = "max_excluded_softplus_direct_v2"
+            report["softmax_implementation"] = "native_pytorch"
             report["scorer_attention_backend"] = "native_sdpa"
             report["question_pooling_implementation"] = "masked_attentive_mlp_v1"
         report["mvpruner_encoder_output"] = _stats(
             "mvpruner_encoder_output", split.encoder_outputs.last_hidden_state
         )
         report["mvpruner_attention_mask"] = _stats("mvpruner_attention_mask", split.attention_mask)
-        if isinstance(self.visual_fusion, CameraPoolQueryFusion):
+        if isinstance(self.visual_fusion, MVPrunerThreeStageQaware):
+            report["mvpruner"] = {
+                "stage1_budgets": diagnostic_scalars(split.debug["stage1_budgets"]),
+                "stage2_prune": diagnostic_scalars(split.debug["stage2_prune"]),
+                "stage3_merge": diagnostic_scalars(split.debug["stage3_merge"]),
+                "beta": self.visual_fusion.current_beta(),
+                "beta_step": int(self.visual_fusion.beta_step),
+                "beta_target_steps": int(self.visual_fusion.beta_target_steps),
+            }
+        elif isinstance(self.visual_fusion, CameraPoolQueryFusion):
             report["mvpruner"] = {}
             for name in ("stage1_enabled", "stage2_method", "algorithm_version", "stage2_budgets",
                          "camera_rank", "rank_quotas", "camera_shares", "camera_relevance", "pooling",
@@ -274,7 +284,13 @@ class EfficientVLMForAD(nn.Module):
                 "stage2_budgets": split.debug["stage2_budgets"].detach().cpu().tolist(),
                 "stage1_indices": split.debug["stage1_indices"].detach().cpu().tolist(),
             }
-        if isinstance(self.visual_fusion, CameraQueryFusion):
+        if isinstance(self.visual_fusion, MVPrunerThreeStageQaware):
+            for name in ("answer_loss", "entropy_loss"):
+                value = getattr(output, name)
+                report[name] = float(value.detach()) if value is not None else None
+            report["weighted_entropy_loss"] = (report["entropy_loss"] * self.visual_fusion.entropy_weight
+                                               if report["entropy_loss"] is not None else None)
+        elif isinstance(self.visual_fusion, CameraQueryFusion):
             report["mvpruner"]["stage2_method"] = split.debug.get("stage2_method", "camera_query")
             for name in ("camera_shares", "expected_budgets", "soft_row_mass_error", "beta", "tau", "gamma", "score_std", "alpha_entropy", "text_pool_entropy", "text_pool_max_weight_mean"):
                 if name in split.debug:

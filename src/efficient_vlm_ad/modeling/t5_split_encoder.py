@@ -9,6 +9,7 @@ from torch.profiler import record_function
 
 from .camera_query import CameraQueryFusion
 from .question_camera_query import QuestionAwareCameraQueryFusion
+from .three_stage_qaware import MVPrunerThreeStageQaware
 from .camera_pool_query import CameraPoolQueryFusion
 from .mvpruner import MVPrunerTwoStage, gather_position_bias, validate_attention_numerics
 from .mvpruner_qaware import QuestionAwareMVPruner
@@ -150,7 +151,8 @@ class T5SplitEncoder(nn.Module):
         compute_entropy: bool = True,
     ) -> SplitEncoderResult:
         use_training = self.training if training is None else bool(training)
-        is_qaware = isinstance(self.pruner, (QuestionAwareCameraQueryFusion, CameraPoolQueryFusion))
+        is_three_stage = isinstance(self.pruner, MVPrunerThreeStageQaware)
+        is_qaware = isinstance(self.pruner, (QuestionAwareCameraQueryFusion, CameraPoolQueryFusion)) and not is_three_stage
         is_qaware_pruning = isinstance(self.pruner, QuestionAwareMVPruner)
         is_context = isinstance(self.pruner, MVPrunerCCTSContext)
         batch, sequence, _ = inputs_embeds.shape
@@ -174,7 +176,7 @@ class T5SplitEncoder(nn.Module):
             )
 
         auxiliary_losses = {}
-        is_query = isinstance(self.pruner, (CameraQueryFusion, CameraPoolQueryFusion))
+        is_query = isinstance(self.pruner, (CameraQueryFusion, CameraPoolQueryFusion)) and not is_three_stage
         if is_query:
             if getattr(self.encoder, "gradient_checkpointing", False):
                 raise ValueError("camera-query gradient checkpointing is not supported")
@@ -265,6 +267,44 @@ class T5SplitEncoder(nn.Module):
             debug.update(stage2_indices=selected_indices)
             if not is_context:
                 debug["retained_indices"] = retained_indices
+        if is_three_stage:
+            # The gathered bias belongs to the 98-token encoder sequence, never
+            # to the 49-token decoder memory produced below.
+            relevance = stage2_debug["camera_relevance"].detach()
+            normalized = (relevance - relevance.amin(-1, keepdim=True)) / (
+                relevance.amax(-1, keepdim=True) - relevance.amin(-1, keepdim=True)).clamp_min(self.pruner.eps)
+            compact_prune = {
+                "method": "t5_attention_ira_gumbel_ste",
+                "input_count": visual_count, "output_count": self.pruner.stage2_top_k,
+                "stage2_budgets": stage2_debug["stage2_budgets"].detach(),
+                "indices": selected_indices.detach(),
+                "camera_relevance": stage2_debug["camera_relevance"].detach(),
+                "camera_shares": torch.softmax(normalized, dim=-1),
+                "score_min": scores.detach().amin(), "score_max": scores.detach().amax(),
+                "score_clamp_ratio": (scores.detach() < self.pruner.eps).float().mean(),
+                "encoder_position_bias_shape": list(pruned_position_bias.shape),
+                "encoder_attention_mask_shape": list(pruned_mask.shape),
+            }
+            with record_function("mvpruner.stage3_qaware_merge"):
+                compression = self.pruner.merge_after_encoder(
+                    hidden[:, :self.pruner.stage2_top_k], hidden[:, self.pruner.stage2_top_k:],
+                    question_mask, selected_cameras, training=use_training, compute_entropy=compute_entropy)
+            hidden = torch.cat([compression.visual_tokens, hidden[:, self.pruner.stage2_top_k:]], dim=1)
+            pruned_mask = torch.cat([attention_mask.new_ones(batch, self.pruner.stage3_top_k), question_mask], dim=1)
+            selected_cameras = compression.visual_camera_ids
+            if compression.entropy_loss is not None:
+                auxiliary_losses["entropy_loss"] = compression.entropy_loss
+            # Never place full compression probability matrices in persistent debug.
+            omitted = {"probabilities", "valid_keys", "logits", "p_soft", "p_hard",
+                       "stage2_method", "stage2_budgets"}
+            merge_debug = {k: v.detach() if isinstance(v, torch.Tensor) else v
+                           for k, v in compression.debug.items() if k not in omitted}
+            merge_debug.update(method="qaware_prefix_dp_v1", input_count=self.pruner.stage2_top_k,
+                               output_count=self.pruner.stage3_top_k,
+                               stage3_budgets=compression.budgets.detach())
+            debug.update(stage2_prune=compact_prune, stage3_merge=merge_debug,
+                         stage2_method="t5_attention_ira_gumbel_ste",
+                         stage3_method="qaware_prefix_dp_v1")
         return SplitEncoderResult(
             encoder_outputs=BaseModelOutput(last_hidden_state=hidden),
             attention_mask=pruned_mask,
