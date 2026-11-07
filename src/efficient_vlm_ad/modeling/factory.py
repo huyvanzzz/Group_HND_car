@@ -188,6 +188,17 @@ def build_vision_encoder(cfg):
 
 
 def build_visual_fusion(cfg):
+    if cfg.model.fusion.name == "mvpruner_direct_camera":
+        from .mvpruner_direct_camera import MVPrunerDirectCamera
+        fusion = cfg.model.fusion
+        return MVPrunerDirectCamera(
+            d_model=cfg.model.text.d_model, vision_dim=cfg.model.vision.output_dim,
+            num_views=len(cfg.data.view_order), tokens_per_view=cfg.model.vision.seq_len,
+            stage1_top_k=fusion.stage1_top_k, stage2_top_k=fusion.stage2_top_k,
+            min_tokens_per_camera=fusion.min_tokens_per_camera,
+            relevance_mode=fusion.stage1_relevance_mode, eps=fusion.eps,
+            beta_start=fusion.beta_start, beta_end=fusion.beta_end, tau=fusion.tau,
+        )
     if cfg.model.fusion.name == "mvpruner_camera_pool_qaware":
         from .camera_pool_query import CameraPoolQueryFusion
         fusion = cfg.model.fusion

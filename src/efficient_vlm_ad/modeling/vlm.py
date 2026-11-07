@@ -16,6 +16,7 @@ from .losses import stable_cross_entropy
 from .camera_pool_query import CameraPoolQueryFusion
 from .mvpruner import MVPrunerTwoStage
 from .mvpruner_stage2_only import MVPrunerStage2Only
+from .mvpruner_direct_camera import MVPrunerDirectCamera, DIRECT_CAMERA_FIELDS
 from .mvpruner_ccts_context import MVPrunerCCTSContext
 from .t5_split_encoder import T5SplitEncoder
 
@@ -136,6 +137,8 @@ class EfficientVLMForAD(nn.Module):
             compute_entropy=compute_entropy,
         )
         split.debug.update(stage1_debug)
+        if isinstance(self.visual_fusion, MVPrunerDirectCamera):
+            split.debug["stage2_source_indices"] = torch.gather(_stage1_indices, 1, split.debug["stage2_indices"])
         if isinstance(self.visual_fusion, MVPrunerThreeStageQaware):
             source_indices = torch.gather(_stage1_indices, 1, split.debug["stage2_indices"])
             split.debug["stage2_prune"]["source_indices"] = source_indices.detach()
@@ -310,6 +313,15 @@ class EfficientVLMForAD(nn.Module):
             report["mvpruner"]["beta"] = self.visual_fusion.current_beta()
             report["mvpruner"]["stage2_indices"] = split.debug["stage2_indices"].detach().cpu().tolist()
         report["logits"] = _stats("logits", output.logits)
+        if isinstance(self.visual_fusion, MVPrunerDirectCamera):
+            report["answer_loss_implementation"] = "native_pytorch"
+            report["softmax_implementation"] = "native_pytorch"
+            for key in DIRECT_CAMERA_FIELDS:
+                if key in split.debug:
+                    value = split.debug[key]
+                    report["mvpruner"][key] = value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
+            report["mvpruner"].update(beta_step=int(self.visual_fusion.beta_step),
+                                      beta_target_steps=int(self.visual_fusion.beta_target_steps))
         if isinstance(self.visual_fusion, MVPrunerCCTSContext):
             for key, value in split.debug.items():
                 if key.startswith("context_") or key in {"stage2_method", "main_tokens", "output_visual_tokens",

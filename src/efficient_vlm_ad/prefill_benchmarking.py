@@ -27,11 +27,13 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
     question_aware = getattr(query_fusion, 'algorithm_version', None) == 'qaware_prefix_dp_v1'
     question_pruning = getattr(query_fusion, 'algorithm_version', None) == 'qaware_pruning_v1'
     stage2_only = getattr(query_fusion, 'algorithm_version', None) == 't5_attention_direct_camera_v1'
+    direct_camera = getattr(query_fusion, 'algorithm_version', None) == 't5_attention_direct_camera_stage1_v1'
     ccts_context = getattr(query_fusion, 'algorithm_version', None) == 'ccts_context_v1'
     spatial_pool = getattr(query_fusion, 'algorithm_version', None) == 'qaware_spatial_pool_v1'
     return {
         'status': 'supported' if prefill_supported(model) else 'unsupported_synthetic',
-        'scope': ('feature embeddings/projector/Stage 1/T5 attention scoring/IRA/token pruning/final encoder norm/question scoring/prefix DP/query compression + T5 encoder + first decoder forward including LM head'
+        'scope': ('feature embeddings/projector/Stage 1 DRA CCTS/T5 attention scoring/direct camera allocation/token pruning + T5 encoder + first decoder forward including LM head'
+                  if direct_camera else 'feature embeddings/projector/Stage 1/T5 attention scoring/IRA/token pruning/final encoder norm/question scoring/prefix DP/query compression + T5 encoder + first decoder forward including LM head'
                   if three_stage else 'feature embeddings/projector/question scoring/camera ranking/spatial pooling/query compression + T5 encoder + first decoder forward including LM head'
                   if spatial_pool else 'feature embeddings/projector/Stage 1/T5 attention scoring/IRA/token pruning/context allocation/CCTS/assignment/merge/group mask + T5 encoder + first decoder forward including LM head'
                   if ccts_context else 'feature embeddings/projector/T5 attention scoring/direct camera allocation/token pruning + T5 encoder + first decoder forward including LM head'
@@ -52,6 +54,13 @@ def prefill_measurement_metadata(model, generation, *, warmup_samples: int) -> d
         **({'token_reduction': {'name': 'mvpruner_stage2_only', 'stage1_enabled': False,
                                'input_visual_tokens': query_fusion.num_views * query_fusion.tokens_per_view,
                                'visual_tokens': query_fusion.stage2_top_k}} if stage2_only else {}),
+        **({'token_reduction': {'name': 'mvpruner_direct_camera', 'stage1_enabled': True,
+                               'input_visual_tokens': query_fusion.num_views * query_fusion.tokens_per_view,
+                               'stage1_visual_tokens': query_fusion.stage1_top_k,
+                               'visual_tokens': query_fusion.stage2_top_k,
+                               'decoder_memory': 'visual_tokens_plus_prompt',
+                               'camera_allocation': 'direct_minmax_softmax_v1',
+                               'position_policy': 'gather_stage1_source_bias_and_mask'}} if direct_camera else {}),
         **({'token_reduction': {'name': 'mvpruner_ccts_context', 'stage1_enabled': True,
                                'main_tokens': query_fusion.stage2_top_k,
                                'context_tokens': query_fusion.context_tokens,

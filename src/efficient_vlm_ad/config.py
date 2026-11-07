@@ -181,6 +181,18 @@ class FusionConfig:
     pooled_query: PooledQueryConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.name == "mvpruner_direct_camera":
+            for key in ("stage1_top_k", "stage2_top_k", "stage2_layer", "min_tokens_per_camera"):
+                if type(getattr(self, key)) is not int or getattr(self, key) < 1:
+                    raise ValueError(f"fusion.{key} must be a positive integer")
+            for key in ("eps", "beta_start", "beta_end", "tau"):
+                value = getattr(self, key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError(f"fusion.{key} must be a finite number")
+            if (self.stage2_layer != 2 or self.stage1_relevance_mode != "shifted_max_cosine"
+                    or self.beta_schedule != "linear" or not self.beta_start >= self.beta_end >= 0
+                    or self.tau <= 0 or self.eps <= 0):
+                raise ValueError("direct camera requires Stage 1 max-cosine, layer 2, linear beta and positive tau/eps")
         if self.name == "mvpruner_three_stage_qaware":
             for key in ("eps", "beta_start", "beta_end", "tau"):
                 value = getattr(self, key)
@@ -305,6 +317,22 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     def __post_init__(self) -> None:
+        if self.model.fusion.name == "mvpruner_direct_camera":
+            fusion = self.model.fusion
+            counts = (self.model.vision.seq_len, self.model.vision.output_dim,
+                      self.model.text.d_model, self.training.batch_size,
+                      self.training.gradient_accumulation_steps, self.training.finetune_epochs)
+            if any(type(value) is not int or value < 1 for value in counts):
+                raise ValueError("direct camera dimensions and training counts must be positive integers")
+            views = len(self.data.view_order)
+            if not views * fusion.min_tokens_per_camera <= fusion.stage2_top_k <= fusion.stage1_top_k <= views * self.model.vision.seq_len:
+                raise ValueError("direct camera has invalid token budgets")
+            if type(self.training.align_epochs) is not int or self.training.align_epochs != 0:
+                raise ValueError("direct camera supports finetune only; align_epochs must be 0")
+            if self.runtime.precision != "fp32" or self.training.vision_training != "feature_cache":
+                raise ValueError("direct camera requires fp32 feature_cache training")
+            if self.training.entropy_weight != 0 or self.training.gradient_checkpointing:
+                raise ValueError("direct camera requires native CE only and no gradient_checkpointing")
         if self.model.fusion.name == "mvpruner_three_stage_qaware":
             fusion = self.model.fusion
             integer_values = (fusion.stage1_top_k, fusion.stage2_top_k, fusion.stage3_top_k,
@@ -479,8 +507,27 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if adapter_name != "none":
         raise ValueError("mvpruner_two_stage requires model.adapter.name=none; adapters are no longer supported")
     fusion_name = str(fusion_raw.get("name", ""))
-    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_stage2_only", "mvpruner_ccts_context", "mvpruner_camera_pool_qaware", "mvpruner_three_stage_qaware"}:
+    if fusion_name not in {"mvpruner_two_stage", "unpruned", "mvpruner_camera_query", "mvpruner_camera_query_qaware", "mvpruner_qaware", "mvpruner_stage2_only", "mvpruner_ccts_context", "mvpruner_camera_pool_qaware", "mvpruner_three_stage_qaware", "mvpruner_direct_camera"}:
         raise ValueError("Unknown model.fusion.name")
+    if fusion_name == "mvpruner_direct_camera":
+        for key in ("stage1_top_k", "stage2_top_k"):
+            _require(fusion_raw, key)
+        if "gamma" in fusion_raw:
+            raise ValueError("mvpruner_direct_camera has no gamma setting")
+        for key in ("stage1_top_k", "stage2_top_k", "stage2_layer", "min_tokens_per_camera"):
+            if key in fusion_raw and type(fusion_raw[key]) is not int:
+                raise ValueError(f"fusion.{key} must be an integer")
+        for key in ("batch_size", "gradient_accumulation_steps", "align_epochs", "finetune_epochs"):
+            if key in train_raw and type(train_raw[key]) is not int:
+                raise ValueError(f"training.{key} must be an integer")
+        for mapping, key in ((vision_raw, "seq_len"), (vision_raw, "output_dim"), (text_raw, "d_model")):
+            if type(mapping.get(key)) is not int:
+                raise ValueError(f"model.{key} must be an integer")
+        for key in ("eps", "beta_start", "beta_end", "tau"):
+            if key in fusion_raw:
+                value = fusion_raw[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError(f"fusion.{key} must be a finite number")
     if fusion_name in {"mvpruner_stage2_only", "mvpruner_ccts_context", "mvpruner_three_stage_qaware"} and "gamma" in fusion_raw:
         raise ValueError(f"{fusion_name} has no gamma setting")
     context_tokens = fusion_raw.get("context_tokens", 15 if fusion_name == "mvpruner_ccts_context" else 0)
