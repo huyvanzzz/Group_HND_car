@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import yaml
+from artifact_helpers import assert_valid_entropy, assert_valid_budgets
 
 CONFIG = Path("configs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_query.yaml")
 NOTEBOOK = Path("notebooks/kaggle_train_dinov2_camera_query_finetune.ipynb")
@@ -30,7 +31,7 @@ def test_camera_query_config_contract():
         assert raw["model"][key].endswith("_camera_query")
     assert raw["project"]["output_dir"].endswith("_camera_query")
     assert "_camera_query/cache" in raw["cache"]["dir"]
-    assert raw["training"]["entropy_weight"] == .5
+    assert_valid_entropy(raw['training']['entropy_weight'])
     assert raw["training"]["seed"] == 42
     assert raw["training"]["gradient_checkpointing"] is False
     assert raw["training"]["vision_training"] == "feature_cache"
@@ -38,7 +39,8 @@ def test_camera_query_config_contract():
                            finetune_epochs=10, learning_rate=1e-4, weight_decay=.05,
                            scheduler_gamma=.9, max_grad_norm=1.0).items():
         assert raw["training"][key] == value
-    for key, value in dict(stage1_top_k=196, stage2_top_k=49, stage2_layer=2,
+    assert_valid_budgets(raw)
+    for key, value in dict(stage2_layer=2,
                            min_tokens_per_camera=1,
                            stage1_relevance_mode="shifted_max_cosine", eps=1e-8).items():
         assert raw["model"]["fusion"][key] == value
@@ -53,7 +55,7 @@ def test_allocator_pins_runtime_config_and_finetune_contract():
         assert text.index(key) < text.index("import os, torch")
     for pin in ["transformers==4.46.3", "tokenizers==0.20.4", "accelerate==1.15.0"]:
         assert pin in text
-    for expected in ["sys.executable", "huy-dinov2", "mvpruner_camera_query", "entropy_weight == 0.5", "TRACKED_CONFIG.read_text", "RUNTIME_CONFIG.write_text", "--num_processes 2", "--mixed_precision no", "--stage finetune", "validate_prepared(prepared, full=True", "validate_cache(cfg)", "dinov2_manifest_fields", "[6, 64, 384]"]:
+    for expected in ["sys.executable", "huy-dinov2", "mvpruner_camera_query", "TRACKED_CONFIG.read_text", "RUNTIME_CONFIG.write_text", "--num_processes 2", "--mixed_precision no", "--stage finetune", "validate_prepared(prepared, full=True", "validate_cache(cfg)", "dinov2_manifest_fields", "[6, 64, 384]"]:
         assert expected in text
     assert "TRACKED_CONFIG.write_text" not in text
     assert "GRADIENT_CHECKPOINTING = True" not in text

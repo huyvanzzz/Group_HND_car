@@ -62,8 +62,14 @@ New model instances no longer allocate the unused GPA module, so total parameter
 ## Verification
 
 ```bash
-python -m pytest tests -q
+# Full suite (the default includes integration and distributed tests)
+python -m pytest -q
+
+# Local checks while editing a component
+python -m pytest -q -m "not integration and not distributed"
 ```
+
+See [test-suite audit and timing](docs/research/test-suite-cleanup.md) for retained coverage, merged tests and measurement details. Distributed tests use two CPU/Gloo processes; lifecycle tests use offline fixtures without downloading models or datasets.
 
 ## Camera-query Stage 2
 

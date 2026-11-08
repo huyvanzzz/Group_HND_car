@@ -1,5 +1,3 @@
-import subprocess
-import sys
 from pathlib import Path
 import json
 
@@ -7,6 +5,8 @@ from PIL import Image
 
 from efficient_vlm_ad.progress import progress
 from efficient_vlm_ad.progress_logging import MinimalProgressWriter, ProgressEventWriter
+
+from runtime_helpers import checked_cli as _checked_cli
 
 
 def test_pyproject_declares_tqdm_dependency():
@@ -20,41 +20,16 @@ def test_progress_helper_yields_all_items():
     assert list(progress([1, 2, 3], desc="unit", disable=True)) == [1, 2, 3]
 
 
-def test_cli_help_exposes_no_progress():
-    result = subprocess.run(
-        [sys.executable, "-m", "efficient_vlm_ad", "train", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+def test_cli_help_exposes_train_progress_flags():
+    result = _checked_cli(['train', '--help'])
 
     assert "--no-progress" in result.stdout
-
-
-def test_cli_help_exposes_progress_log_every_steps():
-    result = subprocess.run(
-        [sys.executable, "-m", "efficient_vlm_ad", "train", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
     assert "--progress-log-every-steps" in result.stdout
 
 
 def test_cli_help_exposes_eval_benchmark_progress_flags():
-    eval_help = subprocess.run(
-        [sys.executable, "-m", "efficient_vlm_ad", "evaluate", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    benchmark_help = subprocess.run(
-        [sys.executable, "-m", "efficient_vlm_ad", "benchmark", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    eval_help = _checked_cli(['evaluate', '--help'])
+    benchmark_help = _checked_cli(['benchmark', '--help'])
 
     assert "--batch-size" in eval_help.stdout
     assert "--progress-log-every-samples" in eval_help.stdout
@@ -135,17 +110,4 @@ training:
         encoding="utf-8",
     )
 
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "efficient_vlm_ad",
-            "prepare-data",
-            "--config",
-            str(cfg),
-            "--subset",
-            "smoke",
-            "--no-progress",
-        ],
-        check=True,
-    )
+    _checked_cli(['prepare-data', '--config', str(cfg), '--subset', 'smoke', '--no-progress'])

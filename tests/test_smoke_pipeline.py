@@ -1,32 +1,15 @@
 import json
-import subprocess
-import sys
 from types import SimpleNamespace
 from pathlib import Path
 
-from PIL import Image
 import torch
 import pytest
 
 from efficient_vlm_ad.pipeline import _target_optimizer_steps
+from data_helpers import _make_fake_data
+from runtime_helpers import checked_cli, run_isolated_workflow
 
 
-def _make_fake_data(root: Path, rows_per_split: int = 1):
-    images = root / "images"
-    images.mkdir(parents=True)
-    camera_names = ["Front", "Front-Left", "Front-Right", "Back", "Back-Left", "Back-Right"]
-    for split in ("train", "val", "test"):
-        rows = []
-        for idx in range(rows_per_split):
-            camera_paths = {}
-            for camera in camera_names:
-                path = images / f"{split}_{idx}_{camera}.jpg"
-                Image.new("RGB", (16, 16), color=(20 + idx, 40, 60)).save(path)
-                camera_paths[camera] = str(path.relative_to(root))
-            rows.append([{"Q": f"What is visible {split} {idx}?", "A": "A road."}, camera_paths])
-        split_path = root / "data" / "multi_frame" / f"multi_frame_{split}.json"
-        split_path.parent.mkdir(parents=True, exist_ok=True)
-        split_path.write_text(json.dumps(rows), encoding="utf-8")
 
 
 def test_target_optimizer_steps_matches_epoch_end_accumulation_flush():
@@ -35,6 +18,8 @@ def test_target_optimizer_steps_matches_epoch_end_accumulation_flush():
 
 
 def test_offline_smoke_cli_sequence(tmp_path: Path):
+    if run_isolated_workflow(__file__, "test_offline_smoke_cli_sequence"):
+        return
     data_root = tmp_path / "dataset"
     _make_fake_data(data_root, rows_per_split=2)
     output_dir = tmp_path / "outputs"
@@ -113,7 +98,7 @@ generation:
         ],
     ]
     for command in commands:
-        subprocess.run([sys.executable, "-m", "efficient_vlm_ad", *command], check=True)
+        checked_cli([*command])
 
     assert (output_dir / "predictions.jsonl").exists()
     assert (output_dir / "benchmark.json").exists()
@@ -191,8 +176,8 @@ generation:
         encoding="utf-8",
     )
 
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "smoke"], check=True)
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg), "--subset", "smoke"], check=True)
+    checked_cli(['prepare-data', '--config', str(cfg), '--subset', 'smoke'])
+    checked_cli(['prepare-features', '--config', str(cfg), '--subset', 'smoke'])
 
     index = json.loads((output_dir / "cache" / "index.json").read_text(encoding="utf-8"))
     assert len(index) == 6
@@ -291,7 +276,7 @@ evaluation:
             ["train", "--config", str(cfg), "--stage", "finetune", "--max-steps", "1"],
         ] + commands[4:]
     for command in commands:
-        subprocess.run([sys.executable, "-m", "efficient_vlm_ad", *command], check=True)
+        checked_cli([*command])
 
     stage = "finetune" if finetune_only else "align"
     align = torch.load(output_dir / "checkpoints" / f"{stage}_latest.pt", map_location="cpu", weights_only=False)
@@ -353,25 +338,10 @@ generation:
         encoding="utf-8",
     )
 
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "full"], check=True)
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg), "--subset", "full"], check=True)
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "train", "--config", str(cfg), "--stage", "align", "--no-progress"], check=True)
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "efficient_vlm_ad",
-            "train",
-            "--config",
-            str(cfg),
-            "--stage",
-            "finetune",
-            "--resume",
-            str(output_dir / "checkpoints" / "align_best.pt"),
-            "--no-progress",
-        ],
-        check=True,
-    )
+    checked_cli(['prepare-data', '--config', str(cfg), '--subset', 'full'])
+    checked_cli(['prepare-features', '--config', str(cfg), '--subset', 'full'])
+    checked_cli(['train', '--config', str(cfg), '--stage', 'align', '--no-progress'])
+    checked_cli(['train', '--config', str(cfg), '--stage', 'finetune', '--resume', str(output_dir / 'checkpoints' / 'align_best.pt'), '--no-progress'])
 
     assert (output_dir / "checkpoints" / "align_latest.pt").exists()
     assert (output_dir / "debug" / "train_progress.jsonl").exists()
@@ -416,8 +386,8 @@ generation:
 """,
         encoding="utf-8",
     )
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg_path), "--subset", "smoke"], check=True)
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg_path), "--subset", "smoke"], check=True)
+    checked_cli(['prepare-data', '--config', str(cfg_path), '--subset', 'smoke'])
+    checked_cli(['prepare-features', '--config', str(cfg_path), '--subset', 'smoke'])
     cfg = load_config(cfg_path)
     _, tokenizer = pipeline.build_vlm_model(cfg)
 

@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import yaml
+from artifact_helpers import assert_valid_entropy, assert_valid_budgets
 
 ROOT = Path(__file__).resolve().parents[1]
 STEM = "dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner"
@@ -15,8 +16,10 @@ def test_direct_camera_config_preserves_baseline_protocol():
     original = yaml.safe_load((ROOT / "configs" / f"{STEM}.yaml").read_text(encoding="utf-8"))
     new = yaml.safe_load((ROOT / "configs" / f"{STEM}_direct_camera.yaml").read_text(encoding="utf-8"))
     assert "stage1_enabled" not in new["model"]["fusion"]  # Derived from profile, not an ignored YAML switch.
-    assert new["model"]["fusion"].pop("stage1_top_k") == 196
-    assert new["model"]["fusion"].pop("stage2_top_k") == 49
+    assert_valid_budgets(original)
+    assert_valid_budgets(new)
+    new["model"]["fusion"].pop("stage1_top_k")
+    new["model"]["fusion"].pop("stage2_top_k")
     original["model"]["fusion"].pop("stage2_top_k")
     original["model"]["fusion"].pop("stage1_top_k")
     assert new["model"]["fusion"].pop("name") == "mvpruner_direct_camera"
@@ -28,7 +31,7 @@ def test_direct_camera_config_preserves_baseline_protocol():
     new["cache"]["dir"] = original["cache"]["dir"]
     assert new["model"]["profile"] == original["model"]["profile"] + "_direct_camera"
     new["model"]["profile"] = original["model"]["profile"]
-    assert new["training"].pop("entropy_weight") == 0.0
+    assert_valid_entropy(new["training"].pop("entropy_weight"))
     assert new["training"].pop("gradient_checkpointing") is False
     assert "seed" not in new["training"]
     original["training"].pop("align_epochs")

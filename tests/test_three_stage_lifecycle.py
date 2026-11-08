@@ -1,37 +1,19 @@
 """Offline CLI coverage for the three-stage pruning/merge lifecycle."""
-from dataclasses import asdict, replace
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 
 import pytest
 import torch
 import yaml
 
-from config_helpers import fake_config
-from test_smoke_pipeline import _make_fake_data
-from test_text_pool_lifecycle import _assert_head_checkpoint_restore
+from runtime_helpers import run_cli, run_module
+from data_helpers import _make_fake_data
+from lifecycle_helpers import _assert_head_checkpoint_restore, three_stage_config
 
 
-def three_stage_config():
-    raw = asdict(fake_config())
-    raw['runtime'] = {'device': 'cpu', 'precision': 'fp32'}
-    raw['model']['vision'].update(output_dim=16, seq_len=4, image_size=16)
-    raw['model']['text']['d_model'] = 16
-    raw['model']['fusion'].update(
-        name='mvpruner_three_stage_qaware', stage1_top_k=18, stage2_top_k=12,
-        stage3_top_k=8, query={'dim': 8}, beta_start=.2, beta_end=.1,
-        question_scoring={'num_heads': 4, 'hidden_dim': 8})
-    raw['training'].update(max_steps=None, batch_size=1, finetune_epochs=1,
-                           gradient_accumulation_steps=2, num_workers=0,
-                           entropy_weight=0., seed=42, beta_decay_updates=None, align_epochs=0)
-    raw['generation'].update(max_new_tokens=3, num_beams=1)
-    raw['evaluation']['benchmark_max_samples'] = 2
-    return raw
-
-
+@pytest.mark.integration
 def test_three_stage_offline_cli_checkpoint_resume(tmp_path):
     data = tmp_path / 'dataset'
     _make_fake_data(data, rows_per_split=3)
@@ -47,9 +29,10 @@ def test_three_stage_offline_cli_checkpoint_resume(tmp_path):
     environment.update(OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
 
     def run(*args, module='efficient_vlm_ad'):
-        result = subprocess.run([sys.executable, '-m', module, *args, '--config', str(config),
-                                 *([] if module.endswith('accumulation_debug') else ['--no-progress'])],
-                                env=environment, capture_output=True, text=True, timeout=120)
+        runner = run_cli if module == 'efficient_vlm_ad' else lambda args, **kwargs: run_module(module, args, **kwargs)
+        result = runner([*args, '--config', str(config),
+                         *([] if module.endswith('accumulation_debug') else ['--no-progress'])],
+                        env=environment)
         assert result.returncode == 0, result.stdout + '\n' + result.stderr
 
     run('prepare-data', '--subset', 'smoke')

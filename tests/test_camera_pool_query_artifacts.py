@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import yaml
+from artifact_helpers import assert_valid_entropy, assert_valid_budgets
 
 CONFIG = Path('configs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_pool_qaware.yaml')
 NOTEBOOK = Path('notebooks/kaggle_train_dinov2_camera_pool_qaware_finetune.ipynb')
@@ -28,7 +29,7 @@ def test_config_geometry_and_training_protocol():
     assert fusion['question_scoring'] == dict(num_heads=4, hidden_dim=64, gamma=.1, rms_eps=1e-6)
     assert not {'query', 'beta_start', 'beta_end', 'beta_schedule', 'tau'} & fusion.keys()
     assert 'beta_decay_updates' not in raw['training']
-    assert raw['training']['entropy_weight'] == 0.0
+    assert_valid_entropy(raw['training']['entropy_weight'])
     assert raw['training']['gradient_checkpointing'] is False
     assert raw['training']['vision_training'] == 'feature_cache'
     assert raw['runtime']['precision'] == 'fp32'

@@ -1,14 +1,15 @@
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 
 import yaml
+import pytest
+from runtime_helpers import run_cli
 
-from test_smoke_pipeline import _make_fake_data
+from data_helpers import _make_fake_data
 
 
+@pytest.mark.integration
 def test_context_offline_cli_lifecycle(tmp_path):
     data = tmp_path/'data'
     _make_fake_data(data,rows_per_split=3)
@@ -39,8 +40,7 @@ def test_context_offline_cli_lifecycle(tmp_path):
         if command[0]=='train' and '--resume' in command:
             config['training']['finetune_epochs']=2
             path.write_text(yaml.safe_dump(config),encoding='utf-8')
-        result=subprocess.run([sys.executable,'-m','efficient_vlm_ad',*command,'--config',str(path)],
-            env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=90)
+        result=run_cli([*command,'--config',str(path)],env=env)
         assert result.returncode==0,(command,result.stdout[-5000:],result.stderr[-5000:])
     import torch
     payload=torch.load(checkpoint,weights_only=False)

@@ -7,6 +7,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from lifecycle_helpers import _HEAD_NAMES
+
 
 def _camera_query_worker(rank, store_path, output_dir):
     from efficient_vlm_ad.modeling.camera_query import CameraQueryCompressor
@@ -82,7 +84,18 @@ def _qaware_worker(rank, store_path, output_dir):
     try:
         torch.manual_seed(42)
         model = torch.nn.parallel.DistributedDataParallel(_QuestionAwareCompression())
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        head = dict(model.module.fusion.question_scorer.text_pool.named_parameters())
+        assert set(head) == set(_HEAD_NAMES)
+        head_ids = {id(parameter) for parameter in head.values()}
+        # A dedicated head rate makes the small real allocation gradients
+        # produce observable float32 updates on the second step.
+        optimizer = torch.optim.SGD([
+            {'params': [p for p in model.parameters() if id(p) not in head_ids], 'lr': .01},
+            {'params': list(head.values()), 'lr': 1.0},
+        ])
+        registered = {id(p) for group in optimizer.param_groups for p in group['params']}
+        assert all(id(parameter) in registered for parameter in head.values())
+        audit = []
         original = module.build_prefix_utilities
 
         def fixed_noise(log_shares, capacities, bank_size, **kwargs):
@@ -113,9 +126,20 @@ def _qaware_worker(rank, store_path, output_dir):
                 gradients = [torch.empty_like(parameter.grad) for _ in range(2)]
                 dist.all_gather(gradients, parameter.grad)
                 torch.testing.assert_close(gradients[0], gradients[1], rtol=0, atol=0)
+            before = {name: parameter.detach().clone() for name, parameter in head.items()}
+            head_gradients = {name: parameter.grad.detach().clone() for name, parameter in head.items()}
+            assert torch.count_nonzero(head_gradients['fc2.weight']) > 0
+            if audit:
+                assert torch.count_nonzero(head_gradients['fc1.weight']) > 0
+            else:
+                assert torch.count_nonzero(head_gradients['fc1.weight']) == 0
             optimizer.step()
+            assert not torch.equal(before['fc2.weight'], head['fc2.weight'])
+            if audit:
+                assert not torch.equal(before['fc1.weight'], head['fc1.weight'])
+            audit.append(head_gradients)
             optimizer.zero_grad(set_to_none=True)
-        torch.save({'state': model.module.state_dict(), 'budgets': recorded},
+        torch.save({'state': model.module.state_dict(), 'budgets': recorded, 'pool_audit': audit},
                    Path(output_dir) / f'qaware_rank_{rank}.pt')
     finally:
         dist.destroy_process_group()
@@ -141,3 +165,10 @@ def test_question_aware_fusion_distinct_budgets_two_cpu_ranks(tmp_path):
     assert second['budgets'] == [[[1, 3]], [[1, 3]]]
     for name, value in first['state'].items():
         torch.testing.assert_close(value, second['state'][name], rtol=0, atol=0)
+
+    for payload in (first, second):
+        assert len(payload['pool_audit']) == 2
+        for name in _HEAD_NAMES:
+            assert 'fusion.question_scorer.text_pool.' + name in payload['state']
+        assert torch.count_nonzero(payload['pool_audit'][0]['fc1.weight']) == 0
+        assert torch.count_nonzero(payload['pool_audit'][1]['fc1.weight']) > 0

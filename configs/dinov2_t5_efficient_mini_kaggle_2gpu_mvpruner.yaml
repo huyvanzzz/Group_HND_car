@@ -36,7 +36,7 @@ model:
   fusion:
     name: mvpruner_two_stage
     stage1_top_k: 196
-    stage2_top_k: 64
+    stage2_top_k: 49
     stage2_layer: 2
     min_tokens_per_camera: 1
     stage1_relevance_mode: shifted_max_cosine

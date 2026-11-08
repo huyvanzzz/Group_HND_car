@@ -149,7 +149,7 @@ def test_historical_checkpoint_full_lifecycle(tmp_path, monkeypatch, stage):
     """Exercise direct-load paths, not just the common checkpoint loader."""
     import hashlib
     import shutil
-    from test_verify_align_checkpoint import _write_fake_config
+    from checkpoint_helpers import _write_fake_config
     from efficient_vlm_ad import pipeline
     from efficient_vlm_ad.hf_data import prepare_data
 

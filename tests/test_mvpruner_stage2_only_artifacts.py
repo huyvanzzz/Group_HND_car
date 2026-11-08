@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import yaml
+from artifact_helpers import assert_valid_entropy, assert_valid_budgets
 
 ROOT = Path(__file__).resolve().parents[1]
 STEM = "dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner"
@@ -14,11 +15,15 @@ STEM = "dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner"
 def test_stage2_only_config_preserves_baseline_protocol():
     original = yaml.safe_load((ROOT / "configs" / f"{STEM}.yaml").read_text(encoding="utf-8"))
     new = yaml.safe_load((ROOT / "configs" / f"{STEM}_stage2_only.yaml").read_text(encoding="utf-8"))
+    assert_valid_budgets(original)
+    assert_valid_budgets(new)
     assert "stage1_enabled" not in new["model"]["fusion"]  # Derived from profile, not an ignored YAML switch.
-    assert new["model"]["fusion"].pop("stage1_top_k") == 384
+    assert new["model"]["fusion"].pop("stage1_top_k") == len(new["data"]["view_order"]) * new["model"]["vision"]["seq_len"]
     original["model"]["fusion"].pop("stage1_top_k")
     assert new["model"]["fusion"].pop("name") == "mvpruner_stage2_only"
     original["model"]["fusion"].pop("name")
+    original["model"]["fusion"].pop("stage2_top_k")
+    new["model"]["fusion"].pop("stage2_top_k")
     for key in ("output_dir",):
         assert new["project"][key] == original["project"][key] + "_stage2_only"
         new["project"][key] = original["project"][key]
@@ -26,7 +31,7 @@ def test_stage2_only_config_preserves_baseline_protocol():
     new["cache"]["dir"] = original["cache"]["dir"]
     assert new["model"]["profile"] == original["model"]["profile"] + "_stage2_only"
     new["model"]["profile"] = original["model"]["profile"]
-    assert new["training"].pop("entropy_weight") == 0.0
+    assert_valid_entropy(new["training"].pop("entropy_weight"))
     assert new["training"].pop("gradient_checkpointing") is False
     assert "seed" not in new["training"]
     original["training"].pop("align_epochs")

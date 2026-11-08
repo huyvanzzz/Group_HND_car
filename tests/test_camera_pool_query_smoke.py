@@ -3,16 +3,17 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 
 import torch
+import pytest
 import yaml
 
+from runtime_helpers import run_cli, run_module
 from config_helpers import fake_config
-from test_smoke_pipeline import _make_fake_data
+from data_helpers import _make_fake_data
 
 
+@pytest.mark.integration
 def test_camera_pool_query_offline_cli_lifecycle(tmp_path):
     data = tmp_path / 'dataset'
     _make_fake_data(data, rows_per_split=3)
@@ -40,9 +41,10 @@ def test_camera_pool_query_offline_cli_lifecycle(tmp_path):
     environment.update(OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
 
     def run(*args, module='efficient_vlm_ad'):
-        result = subprocess.run([sys.executable, '-m', module, *args, '--config', str(config),
-                                 *([] if module.endswith('accumulation_debug') else ['--no-progress'])],
-                                env=environment, capture_output=True, text=True, timeout=90)
+        runner = run_cli if module == 'efficient_vlm_ad' else lambda args, **kwargs: run_module(module, args, **kwargs)
+        result = runner([*args, '--config', str(config),
+                         *([] if module.endswith('accumulation_debug') else ['--no-progress'])],
+                        env=environment)
         assert result.returncode == 0, result.stdout + '\n' + result.stderr
 
     run('prepare-data', '--subset', 'smoke')

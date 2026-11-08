@@ -24,3 +24,7 @@ mvpruner = ["transformers==4.46.3", "tokenizers==0.20.4"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "integration: real CLI or pipeline lifecycle tests with offline data and checkpoints",
+  "distributed: multiple CPU/Gloo processes validating synchronization or replay",
+]

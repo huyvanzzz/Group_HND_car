@@ -181,7 +181,7 @@ def test_baseline_full_384_visual_tokens():
 
 def test_baseline_finetune_lifecycle_and_checkpointing_resume(tmp_path, monkeypatch):
     import json
-    from test_verify_align_checkpoint import _write_fake_config
+    from checkpoint_helpers import _write_fake_config
     from efficient_vlm_ad import pipeline
     from efficient_vlm_ad.hf_data import prepare_data
     cfg = load_config(_write_fake_config(tmp_path))

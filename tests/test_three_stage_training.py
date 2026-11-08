@@ -6,7 +6,7 @@ import yaml
 from efficient_vlm_ad.config import load_config
 from efficient_vlm_ad import pipeline
 from efficient_vlm_ad.query_training import qaware_beta_horizon
-from test_three_stage_lifecycle import three_stage_config
+from lifecycle_helpers import three_stage_config
 from test_three_stage_model import fusion, model, batch
 
 

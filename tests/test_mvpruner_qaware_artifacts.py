@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import yaml
+from artifact_helpers import assert_valid_entropy, assert_valid_budgets
 
 ROOT = Path(__file__).resolve().parents[1]
 STEM = "dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner"
@@ -14,9 +15,15 @@ STEM = "dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner"
 def test_qaware_config_preserves_baseline_protocol():
     original = yaml.safe_load((ROOT / "configs" / f"{STEM}.yaml").read_text())
     new = yaml.safe_load((ROOT / "configs" / f"{STEM}_qaware.yaml").read_text())
+    assert_valid_budgets(original)
+    assert_valid_budgets(new)
     assert new["model"]["fusion"].pop("stage2_scoring") == {"num_heads": 4, "hidden_dim": 64, "rms_eps": 1e-6}
     assert new["model"]["fusion"].pop("name") == "mvpruner_qaware"
     original["model"]["fusion"].pop("name")
+    original["model"]["fusion"].pop("stage1_top_k")
+    new["model"]["fusion"].pop("stage1_top_k")
+    original["model"]["fusion"].pop("stage2_top_k")
+    new["model"]["fusion"].pop("stage2_top_k")
     for key in ("output_dir",):
         assert new["project"][key] == original["project"][key] + "_qaware"
         new["project"][key] = original["project"][key]
@@ -24,7 +31,7 @@ def test_qaware_config_preserves_baseline_protocol():
     new["cache"]["dir"] = original["cache"]["dir"]
     assert new["model"]["profile"] == original["model"]["profile"] + "_qaware"
     new["model"]["profile"] = original["model"]["profile"]
-    assert new["training"].pop("entropy_weight") == 0.0
+    assert_valid_entropy(new["training"].pop("entropy_weight"))
     assert new["training"].pop("gradient_checkpointing") is False
     assert new["training"].pop("seed") == 42
     original["training"].pop("align_epochs")

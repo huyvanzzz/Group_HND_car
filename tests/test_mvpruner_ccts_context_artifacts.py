@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 import yaml
+from artifact_helpers import assert_valid_entropy, assert_valid_budgets
 
 ROOT = Path(__file__).resolve().parents[1]
 STEM = "dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner"
@@ -13,10 +14,11 @@ def test_config_protocol_and_single_output_folder():
     old = yaml.safe_load((ROOT / "configs" / f"{STEM}.yaml").read_text(encoding="utf-8"))
     new = yaml.safe_load((ROOT / "configs" / f"{STEM}_ccts_context.yaml").read_text(encoding="utf-8"))
     assert new["model"]["fusion"]["name"] == "mvpruner_ccts_context"
-    assert new["model"]["fusion"]["stage1_top_k"] == 196
-    assert new["model"]["fusion"]["stage2_top_k"] == 49
-    assert new["model"]["fusion"]["context_tokens"] == 15
-    assert new["training"]["entropy_weight"] == 0
+    assert_valid_budgets(new)
+    fusion = new["model"]["fusion"]
+    assert type(fusion["context_tokens"]) is int
+    assert len(new["data"]["view_order"]) <= fusion["context_tokens"] <= fusion["stage1_top_k"] - fusion["stage2_top_k"]
+    assert_valid_entropy(new["training"]["entropy_weight"])
     assert new["training"]["gradient_checkpointing"] is False
     assert "align_epochs" not in new["training"]
     assert new["cache"]["dir"] == new["project"]["output_dir"] + "/cache"

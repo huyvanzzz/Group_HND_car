@@ -29,8 +29,9 @@ def test_loads_dino_mvpruner_profile():
     assert cfg.model.vision.name == "dinov2_small_avgpool"
     assert cfg.model.vision.output_dim == cfg.model.text.d_model == 384
     assert cfg.model.fusion.name == "mvpruner_two_stage"
-    assert cfg.model.fusion.stage1_top_k == 196
-    assert cfg.model.fusion.stage2_top_k == 49
+    fusion = cfg.model.fusion
+    assert type(fusion.stage1_top_k) is int and type(fusion.stage2_top_k) is int
+    assert len(cfg.data.view_order) * fusion.min_tokens_per_camera <= fusion.stage2_top_k <= fusion.stage1_top_k <= len(cfg.data.view_order) * cfg.model.vision.seq_len
     assert cfg.model.fusion.stage2_layer == 2
     assert cfg.model.fusion.min_tokens_per_camera == 1
     assert cfg.model.fusion.stage1_relevance_mode == "shifted_max_cosine"

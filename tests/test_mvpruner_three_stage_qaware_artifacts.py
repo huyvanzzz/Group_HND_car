@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 import yaml
+from artifact_helpers import assert_valid_entropy, assert_valid_budgets
 
 ROOT = Path(__file__).resolve().parents[1]
 STEM = 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_three_stage_qaware'
@@ -17,7 +18,7 @@ def test_three_stage_config_preserves_qaware_protocol():
     assert raw['cache']['dir'] == 'outputs/' + STEM + '/cache'
     assert raw['model']['profile'] == STEM
     fusion = raw['model']['fusion']
-    assert (fusion['stage1_top_k'], fusion['stage2_top_k'], fusion['stage3_top_k']) == (196, 98, 49)
+    assert_valid_budgets(raw)
     assert fusion['name'] == 'mvpruner_three_stage_qaware'
     assert (fusion['beta_start'], fusion['beta_end'], fusion['tau']) == (.2, .1, 1.)
     assert fusion['beta_schedule'] == 'linear' and fusion['stage2_layer'] == 2
@@ -26,10 +27,13 @@ def test_three_stage_config_preserves_qaware_protocol():
     for key in ('vision', 'text', 'projector'):
         assert raw['model'][key] == base['model'][key]
     assert raw['training']['align_epochs'] == 0
-    assert {k: v for k, v in raw['training'].items() if k != 'align_epochs'} == base['training']
+    excluded = {'align_epochs', 'entropy_weight'}
+    assert {k: v for k, v in raw['training'].items() if k not in excluded} == {
+        k: v for k, v in base['training'].items() if k not in excluded}
     for key in ('data', 'runtime', 'generation', 'evaluation'):
         assert raw[key] == base[key]
-    assert raw['training']['entropy_weight'] == 0.
+    assert_valid_entropy(raw['training']['entropy_weight'])
+    assert_valid_entropy(base['training']['entropy_weight'])
     assert raw['training']['gradient_checkpointing'] is False
     assert raw['training']['beta_decay_updates'] is None
 

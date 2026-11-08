@@ -1,31 +1,17 @@
 import json
+import shutil
+import pytest
 import os
-import subprocess
-import sys
 from argparse import Namespace
 from pathlib import Path
 
 import torch
-from PIL import Image
+from checkpoint_helpers import _make_fake_data
 
 from efficient_vlm_ad.debugging import DebugPrinter, model_param_summary, tensor_stats
 from efficient_vlm_ad.cli import is_main_process, make_debug
 
-
-def _make_fake_data(root: Path):
-    images = root / "images"
-    images.mkdir(parents=True)
-    camera_names = ["Front", "Front-Left", "Front-Right", "Back", "Back-Left", "Back-Right"]
-    camera_paths = {}
-    for idx, camera in enumerate(camera_names):
-        path = images / f"{camera}.jpg"
-        Image.new("RGB", (16, 16), color=(20 + idx, 40, 60)).save(path)
-        camera_paths[camera] = str(path.relative_to(root))
-    rows = [[{"Q": "What is visible?", "A": "A road."}, camera_paths]]
-    for split in ("train", "val", "test"):
-        split_path = root / "data" / "multi_frame" / f"multi_frame_{split}.json"
-        split_path.parent.mkdir(parents=True, exist_ok=True)
-        split_path.write_text(json.dumps(rows), encoding="utf-8")
+from runtime_helpers import checked_cli as _checked_cli, run_cli
 
 
 def _write_fake_config(tmp_path: Path) -> Path:
@@ -59,6 +45,27 @@ generation:
   num_beams: 1
 """,
         encoding="utf-8",
+    )
+    return cfg
+
+
+@pytest.fixture(scope="module")
+def prepared_debug_source(tmp_path_factory):
+    root = tmp_path_factory.mktemp("debug_data")
+    cfg = _write_fake_config(root)
+    for command in ("prepare-data", "prepare-features"):
+        _checked_cli([command, "--config", str(cfg), "--subset", "smoke"])
+    return root
+
+
+@pytest.fixture
+def debug_config(prepared_debug_source, tmp_path):
+    shutil.copytree(prepared_debug_source, tmp_path, dirs_exist_ok=True)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8").replace(
+            prepared_debug_source.as_posix(), tmp_path.as_posix()
+        ), encoding="utf-8",
     )
     return cfg
 
@@ -138,12 +145,7 @@ def test_model_param_summary_labels_duplicate_tied_weights_clearly():
 
 
 def test_cli_accepts_debug_flags():
-    result = subprocess.run(
-        [sys.executable, "-m", "efficient_vlm_ad", "inspect-data", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    result = _checked_cli(['inspect-data', '--help'])
 
     assert "--debug" in result.stdout
     assert "--debug-samples" in result.stdout
@@ -151,12 +153,7 @@ def test_cli_accepts_debug_flags():
 
 
 def test_diagnose_train_cli_is_available():
-    result = subprocess.run(
-        [sys.executable, "-m", "efficient_vlm_ad", "diagnose-train", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    result = _checked_cli(['diagnose-train', '--help'])
 
     assert "--config" in result.stdout
     assert "--stage" in result.stdout
@@ -164,37 +161,12 @@ def test_diagnose_train_cli_is_available():
     assert "--debug-numerics" in result.stdout
 
 
-def test_debug_sample_cli_outputs_sections_and_jsonl(tmp_path):
-    cfg = _write_fake_config(tmp_path)
+def test_debug_sample_cli_outputs_sections_and_jsonl(tmp_path, debug_config):
+    cfg = debug_config
     output_dir = tmp_path / "outputs"
     debug_jsonl = output_dir / "debug" / "events.jsonl"
 
-    subprocess.run(
-        [sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "smoke"],
-        check=True,
-    )
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "efficient_vlm_ad",
-            "debug-sample",
-            "--config",
-            str(cfg),
-            "--split",
-            "train",
-            "--index",
-            "0",
-            "--debug",
-            "--debug-samples",
-            "2",
-            "--debug-jsonl",
-            str(debug_jsonl),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    result = _checked_cli(['debug-sample', '--config', str(cfg), '--split', 'train', '--index', '0', '--debug', '--debug-samples', '2', '--debug-jsonl', str(debug_jsonl)])
 
     assert "[DEBUG][SAMPLE]" in result.stdout
     assert "[DEBUG][IMAGE]" in result.stdout
@@ -205,31 +177,12 @@ def test_debug_sample_cli_outputs_sections_and_jsonl(tmp_path):
     assert "hf_" not in debug_jsonl.read_text(encoding="utf-8")
 
 
-def test_diagnose_train_cli_reports_boundaries_and_batch(tmp_path, monkeypatch):
+def test_diagnose_train_cli_reports_boundaries_and_batch(tmp_path, monkeypatch, debug_config):
     monkeypatch.setenv("HF_TOKEN", "hf_secret_for_diagnose_test")
-    cfg = _write_fake_config(tmp_path)
+    cfg = debug_config
     output_dir = tmp_path / "outputs"
 
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "smoke"], check=True)
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg), "--subset", "smoke"], check=True)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "efficient_vlm_ad",
-            "diagnose-train",
-            "--config",
-            str(cfg),
-            "--stage",
-            "align",
-            "--debug",
-            "--debug-samples",
-            "1",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    result = _checked_cli(['diagnose-train', '--config', str(cfg), '--stage', 'align', '--debug', '--debug-samples', '1'])
 
     json_start = result.stdout.rfind("\n{")
     payload = json.loads(result.stdout[json_start + 1 :])
@@ -243,29 +196,11 @@ def test_diagnose_train_cli_reports_boundaries_and_batch(tmp_path, monkeypatch):
     assert "hf_secret_for_diagnose_test" not in result.stdout
 
 
-def test_diagnose_train_cli_reports_numerics_when_requested(tmp_path):
-    cfg = _write_fake_config(tmp_path)
+def test_diagnose_train_cli_reports_numerics_when_requested(tmp_path, debug_config):
+    cfg = debug_config
     output_dir = tmp_path / "outputs"
 
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-data", "--config", str(cfg), "--subset", "smoke"], check=True)
-    subprocess.run([sys.executable, "-m", "efficient_vlm_ad", "prepare-features", "--config", str(cfg), "--subset", "smoke"], check=True)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "efficient_vlm_ad",
-            "diagnose-train",
-            "--config",
-            str(cfg),
-            "--stage",
-            "align",
-            "--debug",
-            "--debug-numerics",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    result = _checked_cli(['diagnose-train', '--config', str(cfg), '--stage', 'align', '--debug', '--debug-numerics'])
 
     debug_events = (output_dir / "debug" / "debug_events.jsonl").read_text(encoding="utf-8")
     json_start = result.stdout.rfind("\n{")
