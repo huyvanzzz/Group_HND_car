@@ -21,6 +21,7 @@ NAMES.add('kaggle_train_dinov2_mvpruner_ccts_context_finetune.ipynb')
 NAMES.add('kaggle_train_dinov2_camera_pool_qaware_finetune.ipynb')
 NAMES.add('kaggle_train_dinov2_mvpruner_three_stage_qaware_finetune.ipynb')
 NAMES.add('kaggle_train_dinov2_mvpruner_direct_camera_finetune.ipynb')
+NAMES.add('kaggle_train_smolvlm_256m_no_pruner_finetune.ipynb')
 
 
 def notebook(kind):
@@ -31,9 +32,9 @@ def source(kind):
     return '\n'.join(''.join(cell['source']) for cell in notebook(kind)['cells'])
 
 
-def test_only_dino_entrypoint_artifacts_remain():
+def test_supported_entrypoint_artifacts_remain():
     assert {p.name for p in Path('notebooks').glob('*.ipynb')} == NAMES
-    assert {p.name for p in Path('configs').glob('*.yaml')} == {Path(CONFIG).name, 'dinov2_t5_efficient_mini_kaggle_2gpu_unpruned.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_query.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_query_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_stage2_only.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_ccts_context.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_pool_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_three_stage_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_direct_camera.yaml'}
+    assert {p.name for p in Path('configs').glob('*.yaml')} == {Path(CONFIG).name, 'dinov2_t5_efficient_mini_kaggle_2gpu_unpruned.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_query.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_query_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_stage2_only.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_ccts_context.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_camera_pool_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_three_stage_qaware.yaml', 'dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_direct_camera.yaml', 'smolvlm_256m_kaggle_2gpu_no_pruner.yaml'}
 
 
 @pytest.mark.parametrize('kind', ['debug', 'train'])

@@ -82,3 +82,7 @@ All four Kaggle finetune notebooks retain accumulation steps of 2, use the origi
 ## MVPruner CCTS context
 
 [49 main + 15 context finetuning notebook](notebooks/kaggle_train_dinov2_mvpruner_ccts_context_finetune.ipynb) uses the isolated [CCTS context profile](configs/dinov2_t5_efficient_mini_kaggle_2gpu_mvpruner_ccts_context.yaml). Original Stage 1 and the 49-token Stage 2 selector are retained; 147 residual tokens yield 15 per-camera CCTS summaries with VisionZip-style merging. See [method, masks, resume and measurement limits](docs/research/mvpruner-ccts-context.md).
+
+## Native SmolVLM without pruning
+
+The isolated [SmolVLM-256M config](configs/smolvlm_256m_kaggle_2gpu_no_pruner.yaml) and [two-GPU Kaggle notebook](notebooks/kaggle_train_smolvlm_256m_no_pruner_finetune.ipynb) finetune the pretrained native connector, causal LM and head with a frozen vision encoder. FP32 batch 4 per GPU with accumulation 8 gives effective batch 64. The raw native feature cache needs about 35.8 GiB for 4072 camera groups; GPU feasibility remains unmeasured. See [commands, cache provenance, resume and limitations](docs/research/smolvlm-no-pruner.md).
