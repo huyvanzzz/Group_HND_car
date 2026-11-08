@@ -2,6 +2,8 @@
 import json
 import subprocess
 import sys
+import shutil
+from dataclasses import replace
 
 import pytest
 import torch
@@ -9,6 +11,8 @@ import yaml
 
 from runtime_helpers import run_module
 from smolvlm_helpers import create_local_run
+from efficient_vlm_ad.smolvlm.config import load_config
+from efficient_vlm_ad.smolvlm.storage import ensure_prepared, resolve_cache
 
 
 def run(config, command, *args):
@@ -20,8 +24,24 @@ def run(config, command, *args):
 
 def test_offline_native_cli_lifecycle_and_epoch_resume(tmp_path):
     config = create_local_run(tmp_path, dropout=.1)
-    for command in ('prepare-data', 'prepare-features', 'validate-cache',
-                    'diagnose-train', 'verify-accumulation'):
+    for command in ('prepare-data', 'prepare-features'):
+        run(config, command)
+    # The native lifecycle must also work with cache-only Input and separate
+    # prepared data, without depending on raw images or writing to the cache.
+    input_cache = tmp_path / 'input-cache'
+    shutil.move(str(tmp_path / 'output/cache'), input_cache)
+    cfg = load_config(config)
+    prepared = tmp_path / 'output/prepared_data'
+    before = {p.name: p.read_bytes() for p in prepared.iterdir()}
+    ensure_prepared(cfg)
+    location = resolve_cache(cfg, cache_tmp_dir=tmp_path / 'unused-cache',
+                             kaggle_dataset='owner/cache-smolvlm', attach=lambda _: input_cache)
+    initial_cache = {p.name: p.read_bytes() for p in input_cache.iterdir()}
+    raw = yaml.safe_load(config.read_text())
+    raw['cache']['dir'] = str(location.directory)
+    config.write_text(yaml.safe_dump(raw))
+    (tmp_path / 'dataset').rename(tmp_path / 'unused-raw-images')
+    for command in ('validate-cache', 'diagnose-train', 'verify-accumulation'):
         run(config, command)
     output = tmp_path / 'output'
     report = json.loads((output / 'debug' / 'gradient_accumulation_verify.json').read_text())
@@ -65,6 +85,9 @@ def test_offline_native_cli_lifecycle_and_epoch_resume(tmp_path):
     events = [json.loads(x) for x in (output / 'debug/debug_events.jsonl').read_text().splitlines()]
     assert any(e['section'] == 'NUMERICS' and e['payload'].get('stage') == 'diagnose_backward'
                and e['payload']['ok'] for e in events)
+    assert before == {p.name: p.read_bytes() for p in prepared.iterdir()}
+    assert initial_cache == {p.name: p.read_bytes() for p in input_cache.iterdir()}
+    assert not (tmp_path / 'unused-cache').exists()
 
 
 def test_smolvlm_module_help_and_alignment_rejected(tmp_path):

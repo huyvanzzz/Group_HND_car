@@ -17,15 +17,6 @@ def sources():
     return notebook, [''.join(cell['source']) for cell in notebook['cells']]
 
 
-def helper_namespace():
-    _, cells = sources()
-    tree = ast.parse(next(cell for cell in cells if 'def download_exact(' in cell))
-    helpers = ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef)], type_ignores=[])
-    namespace = {'Path': Path, 'json': json}
-    exec(compile(helpers, 'notebook_helpers', 'exec'), namespace)
-    return namespace
-
-
 def test_smolvlm_protocol_and_isolation():
     raw = yaml.safe_load(CONFIG.read_text(encoding='utf-8'))
     baseline = yaml.safe_load((ROOT / 'configs/dinov2_t5_efficient_mini_kaggle_2gpu_unpruned.yaml').read_text(encoding='utf-8'))
@@ -59,7 +50,7 @@ def test_notebook_code_syntax_and_workflow_contract():
     assert 'RESUME_TRAINING' not in joined
     assert 'TRACKED_CONFIG.write_text' not in joined
     assert 'RUNTIME_CONFIG.write_text' in joined
-    for command in ('prepare-data', 'prepare-features', 'validate-cache', 'diagnose-train', 'verify-accumulation', 'verify-resume-checkpoint', 'train', 'evaluate', 'benchmark'):
+    for command in ('diagnose-train', 'verify-accumulation', 'verify-resume-checkpoint', 'train', 'evaluate', 'benchmark'):
         assert command in joined
     assert "'-m', 'efficient_vlm_ad.smolvlm'" in joined
     resume = next(source for source in cells if 'LOCAL_LATEST =' in source)
@@ -68,38 +59,82 @@ def test_notebook_code_syntax_and_workflow_contract():
     assert 'rank_00000.pt' in resume and 'rank_00001.pt' in resume
     assert "f'{FINETUNE_CHECKPOINT_FILENAME}.rng/**'" in resume
     assert "'-m', 'efficient_vlm_ad.smolvlm', 'train'" in resume
-    assert 'get_hf_file_metadata' in joined and 'disk_usage' in joined
-    assert 'local_dir=destination' in joined
+    assert "CACHE_TMP_DIR = '/kaggle/tmp/cache_smolvlm'" in joined
+    assert "CACHE_KAGGLE_DATASET = ''" in joined
+    for pin in ('kaggle==2.2.5', 'kagglehub==1.0.3'):
+        assert pin in joined
+    assert "'pip', 'check'" in joined
+    assert "run_backend('prepare-data'" not in joined
+    assert 'raw[\'cache\'][\'dir\'] = str(cache_location.directory)' in joined
+    assert joined.index('ensure_prepared(cfg, PREPARED_DATA_HF_REPO_ID)') < joined.index('cache_location = resolve_cache(')
+    assert joined.index('storage_result = publish_cache(') < joined.index("run_backend('diagnose-train'")
+    assert 'prepared_manifest.json' not in joined
+    assert 'publish_required' in joined and 'preflight_dataset' in joined
     assert 'dinov2_manifest_fields' not in joined
-
-
-def test_download_checks_remote_sizes_before_writing_and_uses_destination(tmp_path):
-    namespace = helper_namespace()
-    calls = []
-    namespace.update(
-        hf_hub_url=lambda **kwargs: kwargs['filename'],
-        get_hf_file_metadata=lambda url, **kwargs: SimpleNamespace(size=10),
-        shutil=SimpleNamespace(disk_usage=lambda _: SimpleNamespace(free=6 * 1024**3 + 19)),
-        hf_hub_download=lambda **kwargs: calls.append(kwargs),
-        os=SimpleNamespace(environ={}),
-    )
-    with pytest.raises(RuntimeError, match='disk'):
-        namespace['download_exact']('example/cache', 'dataset', tmp_path, ['features.float16.memmap', 'manifest.json'])
-    assert not calls
-    namespace['shutil'].disk_usage = lambda _: SimpleNamespace(free=6 * 1024**3 + 20)
-    namespace['download_exact']('example/cache', 'dataset', tmp_path, ['features.float16.memmap', 'manifest.json'])
-    assert len(calls) == 2
-    assert all(call['local_dir'] == tmp_path for call in calls)
-
-
-def test_download_rejects_unknown_size_without_writing(tmp_path):
-    namespace = helper_namespace()
-    namespace.update(hf_hub_url=lambda **kwargs: '', get_hf_file_metadata=lambda *args, **kwargs: SimpleNamespace(size=None), os=SimpleNamespace(environ={}))
-    with pytest.raises(ValueError, match='size'):
-        namespace['download_exact']('example/cache', 'dataset', tmp_path, ['features.float16.memmap'])
 
 
 def test_documentation_explains_memory_cache_and_measurement_limits():
     text = (ROOT / 'docs/research/smolvlm-no-pruner.md').read_text(encoding='utf-8')
     for term in ('1024', '768', '576', '35.8', '6 GiB', 'GPU', 'null', 'verify-resume-checkpoint', 'FP32', '64'):
         assert term in text
+
+
+def test_publish_cell_writes_storage_debug_and_failure_does_not_mark_ready(tmp_path):
+    from efficient_vlm_ad.debugging import DebugPrinter
+    _, cells = sources()
+    cell = next(s for s in cells if 'storage_result = publish_cache(' in s)
+    location = SimpleNamespace(directory=tmp_path / 'cache', source='tmp', revision=None,
+                               manifest={'fingerprint': 'fingerprint'})
+    namespace = dict(publish_required=True, cache_location=location, publisher_api=object(),
+                     publisher_owner='owner', PREPARED_DATA_HF_REPO_ID='owner/prepared',
+                     PROFILE=tmp_path, DebugPrinter=DebugPrinter, storage_result=None)
+    def guard():
+        assert namespace['storage_result']['status'] == 'ready'
+    namespace.update(assert_storage_ready=guard,
+                     publish_cache=lambda *a, **kw: {'status': 'ready', 'handle': 'owner/cache-smolvlm'})
+    exec(compile(cell, 'publish_cell', 'exec'), namespace)
+    events = [json.loads(line) for line in (tmp_path / 'debug/debug_events.jsonl').read_text().splitlines()]
+    assert events[-1]['section'] == 'STORAGE'
+    assert events[-1]['payload']['source'] == 'tmp'
+    namespace['storage_result'] = None
+    def fail(*args, **kwargs):
+        raise RuntimeError('upload interrupted')
+    namespace['publish_cache'] = fail
+    with pytest.raises(RuntimeError, match='upload interrupted'):
+        exec(compile(cell, 'publish_cell', 'exec'), namespace)
+    assert namespace['storage_result'] is None
+
+
+def test_notebook_cache_resolution_invalidates_old_publish_on_failure():
+    _, cells = sources()
+    cell = next(s for s in cells if 'cache_location = resolve_cache(' in s)
+    namespace = dict(storage_result={'status': 'ready'}, cache_location=object(),
+                     cfg=object(), PREPARED_DATA_HF_REPO_ID='', CACHE_TMP_DIR='tmp',
+                     CACHE_KAGGLE_DATASET='', CACHE_HF_REPO_ID='', ensure_prepared=lambda *a: None)
+    def fail(*args, **kwargs):
+        raise RuntimeError('cache source failed')
+    namespace['resolve_cache'] = fail
+    with pytest.raises(RuntimeError, match='cache source failed'):
+        exec(compile(cell, 'cache_cell', 'exec'), namespace)
+    assert namespace['storage_result'] is None and namespace['cache_location'] is None
+
+
+def test_notebook_ready_guard_binds_cache_and_runtime_yaml(tmp_path):
+    _, cells = sources()
+    tree = ast.parse(next(s for s in cells if 'def assert_storage_ready(' in s))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'assert_storage_ready')
+    runtime = tmp_path / 'runtime.yaml'
+    directory = tmp_path / 'cache'
+    runtime.write_text(yaml.safe_dump({'cache': {'dir': str(directory)}}))
+    location = SimpleNamespace(directory=directory, manifest={'fingerprint': 'one'})
+    namespace = dict(yaml=yaml, RUNTIME_CONFIG=runtime, cache_location=location,
+                     storage_result={'status': 'ready', 'cache_dir': str(directory), 'fingerprint': 'one'})
+    exec(compile(ast.Module(body=[function], type_ignores=[]), 'ready_guard', 'exec'), namespace)
+    namespace['assert_storage_ready']()
+    location.manifest['fingerprint'] = 'different'
+    with pytest.raises(RuntimeError):
+        namespace['assert_storage_ready']()
+    location.manifest['fingerprint'] = 'one'
+    runtime.write_text(yaml.safe_dump({'cache': {'dir': 'another/cache'}}))
+    with pytest.raises(RuntimeError):
+        namespace['assert_storage_ready']()

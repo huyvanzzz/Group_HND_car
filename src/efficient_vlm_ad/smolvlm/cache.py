@@ -74,7 +74,8 @@ def _fingerprint(manifest):
     return hashlib.sha256(_canonical({k: v for k, v in manifest.items() if k != 'fingerprint'})).hexdigest()
 
 
-def validate_cache(cfg, processor, geometry, *, full=True):
+def validate_cache_metadata(cfg, processor, geometry):
+    """Validate identity/index before allocating or downloading the feature payload."""
     directory = Path(cfg.cache.dir)
     try:
         manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
@@ -97,6 +98,13 @@ def validate_cache(cfg, processor, geometry, *, full=True):
     shape = [len(index), geometry['num_views'], geometry['vision_tokens'], geometry['vision_dim']]
     if not index or manifest.get('shape') != shape or manifest.get('num_samples') != len(index):
         raise ValueError('SmolVLM cache shape mismatch or empty cache')
+    return manifest
+
+
+def validate_cache(cfg, processor, geometry, *, full=True):
+    directory = Path(cfg.cache.dir)
+    manifest = validate_cache_metadata(cfg, processor, geometry)
+    shape = manifest['shape']
     path = directory / FEATURE_FILE
     if not path.is_file() or path.stat().st_size != int(np.prod(shape)) * 2:
         raise ValueError('SmolVLM cache feature file size mismatch')
@@ -131,10 +139,8 @@ def prepare_features(cfg, model, processor, *, subset='full', disable_progress=F
         raise ValueError('Cannot cache an empty dataset')
     directory.mkdir(parents=True, exist_ok=True)
     required_bytes = int(np.prod(shape)) * 2
-    free = shutil.disk_usage(directory).free
-    print(f'SmolVLM cache: {required_bytes:,} bytes + {CHECKPOINT_RESERVE_BYTES:,} checkpoint reserve; {free:,} bytes free', flush=True)
-    if free < required_bytes + CHECKPOINT_RESERVE_BYTES:
-        raise OSError('Insufficient disk space for native features plus checkpoint reserve')
+    from .storage import check_storage_space
+    check_storage_space(directory, cfg.project.output_dir, required_bytes)
     token = uuid.uuid4().hex
     temporary = directory / f'{FEATURE_FILE}.{token}.tmp'
     array = None
