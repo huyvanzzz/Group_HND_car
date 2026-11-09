@@ -6,7 +6,7 @@ The processor uses one global image per camera, with splitting disabled, in orde
 
 ## Training protocol
 
-Dataset: `minhdang0901/drivelm-nuscenes-v1-0`, revision `main`, with full split counts 341381 / 19785 / 16817. Images are shared across questions and deduplicated for feature extraction. The seed is 42. FP32 training uses two GPUs, batch 4 per rank and 8 gradient accumulation steps: effective batch 64. Ten finetune epochs use learning rate 1e-4, weight decay 0.05, scheduler gamma 0.9 and gradient clipping at 1.0. Gradient checkpointing defaults to strict boolean `true`. Both PyTorch allocator environment variables are set to `expandable_segments:True` before Torch/CUDA imports in the notebook. There is no automatic batch-size or precision adjustment.
+Dataset: `minhdang0901/drivelm-nuscenes-v1-0`, revision `main`, with full split counts 341381 / 19785 / 16817. Images are shared across questions and deduplicated for feature extraction. The seed is 42. FP32 training uses two GPUs, batch 8 per rank and 4 gradient accumulation steps: effective batch 64. Ten finetune epochs use learning rate 1e-4, weight decay 0.05, scheduler gamma 0.9 and gradient clipping at 1.0. Gradient checkpointing defaults to strict boolean `true`. Both PyTorch allocator environment variables are set to `expandable_segments:True` before Torch/CUDA imports in the notebook. There is no automatic batch-size or precision adjustment.
 
 Generation uses 512 maximum new tokens, 3 beams, early stopping and length penalty 1.0. Evaluation batch size is 4; benchmark sample cap is 200. The notebook pins Transformers 4.46.3, Tokenizers 0.20.4 and Accelerate 1.15.0. No FlashAttention installation is required.
 

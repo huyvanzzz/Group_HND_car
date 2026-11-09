@@ -46,7 +46,7 @@ def test_smolvlm_protocol_and_isolation():
     assert raw['cache']['dir'] == raw['project']['output_dir'] + '/cache'
     assert raw['runtime']['precision'] == 'fp32'
     training = raw['training']
-    assert training['batch_size'] == 4 and training['gradient_accumulation_steps'] == 8
+    assert training['batch_size'] == 8 and training['gradient_accumulation_steps'] == 4
     assert training['align_epochs'] == 0 and training['finetune_epochs'] == 10
     assert training['gradient_checkpointing'] is True
     assert training['entropy_weight'] == 0 and training['seed'] == 42

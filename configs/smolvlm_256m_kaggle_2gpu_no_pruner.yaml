@@ -16,8 +16,8 @@ model:
 training:
   gradient_checkpointing: true
   vision_training: feature_cache
-  batch_size: 4
-  gradient_accumulation_steps: 8
+  batch_size: 8
+  gradient_accumulation_steps: 4
   learning_rate: 0.0001
   weight_decay: 0.05
   scheduler_gamma: 0.9

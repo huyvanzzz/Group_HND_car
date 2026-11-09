@@ -22,7 +22,7 @@ class SmolVLMConfig:
     runtime: RuntimeConfig = field(default_factory=lambda: RuntimeConfig(precision='fp32'))
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=lambda: TrainingConfig(
-        batch_size=4, gradient_accumulation_steps=8, align_epochs=0, finetune_epochs=10,
+        batch_size=8, gradient_accumulation_steps=4, align_epochs=0, finetune_epochs=10,
         gradient_checkpointing=True, max_grad_norm=1.0, num_workers=2,
         pin_memory=True, progress_log_every_steps=500))
     generation: GenerationConfig = field(default_factory=lambda: GenerationConfig(
