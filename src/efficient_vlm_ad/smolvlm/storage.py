@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -151,13 +152,17 @@ def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
     print('[STORAGE] ' + json.dumps({'source': 'raw_images_huggingface',
           'repo_id': cfg.data.hf_repo_id, 'revision': info.sha,
           'image_count': len(names), 'raw_image_dir': str(directory)}), flush=True)
-    for name in names:
+    def download_image(name):
         path = directory / name
         if not path.is_file() or path.stat().st_size != sizes[name]:
             hf_hub_download(repo_id=cfg.data.hf_repo_id, repo_type='dataset',
                             revision=info.sha, filename=name, local_dir=directory, token=False)
         if not path.is_file() or path.stat().st_size != sizes[name]:
             raise ValueError(f'Raw image download size mismatch: {name}')
+    # Match snapshot_download's default concurrency without fetching unrelated files.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for _ in pool.map(download_image, names):
+            pass  # Consume results so download failures propagate before extraction.
     for record in unique.values():
         if not all(p.is_file() for p in normalize_camera_paths(directory, record.camera_paths, cfg.data.view_order)):
             raise FileNotFoundError('Downloaded source photos do not match prepared camera paths')

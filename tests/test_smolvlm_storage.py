@@ -254,6 +254,7 @@ def test_extract_reuses_prepared_and_requires_images(run, monkeypatch):
 
 
 def test_missing_raw_images_download_from_hf_without_modifying_prepared(run, monkeypatch, tmp_path):
+    import threading
     import efficient_vlm_ad.smolvlm.storage as storage
     from efficient_vlm_ad.smolvlm.cache import _prepared
     cfg, processor, geometry = run
@@ -263,6 +264,9 @@ def test_missing_raw_images_download_from_hf_without_modifying_prepared(run, mon
     before = {p.name: p.read_bytes() for p in prepared.iterdir()}
     remote_files = {p.relative_to(source_root).as_posix(): p for p in source_root.rglob('*') if p.is_file()}
     downloads = []
+    started = []
+    lock = threading.Lock()
+    first_two = threading.Barrier(2, timeout=5)
     def info(**kwargs):
         assert kwargs['repo_id'] == cfg.data.hf_repo_id
         return SimpleNamespace(sha='raw-image-commit', siblings=[
@@ -270,6 +274,11 @@ def test_missing_raw_images_download_from_hf_without_modifying_prepared(run, mon
     def download(**kwargs):
         assert kwargs['revision'] == 'raw-image-commit'
         name = kwargs['filename']
+        with lock:
+            slot = len(started)
+            started.append(name)
+        if slot < 2:
+            first_two.wait()  # Sequential downloads cannot satisfy this rendezvous.
         assert name.lower().endswith(('.png', '.jpg', '.jpeg'))
         path = Path(kwargs['local_dir']) / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,3 +300,6 @@ def test_missing_raw_images_download_from_hf_without_modifying_prepared(run, mon
         for record in rows:
             assert all(p.is_file() for p in normalize_camera_paths(root, record.camera_paths, cfg.data.view_order))
     assert before == {p.name: p.read_bytes() for p in prepared.iterdir()}
+    completed_downloads = list(downloads)
+    storage._ensure_raw_images(cfg, metadata, records, root, feature_bytes=32)
+    assert downloads == completed_downloads  # Completed images are not downloaded again.
