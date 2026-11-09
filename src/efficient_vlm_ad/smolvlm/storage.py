@@ -14,6 +14,7 @@ from huggingface_hub.utils import disable_progress_bars
 
 from ..data import normalize_camera_paths
 from ..hf_data import _remote_camera_path
+from ..progress import progress
 from .cache import (CHECKPOINT_RESERVE_BYTES, FEATURE_FILE, _digest, _prepared,
                     record_key, validate_cache, validate_cache_metadata)
 
@@ -161,7 +162,8 @@ def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
             raise ValueError(f'Raw image download size mismatch: {name}')
     # Match snapshot_download's default concurrency without fetching unrelated files.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for _ in pool.map(download_image, names):
+        for _ in progress(pool.map(download_image, names),
+                          desc='HF source images', total=len(names)):
             pass  # Consume results so download failures propagate before extraction.
     for record in unique.values():
         if not all(p.is_file() for p in normalize_camera_paths(directory, record.camera_paths, cfg.data.view_order)):
