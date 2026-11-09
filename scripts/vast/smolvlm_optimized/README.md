@@ -60,10 +60,9 @@ manifest, không đơn thuần đặt `ready: true`.
 - `no_sync` từ cùng weights: relative gradient L2 difference khoảng 0,016%
   trong cửa sổ đủ; tail một microbatch khớp hoàn toàn. Không phải bitwise parity.
 
-Các script `verify_optimized.py`, `check_validation_shards.py` và
-`check_eval_changes.py` là probe riêng. Chúng ghi vào thư mục smoke, không chạy
-full training. Smoke evaluate chỉ dùng năm mẫu và rút ngắn generation để kiểm
-tra lifecycle; không dùng metrics đó làm kết quả thực nghiệm.
+Các script probe/smoke không được giữ trong bộ code này. Smoke evaluate đã
+thực hiện chỉ dùng năm mẫu và rút ngắn generation để kiểm tra lifecycle;
+không dùng metrics đó làm kết quả thực nghiệm.
 
 Môi trường đã đo: hai RTX 4090, Python 3.12, Torch 2.14.1+cu130,
 Transformers 4.46.3, Tokenizers 0.20.4 và Accelerate 1.15.0.
