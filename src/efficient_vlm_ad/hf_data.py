@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -130,7 +129,7 @@ def _remote_camera_path(raw_path: str, repository_files: set[str]) -> str:
 def _download_smoke_subset(
     cfg: ExperimentConfig,
     *,
-    token: str,
+    token: str | bool = False,
     limit_per_split: int = 64,
 ) -> tuple[Path, list[str]]:
     api = HfApi()
@@ -183,7 +182,7 @@ def _download_smoke_subset(
     return root, list(split_candidates.values())
 
 
-def inspect_hf_dataset(cfg: ExperimentConfig, token: str | None, debug: DebugPrinter | None = None) -> dict[str, Any]:
+def inspect_hf_dataset(cfg: ExperimentConfig, token: str | None = None, debug: DebugPrinter | None = None) -> dict[str, Any]:
     if cfg.data.local_dir:
         files = [str(p.relative_to(cfg.data.local_dir)).replace("\\", "/") for p in Path(cfg.data.local_dir).rglob("*")]
         candidates = split_file_candidates(files)
@@ -198,18 +197,7 @@ def inspect_hf_dataset(cfg: ExperimentConfig, token: str | None, debug: DebugPri
         if debug:
             debug.log("DATASET", report)
         return report
-    if not token:
-        report = {
-            "hf_repo_id": cfg.data.hf_repo_id,
-            "token_present": False,
-            "resolved_revision": cfg.data.revision,
-            "file_count": 0,
-            "split_candidates": {},
-            "error": "HF_TOKEN is required to inspect the private Hugging Face dataset",
-        }
-        if debug:
-            debug.log("DATASET", report)
-        return report
+    token = token or False  # Public repositories do not require credentials.
     api = HfApi()
     try:
         info = api.repo_info(cfg.data.hf_repo_id, repo_type="dataset", revision=cfg.data.revision, token=token)
@@ -217,7 +205,7 @@ def inspect_hf_dataset(cfg: ExperimentConfig, token: str | None, debug: DebugPri
     except Exception as exc:
         report = {
             "hf_repo_id": cfg.data.hf_repo_id,
-            "token_present": True,
+            "token_present": bool(token),
             "resolved_revision": cfg.data.revision,
             "file_count": 0,
             "split_candidates": {},
@@ -228,7 +216,7 @@ def inspect_hf_dataset(cfg: ExperimentConfig, token: str | None, debug: DebugPri
         return report
     report = {
         "hf_repo_id": cfg.data.hf_repo_id,
-        "token_present": True,
+        "token_present": bool(token),
         "resolved_revision": getattr(info, "sha", None) or cfg.data.revision,
         "file_count": len(files),
         "split_candidates": split_file_candidates(files),
@@ -251,9 +239,7 @@ def prepare_data(
         root = Path(cfg.data.local_dir).resolve()
         files = [str(p.relative_to(root)).replace("\\", "/") for p in root.rglob("*.json")]
     else:
-        token = os.getenv("HF_TOKEN")
-        if not token:
-            raise RuntimeError("HF_TOKEN is required to download the private Hugging Face dataset")
+        token = False  # Download public source data without authentication.
         if subset == "smoke":
             root, files = _download_smoke_subset(cfg, token=token)
         else:

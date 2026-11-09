@@ -301,3 +301,14 @@ def test_bootstrap_uses_active_config_binary_install_and_two_gpu_finetune():
     assert 'raw["training"]["gradient_accumulation_steps"] = 1' in text
     assert 'raw["training"]["finetune_max_steps"] = 20' in text
     assert 'raw["project"]["output_dir"] += "_debug"' in text
+
+
+def test_public_hf_setup_never_requires_a_kaggle_hf_secret():
+    for path in Path('notebooks').glob('*.ipynb'):
+        nb = json.loads(path.read_text(encoding='utf-8'))
+        text = '\n'.join(''.join(cell['source']) for cell in nb['cells'])
+        assert "get_secret('HF_TOKEN')" not in text
+        assert 'get_secret("HF_TOKEN")' not in text
+        assert "'hf_access': 'public'" in text
+    bootstrap = Path('scripts/kaggle_bootstrap.py').read_text(encoding='utf-8')
+    assert 'get_secret' not in bootstrap

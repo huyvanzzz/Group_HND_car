@@ -179,6 +179,7 @@ def test_remote_smoke_download_fetches_only_metadata_and_referenced_images(tmp_p
             return repository_files
 
     def fake_download(*args, filename: str, **kwargs):
+        assert kwargs["token"] is False
         downloaded.append(filename)
         target = snapshot_root / filename
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -190,12 +191,12 @@ def test_remote_smoke_download_fetches_only_metadata_and_referenced_images(tmp_p
 
     monkeypatch.setattr(hf_data, "HfApi", FakeApi)
     monkeypatch.setattr(hf_data, "hf_hub_download", fake_download, raising=False)
-    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.delenv("HF_TOKEN", raising=False)
     cfg = SimpleNamespace(
         project=SimpleNamespace(output_dir=str(tmp_path / "output")),
         data=SimpleNamespace(
             local_dir=None,
-            hf_repo_id="owner/private-dataset",
+            hf_repo_id="owner/public-dataset",
             revision="revision",
             expected_counts=None,
         ),
@@ -209,3 +210,41 @@ def test_remote_smoke_download_fetches_only_metadata_and_referenced_images(tmp_p
     assert "nuscenes/samples/CAM_FRONT/63.jpg" in downloaded
     assert "nuscenes/samples/CAM_FRONT/64.jpg" not in downloaded
     assert len(downloaded) == 3 + 64 * 6
+
+
+def test_inspect_public_dataset_without_token(monkeypatch):
+    calls = []
+    class PublicApi:
+        def repo_info(self, *args, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(sha='public-commit')
+        def list_repo_files(self, *args, **kwargs):
+            calls.append(kwargs)
+            return ['multi_frame/multi_frame_train.json']
+    monkeypatch.delenv('HF_TOKEN', raising=False)
+    monkeypatch.setattr(hf_data, 'HfApi', PublicApi)
+    cfg = SimpleNamespace(data=SimpleNamespace(local_dir=None, hf_repo_id='owner/public', revision='main'))
+    report = hf_data.inspect_hf_dataset(cfg, None)
+    assert 'error' not in report and report['resolved_revision'] == 'public-commit'
+    assert report['token_present'] is False
+    assert len(calls) == 2 and all(call['token'] is False for call in calls)
+
+
+def test_prepare_full_public_without_token(monkeypatch, tmp_path):
+    from efficient_vlm_ad.config import CAMERA_ORDER
+    snapshot = tmp_path / 'snapshot'
+    snapshot.mkdir()
+    for split in ('train', 'val', 'test'):
+        row = [{'Q': 'What?', 'A': 'A car.'}, {camera: 'photo.jpg' for camera in CAMERA_ORDER}]
+        (snapshot / f'multi_frame_{split}.json').write_text(json.dumps([row]))
+    calls = []
+    def download(*args, **kwargs):
+        calls.append(kwargs)
+        return str(snapshot)
+    monkeypatch.delenv('HF_TOKEN', raising=False)
+    monkeypatch.setattr(hf_data, 'snapshot_download', download)
+    cfg = SimpleNamespace(project=SimpleNamespace(output_dir=str(tmp_path/'output')),
+        data=SimpleNamespace(local_dir=None, hf_repo_id='owner/public', revision='main', expected_counts=None))
+    report = hf_data.prepare_data(cfg, disable_progress=True)
+    assert report['counts'] == {'train': 1, 'val': 1, 'test': 1}
+    assert len(calls) == 1 and calls[0]['token'] is False

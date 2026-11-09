@@ -1,5 +1,7 @@
 # Kaggle MVPruner finetune notebooks
 
+> Authentication update: source data is now public. Historical HF-secret instructions below are superseded; current notebooks and bootstrap do not require an HF token.
+
 Tạo hai notebook Kaggle self-contained cho profile
 `configs/repvit_t5_efficient_mini_kaggle_2gpu_mvpruner.yaml`.
 

@@ -8,7 +8,7 @@ The runtime in `src/efficient_vlm_ad/` supports MVPruner and a native unpruned b
 
 ## Kaggle
 
-Enable two GPUs and store the Hugging Face token as a Kaggle secret named `HF_TOKEN`. Use branch `huy-dinov2` and one of these entrypoints:
+Enable two GPUs. Source data repositories are public; no Hugging Face token is required. Use branch `huy-dinov2` and one of these entrypoints:
 
 - [Debug finetuning](notebooks/kaggle_debug_dinov2_mvpruner_finetune.ipynb): real DINO/T5 smoke data and features, manifest v2 validation, gradient diagnosis, exactly 20 optimizer steps with runtime accumulation 1, then small evaluation and benchmark. Debug outputs use a separate directory.
 - [Full finetuning](notebooks/kaggle_train_dinov2_mvpruner_finetune.ipynb): full data/cache preparation or validated downloads, optional finetune resume with per-rank RNG files, two-GPU FP32 training, evaluation, benchmark and artifact archive.
@@ -43,7 +43,7 @@ python -m efficient_vlm_ad evaluate --config "$CONFIG" --checkpoint CHECKPOINT
 python -m efficient_vlm_ad benchmark --config "$CONFIG" --checkpoint CHECKPOINT
 ```
 
-Read [MVPruner details](docs/mvpruner-two-stage.md) for architecture, cache and checkpoint contracts. Supply `HF_TOKEN` through the environment or Kaggle secrets.
+Read [MVPruner details](docs/mvpruner-two-stage.md) for architecture, cache and checkpoint contracts. Public source data can be downloaded without authentication.
 
 ## Unpruned baseline
 

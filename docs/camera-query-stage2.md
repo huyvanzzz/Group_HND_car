@@ -37,7 +37,7 @@ Finetune toàn bộ T5, embeddings, projector và compressor; DINOv2 frozen vớ
 
 ## Chạy Kaggle
 
-Mở [notebook riêng](../notebooks/kaggle_train_dinov2_camera_query_finetune.ipynb), chọn hai GPU, branch `huy-dinov2`, đặt secret `HF_TOKEN` và các HF repo tùy chọn. [Config riêng](../configs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_query.yaml) giữ đúng revisions DINO/T5, preprocessing và geometry MVPruner; output/cache mang hậu tố `_camera_query`.
+Mở [notebook riêng](../notebooks/kaggle_train_dinov2_camera_query_finetune.ipynb), chọn hai GPU, branch `huy-dinov2`, dùng dữ liệu HF public (không cần token) và các HF repo tùy chọn. [Config riêng](../configs/dinov2_t5_efficient_mini_kaggle_2gpu_camera_query.yaml) giữ đúng revisions DINO/T5, preprocessing và geometry MVPruner; output/cache mang hậu tố `_camera_query`.
 
 Cell code đầu đặt cả `PYTORCH_ALLOC_CONF` và `PYTORCH_CUDA_ALLOC_CONF` thành `expandable_segments:True` trước Torch/CUDA. Chỉ notebook mới pin Transformers 4.46.3, Tokenizers 0.20.4 và Accelerate 1.15.0. Pip/CLI dùng Python của kernel. Gradient checkpointing là false; true chưa hỗ trợ, không có toggle sau OOM.
 

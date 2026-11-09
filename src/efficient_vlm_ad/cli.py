@@ -33,7 +33,7 @@ def inspect_data(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     debug = make_debug(args, cfg)
     debug.log("CONFIG", config_debug_payload(cfg))
-    report = inspect_hf_dataset(cfg, os.getenv("HF_TOKEN"), debug=debug)
+    report = inspect_hf_dataset(cfg, debug=debug)
     report["view_order"] = cfg.data.view_order
     report["git_sha"] = _git_sha()
     print(json.dumps(report, indent=2))

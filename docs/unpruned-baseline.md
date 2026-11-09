@@ -6,7 +6,7 @@ DINOv2-S được đóng băng. Revision, preprocessing, projector, pretrained T
 
 ## Chạy trên Kaggle
 
-Bật hai GPU, cung cấp secret `HF_TOKEN`, chọn branch `huy-dinov2` rồi chạy notebook từ đầu. Cell đầu tiên đặt `GRADIENT_CHECKPOINTING = False` và cả hai biến allocator trước khi import torch hoặc kiểm tra CUDA. Cờ chỉ nhận boolean `True` hoặc `False`.
+Bật hai GPU, dùng dữ liệu HF public, không cần token, chọn branch `huy-dinov2` rồi chạy notebook từ đầu. Cell đầu tiên đặt `GRADIENT_CHECKPOINTING = False` và cả hai biến allocator trước khi import torch hoặc kiểm tra CUDA. Cờ chỉ nhận boolean `True` hoặc `False`.
 
 Notebook sao chép YAML vào `/kaggle/working/dinov2_unpruned_runtime.yaml`, ghi cờ vào `training.gradient_checkpointing`, rồi cập nhật `CONFIG` và `cfg` trước prepare-data, diagnose và train. YAML trong repo không bị ghi đè. Settings in ra ghi rõ 384 tokens và cờ thực tế; archive chứa cả runtime YAML.
 
