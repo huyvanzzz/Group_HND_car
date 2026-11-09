@@ -242,12 +242,16 @@ def publish_cache(cache_dir, *, api, owner, prepared_repo_id='', poll_seconds=15
         if not (cache / name).is_file():
             raise PublishError('Incomplete cache cannot be published')
     deadline = time.monotonic() + timeout_seconds
+    print(f'[PUBLISH] phase=checking dataset={handle}', flush=True)
     state = preflight_dataset(api, handle)
     reused = state is not None
     if state is None:
         stage = _stage(cache, handle, prepared_repo_id)
+        payload_bytes = sum((stage / name).stat().st_size for name in PAYLOAD)
+        print(f'[PUBLISH] phase=uploading files={len(PAYLOAD)} '
+              f'total_gib={payload_bytes / 1024**3:.2f}; SDK byte progress follows', flush=True)
         try:
-            response = _call('dataset creation', api.dataset_create_new, str(stage), public=True, quiet=True, convert_to_csv=False, dir_mode='skip')
+            response = _call('dataset creation', api.dataset_create_new, str(stage), public=True, quiet=False, convert_to_csv=False, dir_mode='skip')
         except PublishError as exc:
             if exc.status_code != 409:
                 raise
@@ -262,14 +266,22 @@ def publish_cache(cache_dir, *, api, owner, prepared_repo_id='', poll_seconds=15
             else:
                 _check_response(response, 'dataset creation')
         state = preflight_dataset(api, handle)
+    last_status, last_report = None, float('-inf')
     while state is None or state['status'] != 'ready':
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        status = state['status'] if state else 'pending'
+        if status != last_status or now - last_report >= 60:
+            print(f'[PUBLISH] phase=processing status={status}; waiting for Kaggle', flush=True)
+            last_status, last_report = status, now
+        if now >= deadline:
             raise PublishError('Timed out waiting for Kaggle cache; preserve cache/staging and rerun publish')
         time.sleep(min(poll_seconds, max(0, deadline - time.monotonic())))
         state = preflight_dataset(api, handle)
     if state.get('title') != 'cache_smolvlm':
         raise PublishError('Existing Kaggle dataset title mismatch')
+    print('[PUBLISH] phase=verifying cache metadata and file sizes', flush=True)
     _verify_existing(api, handle, cache)
+    print(f'[PUBLISH] phase=ready https://www.kaggle.com/datasets/{handle}', flush=True)
     return {'handle': handle, 'url': f'https://www.kaggle.com/datasets/{handle}', 'status': 'ready', 'reused': reused}
 
 

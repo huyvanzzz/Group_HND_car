@@ -52,7 +52,7 @@ class FakeAPI:
         return True
 
     def dataset_create_new(self, folder, **kwargs):
-        assert kwargs == dict(public=True, quiet=True, convert_to_csv=False, dir_mode='skip')
+        assert kwargs == dict(public=True, quiet=False, convert_to_csv=False, dir_mode='skip')
         assert set(p.name for p in Path(folder).iterdir()) == set(pub.PAYLOAD) | {'dataset-metadata.json'}
         assert os.path.samefile(Path(folder) / pub.FEATURE_FILE, self.cache / pub.FEATURE_FILE)
         self.creates += 1
@@ -175,6 +175,21 @@ def test_failed_and_timeout_block(cache, statuses, error):
 def test_processing_then_ready(cache):
     api = FakeAPI(cache, exists=True, statuses=['processing', 'ready'])
     assert pub.publish_cache(cache, api=api, owner='owner', poll_seconds=0)['reused']
+
+
+def test_upload_progress_and_bounded_processing_logs(cache, monkeypatch, capsys):
+    api = FakeAPI(cache, statuses=['processing'] * 12 + ['ready'])
+    clock = [0.0]
+    monkeypatch.setattr(pub.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(pub.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    result = pub.publish_cache(cache, api=api, owner='owner')
+    assert result['status'] == 'ready'
+    output = capsys.readouterr().out
+    lines = output.splitlines()
+    assert 'phase=uploading' in output and 'files=4' in output
+    assert 'phase=verifying' in output and 'phase=ready' in output
+    assert 2 <= sum('phase=processing' in line for line in lines) <= 4
+    assert len(lines) < 12 and 'SECRET' not in output
 
 
 @pytest.mark.parametrize('mode', ['private', 'extra', 'mismatch'])
