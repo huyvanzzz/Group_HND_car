@@ -88,7 +88,7 @@ Architecture identity is mandatory and checked before loading checkpoint weights
 
 ## Measurement limits and validation
 
-The end-to-end benchmark includes host-to-device feature transfer, generation and decoding. The generation region includes connector, native multimodal merge and causal LM generation, excluding vision extraction, DataLoader work and text tokenization. Reported T5 prefill/FLOPs fields are unsupported for this backend and must be `null` with explanatory metadata rather than misleading zeroes.
+The end-to-end benchmark includes host-to-device feature transfer, generation and decoding. The generation region includes connector, native multimodal merge and causal LM generation, excluding vision extraction, DataLoader work and text tokenization. Native causal prefill/FLOPs now use the separate SmolVLM helper described below; the T5 prefill helper is never used.
 
 Initial native-backend verification on Windows CPU: **1024 passed, 3 skipped** in **379.87 seconds** for the full repository suite, including **62 new native-backend tests**. Versions used were Torch 2.14.0+cpu, Transformers 4.46.3, Tokenizers 0.20.4 and Accelerate 1.15.0. Existing skips were two CUDA checks and one Windows symlink-permission check; both new Gloo tests executed successfully. The artifact allowlist was extended for the two new files; existing model/config/notebook files were unchanged.
 
@@ -112,3 +112,70 @@ When no complete feature cache is available, extraction reuses existing local so
 The notebook separates preparation from download execution: the first cell reads/validates prepared data, resolves the image list/revision and checks space; the next cell uses this in-memory plan to download/resume images before continuing feature extraction or cache resolution. Retrying image downloads in the same kernel does not rerun prepared-data parsing or HF file-list lookup. After image download succeeds, the existing extraction/cache validation still runs. Keep the same kernel and paths; after restarting the kernel or changing sources, run preparation again. Per-image bars stay disabled; the aggregate bar and eight download workers remain.
 
 Publication prints checking/uploading/verifying/ready phases. SDK upload byte progress is enabled (`quiet=False`) for the four allowed cache files, not for source images. While Kaggle processes the dataset, status polling stays at 15 seconds but messages print only on state transitions or after 60 seconds without a report. Processing has no fabricated percentage. Upload/publication identity, staging, timeout and reuse rules are unchanged.
+
+Prepared records are parsed once per prepared-data directory within each cache/preparation operation. Nested cache checks reuse those records while rechecking file hashes; changed bytes are reparsed and still rejected when cache identity differs. Reuse ends with the operation, so separate runs do not keep stale records. The notebook groups its preparation calls in the same scope to avoid duplicate load-prepared/records bars.
+
+
+## Lifecycle audit update: seed, evaluation and native prefill
+
+Fresh training seeds Python/NumPy/Torch before model construction, then reseeds
+with `training.seed + process_index` after Accelerator.prepare. The sampler keeps
+the shared base seed and set_epoch policy. Recipe field
+`rng_policy: post_prepare_seed_plus_rank_v1` rejects earlier training recipes;
+there is no migration or relaxed state loading. Resume restores each rank's
+Python/NumPy/Torch/CUDA RNG after iterator creation/cursor replay. Existing
+optimizer/scheduler, successful update counters, sampler cursor, full/tail
+accumulation and target-token-weighted validation are unchanged. Seeded CPU
+fixtures do not establish cross-device or cross-version bitwise reproducibility.
+
+The raw FP16 cache, manifest identity, processor, geometry and FP32 batch loading
+are unchanged. Existing valid Kaggle Input/tmp/HF feature caches remain usable;
+this update does not re-extract vision features or publish another dataset.
+
+Train progress retains the DINOv2 event schema. Evaluation/benchmark use shared
+MinimalProgressWriter with current/total, elapsed and ETA. `--no-progress` disables
+terminal bars only; JSONL is retained. CLI interval overrides are
+`--progress-log-every-steps` and `--progress-log-every-samples`. Evaluation adds
+`metrics_display.json` and `generation_diagnostics.json`; metric fallback behavior
+is unchanged and EVAL reports the actual returned metric names. The notebook
+archive includes the two new files without changing checkpoint/cache selection.
+
+Benchmark measures generation and feature-level end-to-end first, and snapshots
+its CUDA memory peak before prefill instrumentation. End-to-end ends immediately
+after text decode, before prediction-row construction or output-token counting.
+Native prefill uses max_new_tokens=1 with the configured beam count, timing from
+connector through the first full-prompt native forward (including LM head and KV
+cache), excluding token/beam selection. Connector runs once, while native causal
+LM prefill uses the expanded beam batch. Prefill latency and FLOPs are separate
+passes, with an independent prefill warmup. All phase progress uses the same
+sample list; FLOPs timing is not substituted for native SDPA latency.
+
+FLOPs use FlopCounterMode at 2 FLOPs/MAC with math SDPA only inside the FLOPs
+context and independent attention/matmul coverage probes. The value is a
+**dense-attention major-operator estimate**, not physical causal-kernel FLOPs;
+normalization, softmax, RoPE/elementwise, indexing/merge and CPU control flow are
+not fully counted. Missing coverage raises an explicit error, not zero FLOPs.
+Hooks, RNG and context/backend state are restored after success or failure.
+Benchmark metadata records the measurement scope, beams/warmup/sample count,
+Torch/Transformers/device/GPU, checkpoint, configured checkpointing and actual
+inference checkpointing state (inactive); native generation keeps KV cache on.
+
+
+Validation for this lifecycle update: the complete SmolVLM test selection plus
+shared progress, accumulation-debug and T5-prefill regression tests completed
+with **177 passed, 1 skipped (CUDA unavailable), 25 warnings in 80.94 seconds**.
+After adding an explicit unsupported-counter regression, all **6 native prefill
+tests passed**. Two-rank CPU/Gloo verifies fresh seeds 42/43, no rank reseeding
+on resume, full/tail updates, and exact epoch-boundary state/RNG replay. Real
+cache-only CLI lifecycle verifies unchanged cache/prepared bytes through train,
+resume, evaluate and all benchmark phases with raw images unavailable. A virtual
+clock test verifies H2D+generation+decode timing excludes prediction-row work;
+beam 1/3 tests verify connector-once FLOPs scaling, native outputs/weights/config
+and RNG preservation, hook cleanup and explicit missing-coverage failure.
+
+Notebook JSON/Python syntax and git diff --check passed. SHA-256 comparisons
+against the start of this change confirm no modifications to cache/storage,
+model/text/data, the tracked experiment YAML, or the shared DINOv2 pipeline,
+checkpoint, evaluation and prefill helpers. Existing unrelated working-tree
+changes were retained. No CUDA speed/memory or real pretrained training result
+is claimed; no dataset/model downloads, full training, commit or push were run.

@@ -19,6 +19,8 @@ def main(argv=None):
     parser.add_argument('--batch-size', type=int)
     parser.add_argument('--skip-meteor', action='store_true')
     parser.add_argument('--no-progress', action='store_true')
+    parser.add_argument('--progress-log-every-steps', type=int)
+    parser.add_argument('--progress-log-every-samples', type=int)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--debug-numerics', action='store_true')
     parser.add_argument('--debug-samples', type=int, default=1)
@@ -34,6 +36,15 @@ def main(argv=None):
         if args.max_steps < 1:
             parser.error('--max-steps must be positive')
         cfg = replace(cfg, training=replace(cfg.training,max_steps=args.max_steps,finetune_max_steps=None))
+    for name in ('progress_log_every_steps', 'progress_log_every_samples'):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error('--'+name.replace('_','-')+' must be positive')
+    if args.progress_log_every_steps is not None:
+        cfg = replace(cfg, training=replace(cfg.training, progress_log_every_steps=args.progress_log_every_steps))
+    if args.progress_log_every_samples is not None:
+        field = 'benchmark_progress_log_every_samples' if args.command == 'benchmark' else 'eval_progress_log_every_samples'
+        cfg = replace(cfg, evaluation=replace(cfg.evaluation, **{field:args.progress_log_every_samples}))
     from . import pipeline
     if args.command == 'prepare-data':
         from ..hf_data import prepare_data
@@ -58,7 +69,7 @@ def main(argv=None):
         result = pipeline.verify_accumulation(cfg)
     elif args.command == 'train':
         result = pipeline.train(cfg, resume=args.resume, debug=args.debug,
-            debug_numerics=args.debug_numerics, debug_samples=args.debug_samples)
+            debug_numerics=args.debug_numerics, debug_samples=args.debug_samples, disable_progress=args.no_progress)
     elif args.command == 'verify-resume-checkpoint':
         if not args.checkpoint:
             parser.error('--checkpoint is required')
@@ -72,7 +83,7 @@ def main(argv=None):
         if not args.checkpoint:
             parser.error('--checkpoint is required')
         result = pipeline.inference(cfg, args.checkpoint, benchmark=args.command == 'benchmark',
-            max_samples=args.max_samples, skip_meteor=args.skip_meteor)
+            max_samples=args.max_samples, skip_meteor=args.skip_meteor, disable_progress=args.no_progress)
     print(json.dumps(result, default=str, ensure_ascii=False))
     return 0
 

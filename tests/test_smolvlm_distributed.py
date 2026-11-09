@@ -114,13 +114,20 @@ def test_native_two_cpu_ranks_full_tail_gradients_and_updates(tmp_path):
 def _production_train_worker(rank, store, config, output, resume=None):
     import os
     from efficient_vlm_ad.smolvlm.config import load_config
-    from efficient_vlm_ad.smolvlm.pipeline import train
+    from efficient_vlm_ad.smolvlm import pipeline
+    seed_trace = []
+    original_seed = pipeline.seed
+    def traced_seed(value):
+        seed_trace.append(value)
+        original_seed(value)
+    pipeline.seed = traced_seed
     torch.set_num_threads(1)
     os.environ.update(RANK=str(rank), WORLD_SIZE='2', LOCAL_RANK=str(rank), LOCAL_WORLD_SIZE='2',
                       MASTER_ADDR='127.0.0.1', MASTER_PORT='29597')
     dist.init_process_group('gloo', init_method=Path(store).as_uri(), rank=rank, world_size=2)
     try:
-        state = train(load_config(config), resume=resume, debug=True)
+        state = pipeline.train(load_config(config), resume=resume, debug=True, disable_progress=True)
+        torch.save(seed_trace, Path(output) / f'seed_trace_rank_{rank}.pt')
         torch.save(state, Path(output) / f'production_rank_{rank}.pt')
     finally:
         dist.destroy_process_group()
@@ -182,6 +189,8 @@ def test_production_native_train_two_ranks_full_tail_counters_and_rng(tmp_path):
     first = torch.load(tmp_path / 'production_rank_0.pt', weights_only=True)
     second = torch.load(tmp_path / 'production_rank_1.pt', weights_only=True)
     assert first == second
+    for rank in range(2):
+        assert torch.load(tmp_path / f'seed_trace_rank_{rank}.pt', weights_only=True)==[cfg.training.seed, cfg.training.seed+rank]
     assert first['world_size'] == 2
     assert first['optimizer_step'] == 4 and first['global_step'] == 6
     assert first['completed_epochs'] == 2
@@ -196,6 +205,14 @@ def test_production_native_train_two_ranks_full_tail_counters_and_rng(tmp_path):
     steps = [row['payload'] for row in events if row['section'] == 'TRAIN_STEP']
     assert [row['window_size'] for row in steps] == [2, 1, 2, 1]
     assert [row['optimizer_step'] for row in steps] == [1, 2, 3, 4]
+
+    progress = [json.loads(line) for line in (Path(cfg.project.output_dir) / 'debug' / 'train_progress.jsonl').read_text().splitlines()]
+    # Two ranks must produce one stream, not one duplicate per process.
+    assert len([row for row in progress if row['event']=='epoch_start']) == 2
+    assert len([row for row in progress if row['event']=='epoch_end']) == 2
+    logged_steps = [row for row in progress if row['event']=='train_step']
+    assert [(row['epoch'], row['step_in_epoch']) for row in logged_steps] == [
+        (1, 1), (1, 3), (2, 1), (2, 3)]
 
     # An interrupted epoch-boundary run must restore both ranks' dropout RNG.
     split_config = create_local_run(tmp_path / 'split', rows=5, dropout=.1)
@@ -212,6 +229,8 @@ def test_production_native_train_two_ranks_full_tail_counters_and_rng(tmp_path):
     split_raw['training']['finetune_epochs'] = 2
     split_config.write_text(yaml.safe_dump(split_raw))
     _run_production_train(tmp_path, split_config, 'resumed_epoch', resume=split_checkpoint)
+    for rank in range(2):
+        assert torch.load(tmp_path / f'seed_trace_rank_{rank}.pt', weights_only=True)==[cfg.training.seed]
     resumed = torch.load(split_checkpoint, weights_only=False)
     for key in ('model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict', 'metadata'):
         _assert_same_state(resumed[key], payload[key])

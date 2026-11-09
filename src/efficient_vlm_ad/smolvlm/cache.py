@@ -1,7 +1,8 @@
 """Versioned disk cache of native vision states, before the connector."""
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -20,6 +21,20 @@ from ..progress import progress
 
 FEATURE_FILE = 'features.float16.memmap'
 CHECKPOINT_RESERVE_BYTES = 6 * 1024**3
+_prepared_scope = ContextVar('smolvlm_prepared_scope', default=None)
+
+
+@contextmanager
+def prepared_data_scope():
+    """Reuse parsed records only during one operation, never across independent runs."""
+    if _prepared_scope.get() is not None:
+        yield
+        return
+    token = _prepared_scope.set({})
+    try:
+        yield
+    finally:
+        _prepared_scope.reset(token)
 
 
 def _canonical(value):
@@ -51,6 +66,13 @@ def _prepared(cfg):
     for path in paths:
         if not path.is_file():
             raise ValueError(f'Missing prepared dataset file: {path}; prepare data first')
+    scope = _prepared_scope.get()
+    key = (str(directory.resolve()), _canonical(cfg.data.expected_counts or {}))
+    if scope is not None and key in scope:
+        cached = scope[key]
+        # Keep byte-level identity checks: changed files must be read and validated again.
+        if cached[2] == {path.name: _digest(path) for path in paths}:
+            return cached
     metadata = json.loads(paths[0].read_text(encoding='utf-8'))
     records = {split: load_prepared_records(cfg, split) for split in ('train', 'val', 'test')}
     counts = {split: len(rows) for split, rows in records.items()}
@@ -58,7 +80,10 @@ def _prepared(cfg):
         raise ValueError('Prepared dataset record counts disagree with its manifest')
     validate_split_counts(counts, cfg.data.expected_counts or {}, subset=metadata.get('subset', 'full'))
     hashes = {path.name: _digest(path) for path in paths}
-    return metadata, records, hashes
+    result = metadata, records, hashes
+    if scope is not None:
+        scope[key] = result
+    return result
 
 
 def _identity(cfg, processor, geometry, hashes):
@@ -74,6 +99,7 @@ def _fingerprint(manifest):
     return hashlib.sha256(_canonical({k: v for k, v in manifest.items() if k != 'fingerprint'})).hexdigest()
 
 
+@prepared_data_scope()
 def validate_cache_metadata(cfg, processor, geometry):
     """Validate identity/index before allocating or downloading the feature payload."""
     directory = Path(cfg.cache.dir)
@@ -101,6 +127,7 @@ def validate_cache_metadata(cfg, processor, geometry):
     return manifest
 
 
+@prepared_data_scope()
 def validate_cache(cfg, processor, geometry, *, full=True):
     directory = Path(cfg.cache.dir)
     manifest = validate_cache_metadata(cfg, processor, geometry)
@@ -119,6 +146,7 @@ def validate_cache(cfg, processor, geometry, *, full=True):
     return manifest
 
 
+@prepared_data_scope()
 def prepare_features(cfg, model, processor, *, subset='full', disable_progress=False, debug=None, image_root=None):
     metadata, records, hashes = _prepared(cfg)
     if subset not in {'full', 'smoke'} or metadata.get('subset', 'full') != subset:

@@ -101,6 +101,61 @@ def fake_hub(monkeypatch, source):
     return calls
 
 
+@pytest.mark.parametrize('source', ['tmp', 'kaggle', 'huggingface', 'extract'])
+def test_cache_resolution_reads_each_prepared_split_once_per_call(run, native_cache, tmp_path, monkeypatch, source):
+    import efficient_vlm_ad.smolvlm.cache as cache_module
+    import efficient_vlm_ad.smolvlm.storage as storage
+    cfg, processor, geometry = run
+    calls = []
+    original = cache_module.load_prepared_records
+    def load(*args, **kwargs):
+        calls.append(args[1])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(cache_module, 'load_prepared_records', load)
+    options = {}
+    if source == 'tmp':
+        shutil.copytree(native_cache[0].cache.dir, cfg.cache.dir)
+    elif source == 'kaggle':
+        options.update(kaggle_dataset='owner/cache-smolvlm', attach=lambda _: Path(native_cache[0].cache.dir))
+    elif source == 'huggingface':
+        fake_hub(monkeypatch, Path(native_cache[0].cache.dir))
+        options['hf_repo_id'] = 'owner/cache'
+    else:
+        model, processor = build_model_and_processor(cfg)
+        options['extractor'] = lambda local: prepare_features(local, model, processor, disable_progress=True)
+    for turn in range(2):
+        storage.resolve_cache(cfg, cache_tmp_dir=cfg.cache.dir, processor=processor, geometry=geometry, **options)
+        assert calls == ['train', 'val', 'test'] * (turn + 1)
+
+
+def test_prepared_scope_still_detects_file_changes(run, native_cache):
+    import efficient_vlm_ad.smolvlm.cache as cache_module
+    cfg, processor, geometry = run
+    shutil.copytree(native_cache[0].cache.dir, cfg.cache.dir)
+    with cache_module.prepared_data_scope():
+        cache_module.validate_cache(cfg, processor, geometry)
+        path = Path(cfg.project.output_dir) / 'prepared_data/train.jsonl'
+        path.write_bytes(path.read_bytes() + b'\n')  # Same records/counts, different identity.
+        with pytest.raises(ValueError, match='identity'):
+            cache_module.validate_cache(cfg, processor, geometry)
+
+
+def test_notebook_preparation_scope_reads_splits_once(run, monkeypatch):
+    import efficient_vlm_ad.smolvlm.cache as cache_module
+    from efficient_vlm_ad.smolvlm.storage import ensure_prepared, prepare_source_images
+    cfg, processor, geometry = run
+    original = cache_module.load_prepared_records
+    calls = []
+    def load(*args, **kwargs):
+        calls.append(args[1])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(cache_module, 'load_prepared_records', load)
+    with cache_module.prepared_data_scope():
+        ensure_prepared(cfg)
+        prepare_source_images(cfg, cache_tmp_dir=cfg.cache.dir, processor=processor, geometry=geometry)
+    assert calls == ['train', 'val', 'test']
+
+
 @pytest.mark.parametrize('source', ['huggingface', 'kaggle', 'tmp'])
 def test_separate_image_cell_skips_feature_cache_sources(run, native_cache, monkeypatch, source):
     import efficient_vlm_ad.smolvlm.storage as storage

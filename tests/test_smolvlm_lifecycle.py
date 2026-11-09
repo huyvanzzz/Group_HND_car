@@ -47,7 +47,7 @@ def test_offline_native_cli_lifecycle_and_epoch_resume(tmp_path):
     report = json.loads((output / 'debug' / 'gradient_accumulation_verify.json').read_text())
     assert report['ok'] and report['weights_and_buffers_unchanged']
     assert report['backend_accumulation_steps'] == 2
-    run(config, 'train', '--stage', 'finetune')
+    run(config, 'train', '--stage', 'finetune', '--progress-log-every-steps', '1')
     checkpoint = output / 'checkpoints' / 'finetune_latest.pt'
     first = torch.load(checkpoint, map_location='cpu', weights_only=False)
     assert first['metadata']['optimizer_step'] == 2
@@ -74,14 +74,27 @@ def test_offline_native_cli_lifecycle_and_epoch_resume(tmp_path):
                             map_location='cpu', weights_only=False)
     for name, value in resumed['model_state_dict'].items():
         torch.testing.assert_close(value, continuous['model_state_dict'][name], rtol=0, atol=0)
-    run(config, 'evaluate', '--checkpoint', str(checkpoint), '--max-samples', '2')
+    evaluation_run = run(config, 'evaluate', '--checkpoint', str(checkpoint), '--max-samples', '2', '--batch-size', '1', '--progress-log-every-samples', '1')
+    assert 'evaluate:' not in evaluation_run.stderr
     rows = [json.loads(x) for x in (output / 'predictions.jsonl').read_text().splitlines()]
     assert len(rows) == 2 and len({r['eval_id'] for r in rows}) == 2
-    run(config, 'benchmark', '--checkpoint', str(checkpoint), '--max-samples', '2')
+    run(config, 'benchmark', '--checkpoint', str(checkpoint), '--max-samples', '2', '--progress-log-every-samples', '1')
     benchmark = json.loads((output / 'benchmark.json').read_text())
-    assert benchmark['prefill_measurement']['status'] == 'unsupported_smolvlm_v1'
-    assert benchmark['prefill_mean_ms'] is None
+    assert benchmark['prefill_measurement']['status'] == 'supported'
+    assert benchmark['prefill_mean_ms'] > 0
+    assert benchmark['prefill_flops_mean_gflops'] > 0
     assert benchmark['generation_scope'].startswith('connector')
+    assert benchmark['gradient_checkpointing_active'] is False
+    assert benchmark['checkpoint_gradient_checkpointing'] is True
+    assert benchmark['num_samples']==2 and benchmark['warmup_samples']==2
+    for name in ('metrics_display.json', 'generation_diagnostics.json'):
+        assert (output/name).is_file()
+    for name,stage in [('eval_progress.jsonl','evaluate'),('benchmark_progress.jsonl','benchmark')]:
+        progress=[json.loads(line) for line in (output/'debug'/name).read_text().splitlines()]
+        selected=[row for row in progress if row['stage']==stage]
+        assert [row['current'] for row in selected]==[0,1,2]
+        assert selected[-1]['estimated_remaining_seconds']==0
+
     events = [json.loads(x) for x in (output / 'debug/debug_events.jsonl').read_text().splitlines()]
     assert any(e['section'] == 'NUMERICS' and e['payload'].get('stage') == 'diagnose_backward'
                and e['payload']['ok'] for e in events)

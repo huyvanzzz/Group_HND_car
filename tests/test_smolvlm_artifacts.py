@@ -95,7 +95,7 @@ def test_notebook_code_syntax_and_workflow_contract():
 
 def test_documentation_explains_memory_cache_and_measurement_limits():
     text = (ROOT / 'docs/research/smolvlm-no-pruner.md').read_text(encoding='utf-8')
-    for term in ('1024', '768', '576', '35.8', '6 GiB', 'GPU', 'null', 'verify-resume-checkpoint', 'FP32', '64'):
+    for term in ('1024', '768', '576', '35.8', '6 GiB', 'GPU', 'dense-attention', 'verify-resume-checkpoint', 'FP32', '64'):
         assert term in text
 
 

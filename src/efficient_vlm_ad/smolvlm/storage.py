@@ -16,7 +16,7 @@ from ..data import normalize_camera_paths
 from ..hf_data import _remote_camera_path
 from ..progress import progress
 from .cache import (CHECKPOINT_RESERVE_BYTES, FEATURE_FILE, _digest, _prepared,
-                    record_key, validate_cache, validate_cache_metadata)
+                    record_key, validate_cache, validate_cache_metadata, prepared_data_scope)
 
 PREPARED_FILES = ('manifest.json', 'train.jsonl', 'val.jsonl', 'test.jsonl')
 CACHE_FILES = ('manifest.json', 'index.json', FEATURE_FILE)
@@ -69,6 +69,7 @@ def _hub_snapshot(repo_id, filenames, *, revision=None):
     return info.sha, {name: sizes[name] for name in filenames}
 
 
+@prepared_data_scope()
 def ensure_prepared(cfg, prepared_repo_id=''):
     """Keep existing prepared bytes; only fill missing files from an explicit Hub repo."""
     directory = Path(cfg.project.output_dir) / 'prepared_data'
@@ -197,6 +198,7 @@ def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
                                                    feature_bytes=feature_bytes))
 
 
+@prepared_data_scope()
 def prepare_source_images(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='',
                           processor=None, geometry=None):
     """Prepare the notebook download cell; selected feature caches need no photos."""
@@ -217,10 +219,11 @@ def prepare_source_images(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='
                             directory.with_name(directory.name + '.raw-images'), feature_bytes=required)
 
 
+@prepared_data_scope()
 def resolve_cache(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='',
                   processor=None, geometry=None, attach=None, extractor=None):
     """Resolve one explicit source, never rebuild prepared data or silently fall back."""
-    _prepared(cfg)  # Must fail before attaching/downloading a large resource.
+    prepared = _prepared(cfg)  # Must fail before attaching/downloading a large resource.
     if processor is None or geometry is None:
         from .model import load_processor_and_geometry
         processor, geometry = load_processor_and_geometry(cfg)
@@ -270,7 +273,7 @@ def resolve_cache(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='',
 
     if state is not None or (directory.exists() and any(directory.iterdir())):
         raise ValueError('Missing or incomplete cache; restore the original download source, no automatic extraction')
-    metadata, records, _ = _prepared(cfg)
+    metadata, records, _ = prepared
     unique = {record_key(r, cfg.data.view_order): r for rows in records.values() for r in rows}
     required = len(unique) * geometry['num_views'] * geometry['vision_tokens'] * geometry['vision_dim'] * 2
     check_storage_space(directory, cfg.project.output_dir, required)

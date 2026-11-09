@@ -8,8 +8,11 @@ from ..checkpointing import save_rank_rng_state, write_rank_rng_manifest
 from ..training_accumulation import accumulation_metadata
 
 
+RNG_POLICY = 'post_prepare_seed_plus_rank_v1'
+
+
 def recipe(cfg):
-    return {**accumulation_metadata(cfg), 'backend': 'smolvlm_native_v1',
+    return {**accumulation_metadata(cfg), 'backend': 'smolvlm_native_v1', 'rng_policy': RNG_POLICY,
             'batch_size': cfg.training.batch_size, 'seed': cfg.training.seed,
             'learning_rate': cfg.training.learning_rate, 'weight_decay': cfg.training.weight_decay,
             'scheduler_gamma': cfg.training.scheduler_gamma, 'max_grad_norm': cfg.training.max_grad_norm,
