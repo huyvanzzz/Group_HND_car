@@ -6,7 +6,7 @@ The processor uses one global image per camera, with splitting disabled, in orde
 
 ## Training protocol
 
-Dataset: `minhdang0901/drivelm-nuscenes-v1-0`, revision `main`, with full split counts 341381 / 19785 / 16817. Images are shared across questions and deduplicated for feature extraction. The seed is 42. FP32 training uses two GPUs, batch 8 per rank and 4 gradient accumulation steps: effective batch 64. Ten finetune epochs use learning rate 1e-4, weight decay 0.05, scheduler gamma 0.9 and gradient clipping at 1.0. Gradient checkpointing defaults to strict boolean `true`. Both PyTorch allocator environment variables are set to `expandable_segments:True` before Torch/CUDA imports in the notebook. There is no automatic batch-size or precision adjustment.
+Dataset: `minhdang0901/drivelm-nuscenes-v1-0`, revision `main`, with full split counts 341381 / 19785 / 16817. Images are shared across questions and deduplicated for feature extraction. The seed is 42. FP32 training uses two GPUs, batch 8 per rank and 4 gradient accumulation steps: effective batch 64. Eight finetune epochs use learning rate 1e-4, weight decay 0.05, scheduler gamma 0.9 and gradient clipping at 1.0. Gradient checkpointing defaults to strict boolean `true`. Both PyTorch allocator environment variables are set to `expandable_segments:True` before Torch/CUDA imports in the notebook. There is no automatic batch-size or precision adjustment.
 
 Generation uses 512 maximum new tokens, 3 beams, early stopping and length penalty 1.0. Evaluation batch size is 4; benchmark sample cap is 200. The notebook pins Transformers 4.46.3, Tokenizers 0.20.4 and Accelerate 1.15.0. No FlashAttention installation is required.
 
@@ -179,3 +179,42 @@ model/text/data, the tracked experiment YAML, or the shared DINOv2 pipeline,
 checkpoint, evaluation and prefill helpers. Existing unrelated working-tree
 changes were retained. No CUDA speed/memory or real pretrained training result
 is claimed; no dataset/model downloads, full training, commit or push were run.
+
+
+## One epoch per Kaggle Save & Run All
+
+The notebook sets `EPOCHS_PER_RUN = 1` and passes `--epochs-per-run 1` to native
+training. This is a per-invocation limit, not a change to the training recipe or
+schedule. The current tracked profile targets **8 epochs**. Each invocation
+finishes its next epoch (or the remainder of a resumed epoch), validates, steps
+the scheduler as before, saves latest/best and all rank RNG sidecars, then returns
+normally. Without the CLI limit, existing full-run behavior remains available.
+No exit/kill or automatic session shutdown is used.
+
+After successful training, a small `training_status.json` records completed and
+target epochs and completion status; it is only used to gate notebook evaluation,
+never to restore training. Intermediate runs skip evaluate/benchmark and continue
+to artifact archiving. At the configured total (currently 8), they run normally.
+The archive includes checkpoints, `.rng` subdirectories and training status;
+feature cache storage/identity/extraction are unchanged.
+
+For the next session, restore the previous archive's `checkpoints/` directory,
+including both latest and best files and their `.rng` directories, or put those
+files in `FINETUNE_CHECKPOINT_HF_REPO_ID`. The HF allowlist also downloads best and
+its sidecars when present, while keeping latest/configured checkpoint precedence.
+Do not provide just a `.pt` without its rank sidecars. Carry the historical best
+forward even when the latest epoch did not improve it. The code does not upload
+checkpoints automatically or attach the previous Kaggle notebook Output for you.
+The session may be ended by Kaggle after the notebook completes; this code only
+limits training and lets the archive cell finish.
+
+
+Validation of the per-invocation epoch limit: **34 tests passed in 95.38 seconds**
+(training, notebook/artifacts, CLI lifecycle and two-rank CPU/Gloo). Three separate
+one-epoch runs with dropout match continuous training exactly for model,
+optimizer, scheduler, metadata and final RNG/sampler state. The two-rank test
+compares a two-epoch continuous run against two capped invocations. Notebook
+execution tests verify intermediate evaluation is skipped, final evaluation uses
+the configured total, and the archive includes latest/best rank sidecars and
+training status. Source/notebook syntax and git diff --check passed. No real
+Kaggle session shutdown or GPU training performance was tested.

@@ -47,7 +47,7 @@ def test_smolvlm_protocol_and_isolation():
     assert raw['runtime']['precision'] == 'fp32'
     training = raw['training']
     assert training['batch_size'] == 8 and training['gradient_accumulation_steps'] == 4
-    assert training['align_epochs'] == 0 and training['finetune_epochs'] == 10
+    assert training['align_epochs'] == 0 and training['finetune_epochs'] == 8
     assert training['gradient_checkpointing'] is True
     assert training['entropy_weight'] == 0 and training['seed'] == 42
     assert raw['generation'] == baseline['generation']
@@ -168,3 +168,52 @@ def test_notebook_ready_guard_binds_cache_and_runtime_yaml(tmp_path):
     runtime.write_text(yaml.safe_dump({'cache': {'dir': 'another/cache'}}))
     with pytest.raises(RuntimeError):
         namespace['assert_storage_ready']()
+
+
+def test_epoch_limited_notebook_skips_intermediate_eval_but_archives_rng(tmp_path):
+    from types import SimpleNamespace
+    import tarfile
+    _, cells=sources()
+    assert 'EPOCHS_PER_RUN = 1' in cells[1]
+    train=next(s for s in cells if 'LOCAL_LATEST =' in s)
+    assert "'--epochs-per-run', str(EPOCHS_PER_RUN)" in train
+    assert "'finetune_best.pt.rng/**'" in train
+    assert not any('exit(' in line and not line.lstrip().startswith('#') for line in train.splitlines())
+    profile=tmp_path/'profile'
+    profile.mkdir()
+    status=profile/'training_status.json'
+    cell=next(s for s in cells if "checkpoint = PROFILE / 'checkpoints/finetune_best.pt'" in s)
+    calls=[]
+    namespace={'PROFILE':profile,'cfg':SimpleNamespace(training=SimpleNamespace(finetune_epochs=10)),
+               'json':json,'run_backend':lambda *args:calls.append(args)}
+    status.write_text(json.dumps({'completed_epochs':1}))
+    exec(compile(cell,'evaluate_cell','exec'),namespace)
+    assert calls==[]
+    for name in ('finetune_latest.pt','finetune_best.pt'):
+        checkpoint=profile/'checkpoints'/name
+        checkpoint.parent.mkdir(exist_ok=True)
+        checkpoint.write_bytes(b'test')
+        rng=Path(str(checkpoint)+'.rng')
+        rng.mkdir()
+        for item in ('manifest.json','rank_00000.pt','rank_00001.pt'):
+            (rng/item).write_bytes(b'test')
+    for name in ('metrics.json','benchmark.json'):
+        (profile/name).write_text('{}')
+    (profile/'predictions.jsonl').write_text('')
+    status.write_text(json.dumps({'completed_epochs':10}))
+    exec(compile(cell,'evaluate_cell','exec'),namespace)
+    assert [args[0] for args in calls]==['evaluate','benchmark']
+    assert calls[0][2].endswith('finetune_best.pt')
+    runtime=tmp_path/'runtime.yaml'
+    runtime.write_text('training: {}')
+    archive=tmp_path/'artifacts.tar.gz'
+    archive_cell=next(s for s in cells if 'import tarfile' in s)
+    exec(compile(archive_cell,'archive_cell','exec'),{
+        'PROFILE':profile,'RUNTIME_CONFIG':runtime,
+        'Path':lambda _:archive})
+    with tarfile.open(archive) as bundle:
+        names=bundle.getnames()
+    for checkpoint in ('finetune_latest.pt','finetune_best.pt'):
+        assert f'profile/checkpoints/{checkpoint}' in names
+        assert f'profile/checkpoints/{checkpoint}.rng/rank_00001.pt' in names
+    assert 'profile/training_status.json' in names

@@ -104,7 +104,7 @@ def test_mid_epoch_resume_matches_continuous_at_update_boundary(tmp_path):
     path=tmp_path/'output/checkpoints/finetune_latest.pt'
     # Runtime checkpointing may change on resume without an architecture migration.
     resumed_cfg=replace(cfg,training=replace(cfg.training,gradient_checkpointing=False))
-    pipeline.train(resumed_cfg,resume=path)
+    pipeline.train(resumed_cfg,resume=path,epochs_per_run=1)
     resumed=torch.load(path,weights_only=False)
     other=prepared(tmp_path/'continuous',rows=3,dropout=.1)
     pipeline.train(other)
@@ -288,10 +288,55 @@ def test_cli_interval_validation_and_routing(tmp_path,monkeypatch):
     config=create_local_run(tmp_path)
     captured=[]
     monkeypatch.setattr(pipeline,'train',lambda cfg,**kw:captured.append((cfg,kw)))
-    main(['train','--config',str(config),'--no-progress','--progress-log-every-steps','7'])
+    main(['train','--config',str(config),'--no-progress','--progress-log-every-steps','7','--epochs-per-run','1'])
     assert captured[0][0].training.progress_log_every_steps==7
     assert captured[0][1]['disable_progress'] is True
+    assert captured[0][1]['epochs_per_run']==1
     for flag in ('--progress-log-every-steps','--progress-log-every-samples'):
         with pytest.raises(SystemExit) as exc:
             main(['train','--config',str(config),flag,'0'])
         assert exc.value.code==2
+
+
+def test_one_epoch_per_run_preserves_continuous_training_and_rng(tmp_path):
+    cfg=prepared(tmp_path/'segmented',rows=3,dropout=.1)
+    cfg=replace(cfg,training=replace(cfg.training,finetune_epochs=3))
+    path=tmp_path/'segmented/output/checkpoints/finetune_latest.pt'
+    first=pipeline.train(cfg,epochs_per_run=1,disable_progress=True)
+    assert first['completed_epochs']==1 and first['batch_cursor']==0
+    assert torch.load(path,weights_only=False)['scheduler_state_dict']['last_epoch']==1
+    status=json.loads((tmp_path/'segmented/output/training_status.json').read_text())
+    assert status['completed_epochs']==1 and status['target_epochs']==3
+    assert status['training_complete'] is False
+    second=pipeline.train(cfg,resume=path,epochs_per_run=1,disable_progress=True)
+    assert second['completed_epochs']==2
+    third=pipeline.train(cfg,resume=path,epochs_per_run=1,disable_progress=True)
+    assert third['completed_epochs']==3 and third['optimizer_step']==6
+    status=json.loads((tmp_path/'segmented/output/training_status.json').read_text())
+    assert status['training_complete'] is True
+    segmented=torch.load(path,weights_only=False)
+    reference=prepared(tmp_path/'continuous',rows=3,dropout=.1)
+    reference=replace(reference,training=replace(reference.training,finetune_epochs=3))
+    pipeline.train(reference,disable_progress=True)
+    other=tmp_path/'continuous/output/checkpoints/finetune_latest.pt'
+    continuous=torch.load(other,weights_only=False)
+    for key in ('model_state_dict','optimizer_state_dict','scheduler_state_dict'):
+        torch.testing.assert_close(segmented[key],continuous[key],rtol=0,atol=0)
+    assert segmented['metadata']==continuous['metadata']
+    left=torch.load(str(path)+'.rng/rank_00000.pt',weights_only=False)
+    right=torch.load(str(other)+'.rng/rank_00000.pt',weights_only=False)
+    assert left['sampler_state']==right['sampler_state']
+    assert left['rng_state']['python']==right['rng_state']['python']
+    torch.testing.assert_close(left['rng_state']['torch'],right['rng_state']['torch'],rtol=0,atol=0)
+    import numpy as np
+    for a,b in zip(left['rng_state']['numpy'],right['rng_state']['numpy']):
+        np.testing.assert_equal(a,b)
+    unchanged=pipeline.train(cfg,resume=path,epochs_per_run=1,disable_progress=True)
+    assert unchanged['optimizer_step']==third['optimizer_step']
+
+
+@pytest.mark.parametrize('value',[0,-1,True,1.5])
+def test_epochs_per_run_requires_positive_integer(tmp_path,value):
+    cfg=load_config(create_local_run(tmp_path))
+    with pytest.raises(ValueError,match='epochs_per_run'):
+        pipeline.train(cfg,epochs_per_run=value)

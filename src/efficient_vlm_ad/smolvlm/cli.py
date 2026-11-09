@@ -16,6 +16,7 @@ def main(argv=None):
     parser.add_argument('--resume')
     parser.add_argument('--max-samples', type=int)
     parser.add_argument('--max-steps', type=int)
+    parser.add_argument('--epochs-per-run', type=int, help='Maximum epochs per train invocation; total finetune target is unchanged')
     parser.add_argument('--batch-size', type=int)
     parser.add_argument('--skip-meteor', action='store_true')
     parser.add_argument('--no-progress', action='store_true')
@@ -30,6 +31,9 @@ def main(argv=None):
         if args.batch_size < 1:
             parser.error('--batch-size must be positive')
         cfg = replace(cfg, evaluation=replace(cfg.evaluation, eval_batch_size=args.batch_size))
+    if args.epochs_per_run is not None:
+        if args.command != 'train' or args.epochs_per_run < 1:
+            parser.error('--epochs-per-run requires train and a positive integer')
     if args.debug_samples < 1:
         parser.error('--debug-samples must be positive')
     if args.max_steps is not None:
@@ -69,7 +73,7 @@ def main(argv=None):
         result = pipeline.verify_accumulation(cfg)
     elif args.command == 'train':
         result = pipeline.train(cfg, resume=args.resume, debug=args.debug,
-            debug_numerics=args.debug_numerics, debug_samples=args.debug_samples, disable_progress=args.no_progress)
+            debug_numerics=args.debug_numerics, debug_samples=args.debug_samples, disable_progress=args.no_progress, epochs_per_run=args.epochs_per_run)
     elif args.command == 'verify-resume-checkpoint':
         if not args.checkpoint:
             parser.error('--checkpoint is required')

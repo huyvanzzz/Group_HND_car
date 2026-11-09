@@ -111,7 +111,7 @@ def test_native_two_cpu_ranks_full_tail_gradients_and_updates(tmp_path):
             torch.testing.assert_close(value, second[epoch]['weights'][name], rtol=0, atol=0)
 
 
-def _production_train_worker(rank, store, config, output, resume=None):
+def _production_train_worker(rank, store, config, output, resume=None, epochs_per_run=None):
     import os
     from efficient_vlm_ad.smolvlm.config import load_config
     from efficient_vlm_ad.smolvlm import pipeline
@@ -126,17 +126,17 @@ def _production_train_worker(rank, store, config, output, resume=None):
                       MASTER_ADDR='127.0.0.1', MASTER_PORT='29597')
     dist.init_process_group('gloo', init_method=Path(store).as_uri(), rank=rank, world_size=2)
     try:
-        state = pipeline.train(load_config(config), resume=resume, debug=True, disable_progress=True)
+        state = pipeline.train(load_config(config), resume=resume, debug=True, disable_progress=True, epochs_per_run=epochs_per_run)
         torch.save(seed_trace, Path(output) / f'seed_trace_rank_{rank}.pt')
         torch.save(state, Path(output) / f'production_rank_{rank}.pt')
     finally:
         dist.destroy_process_group()
 
 
-def _run_production_train(tmp_path, config, name, resume=None):
+def _run_production_train(tmp_path, config, name, resume=None, epochs_per_run=None):
     context = mp.spawn(_production_train_worker,
         args=(str(tmp_path / (name + '_store')), str(config), str(tmp_path),
-              None if resume is None else str(resume)), nprocs=2, join=False)
+              None if resume is None else str(resume), epochs_per_run), nprocs=2, join=False)
     started = time.monotonic()
     try:
         while not context.join(timeout=1):
@@ -216,11 +216,14 @@ def test_production_native_train_two_ranks_full_tail_counters_and_rng(tmp_path):
 
     # An interrupted epoch-boundary run must restore both ranks' dropout RNG.
     split_config = create_local_run(tmp_path / 'split', rows=5, dropout=.1)
+    split_raw = yaml.safe_load(split_config.read_text())
+    split_raw['training']['finetune_epochs'] = 2
+    split_config.write_text(yaml.safe_dump(split_raw))
     split_cfg = load_config(split_config)
     prepare_data(split_cfg, disable_progress=True)
     split_model, split_processor = build_model_and_processor(split_cfg)
     prepare_features(split_cfg, split_model, split_processor, disable_progress=True)
-    _run_production_train(tmp_path, split_config, 'first_epoch')
+    _run_production_train(tmp_path, split_config, 'first_epoch', epochs_per_run=1)
     split_checkpoint = Path(split_cfg.project.output_dir) / 'checkpoints' / 'finetune_latest.pt'
     partial = torch.load(split_checkpoint, weights_only=False)
     assert partial['metadata']['optimizer_step'] == 2
@@ -228,7 +231,7 @@ def test_production_native_train_two_ranks_full_tail_counters_and_rng(tmp_path):
     split_raw = yaml.safe_load(split_config.read_text())
     split_raw['training']['finetune_epochs'] = 2
     split_config.write_text(yaml.safe_dump(split_raw))
-    _run_production_train(tmp_path, split_config, 'resumed_epoch', resume=split_checkpoint)
+    _run_production_train(tmp_path, split_config, 'resumed_epoch', resume=split_checkpoint, epochs_per_run=1)
     for rank in range(2):
         assert torch.load(tmp_path / f'seed_trace_rank_{rank}.pt', weights_only=True)==[cfg.training.seed]
     resumed = torch.load(split_checkpoint, weights_only=False)

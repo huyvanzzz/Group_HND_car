@@ -114,7 +114,10 @@ def validation(model, batches, device, disable_progress=False):
     return total / tokens
 
 
-def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, disable_progress=False):
+def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, disable_progress=False,
+          epochs_per_run=None):
+    if epochs_per_run is not None and (type(epochs_per_run) is not int or epochs_per_run < 1):
+        raise ValueError('epochs_per_run must be a positive integer or None')
     accelerator = accelerator_for(cfg)
     model, processor = setup(cfg, accelerator=accelerator)
     batches = loader(cfg, model, processor, 'train', train=True)
@@ -154,12 +157,15 @@ def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, 
             'seed': cfg.training.seed, 'rng_policy': checkpoint.RNG_POLICY,
             'training_seed_by_rank': [cfg.training.seed+r for r in range(accelerator.num_processes)],
             'rng_restored': resume is not None, 'sampler_seed': cfg.training.seed,
-            'sampler_epoch': start_epoch, 'batch_cursor': cursor})
+            'sampler_epoch': start_epoch, 'batch_cursor': cursor,
+            'epochs_per_run': epochs_per_run, 'target_epochs': cfg.training.finetune_epochs})
     progress = ProgressEventWriter(cfg.project.output_dir, enabled=accelerator.is_main_process)
     best_epoch = None
     optimizer.zero_grad(set_to_none=True)
     limit = cfg.training.finetune_max_steps or cfg.training.max_steps
-    for epoch in range(start_epoch, cfg.training.finetune_epochs):
+    stop_epoch = (cfg.training.finetune_epochs if epochs_per_run is None else
+                  min(cfg.training.finetune_epochs, start_epoch+epochs_per_run))
+    for epoch in range(start_epoch, stop_epoch):
         batches.set_epoch(epoch)
         model.train()
         actual = min(len(batches), cursor+limit-global_step) if limit else len(batches)
@@ -289,8 +295,16 @@ def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, 
         if limit and global_step >= limit:
             break
     accelerator.wait_for_everyone()
+    result = state if 'state' in locals() else previous
+    if accelerator.is_main_process:
+        # A small completion summary for notebook gating, never used to restore training.
+        write_json(Path(cfg.project.output_dir)/'training_status.json', {
+            'completed_epochs': result['completed_epochs'],
+            'target_epochs': cfg.training.finetune_epochs,
+            'training_complete': result['completed_epochs'] >= cfg.training.finetune_epochs,
+            'global_step': result['global_step'], 'optimizer_step': result['optimizer_step']})
     accelerator.free_memory()
-    return state if 'state' in locals() else previous
+    return result
 
 
 def diagnose(cfg, debug_samples=1):
