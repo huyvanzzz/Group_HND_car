@@ -12,6 +12,8 @@ Generation uses 512 maximum new tokens, 3 beams, early stopping and length penal
 
 Attention is selected separately: native eager for the vision sub-config and native SDPA for the language sub-config. Decoder gradient checkpointing uses `use_reentrant=False`; the cached/frozen vision encoder does not use checkpointing. Teacher forcing passes `use_cache=False`, while generation retains native KV caching. The model's global generation configuration is preserved.
 
+Kaggle setup prints the global `pip check` report, then strictly validates the workflow's full active dependency tree (project, pinned model libraries, Kaggle clients and metrics), including transitive requirements, environment markers and requested extras. Missing or incompatible workflow dependencies still stop setup. Conflicts belonging only to unrelated preinstalled apps are reported without blocking training; no packages are uninstalled and pins are unchanged. The success marker is `[ENV] SmolVLM dependency tree OK`. After updating this notebook, restart the Kaggle session/kernel and run from the first cell to avoid using previously imported library versions. This metadata check is followed by imports of the actual Idefics3 classes; it does not replace GPU diagnose.
+
 Training averages the native CE of each microbatch within an accumulation window. Accelerate divides by A=8; a tail window of k microbatches multiplies each raw loss by A/k before backward. This is distinct from averaging all supervised tokens across a concatenated batch. Validation uses target-token-weighted CE across the full validation split, and this value selects the best checkpoint. Scheduler gamma is applied once per completed epoch.
 
 ## Commands
