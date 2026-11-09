@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import disable_progress_bars
 
 from ..data import normalize_camera_paths
 from ..hf_data import _remote_camera_path
@@ -115,6 +116,8 @@ def _save_state(path, state):
 
 def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
     """Fetch referenced source photos only; never regenerate prepared records."""
+    # Thousands of per-image notebook widgets overwhelm Kaggle's output UI.
+    disable_progress_bars()
     unique = {record_key(r, cfg.data.view_order): r for rows in records.values() for r in rows}
     root = Path(cfg.data.local_dir or metadata['root'])
     if all(path.is_file() for r in unique.values()
