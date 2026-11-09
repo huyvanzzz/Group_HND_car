@@ -86,14 +86,47 @@ def _dataset_details(api, handle):
             'slug': response.ref.split('/')[-1], 'title': response.title}
 
 
+def _owned_dataset_absent(api, owner, base):
+    """Resolve ambiguous 403 via a complete, authenticated personal listing.
+
+    Kaggle can forbid status/metadata lookups for a not-yet-created dataset.
+    A public user listing is insufficient: it cannot see private datasets.
+    This read check does not promise write permission; creation still enforces it.
+    """
+    configured_owner = _call('owner confirmation', lambda: api.get_config_value('username'))
+    if configured_owner != owner:
+        raise PublishError('Kaggle publisher owner mismatch')
+    seen = set()
+    for page in range(1, 1001):
+        datasets = _call('owned dataset listing', lambda: api.dataset_list(mine=True, page=page))
+        if not isinstance(datasets, list):
+            raise PublishError('Kaggle owned dataset listing returned an invalid response')
+        if not datasets:
+            return True
+        refs = []
+        for dataset in datasets:
+            ref = _value(dataset, 'ref')
+            if not isinstance(ref, str) or not _HANDLE.fullmatch(ref):
+                raise PublishError('Kaggle owned dataset listing is missing dataset identity')
+            if ref == base:
+                return False
+            refs.append(ref)
+        if not set(refs) - seen:
+            raise PublishError('Kaggle owned dataset listing pagination did not advance')
+        seen.update(refs)
+    raise PublishError('Kaggle owned dataset listing exceeded pagination limit')
+
+
 def preflight_dataset(api, handle):
-    """Return existing public dataset state; only HTTP 404 means absent."""
+    """Return existing state; resolve 403 only through an owned-dataset listing."""
     owner, slug, version = _handle(handle)
     base = f'{owner}/{slug}'
     try:
         status = _call('status lookup', api.dataset_status, base)
     except PublishError as exc:
         if exc.status_code == 404:
+            return None
+        if exc.status_code == 403 and _owned_dataset_absent(api, owner, base):
             return None
         raise
     if not isinstance(status, str):

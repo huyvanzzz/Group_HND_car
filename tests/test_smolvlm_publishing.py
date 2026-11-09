@@ -93,6 +93,66 @@ def test_only_404_is_absent(cache, status):
     assert 'SECRET' not in str(exc.value)
 
 
+def forbidden_preflight_api(cache, pages):
+    api = FakeAPI(cache)
+    api.dataset_status = lambda handle: (_ for _ in ()).throw(HTTPFailure(403))
+    api.get_config_value = lambda key: 'owner'
+    calls = []
+    def listing(*, mine, page):
+        assert mine is True
+        calls.append(page)
+        return pages[page - 1]
+    api.dataset_list = listing
+    return api, calls
+
+
+def test_403_missing_owned_dataset_uses_complete_authenticated_listing(cache):
+    api, calls = forbidden_preflight_api(cache, [[SimpleNamespace(ref='owner/other')], []])
+    assert pub.preflight_dataset(api, 'owner/cache-smolvlm') is None
+    assert calls == [1, 2]
+    assert api.creates == 0
+
+
+def test_create_after_403_absent_preflight_and_retry_is_idempotent(cache):
+    api = FakeAPI(cache)
+    original_status = api.dataset_status
+    def status(handle):
+        if not api.exists:
+            raise HTTPFailure(403)
+        return original_status(handle)
+    api.dataset_status = status
+    api.get_config_value = lambda key: 'owner'
+    api.dataset_list = lambda **kw: []
+    assert pub.preflight_dataset(api, 'owner/cache-smolvlm') is None
+    assert pub.publish_cache(cache, api=api, owner='owner')['status'] == 'ready'
+    assert pub.publish_cache(cache, api=api, owner='owner')['reused']
+    assert api.creates == 1
+
+
+@pytest.mark.parametrize('pages', [
+    [[SimpleNamespace(ref='owner/other')], [SimpleNamespace(ref='owner/cache-smolvlm')]],
+    [None], [[SimpleNamespace(title='missing identity')]],
+    [[SimpleNamespace(ref='owner/other')], [SimpleNamespace(ref='owner/other')]],
+])
+def test_403_existing_or_incomplete_listing_never_means_absent(cache, pages):
+    api, _ = forbidden_preflight_api(cache, pages)
+    with pytest.raises(pub.PublishError):
+        pub.preflight_dataset(api, 'owner/cache-smolvlm')
+
+
+def test_403_owner_mismatch_or_listing_denied_still_blocks(cache):
+    api, calls = forbidden_preflight_api(cache, [[]])
+    api.get_config_value = lambda key: 'someone-else'
+    with pytest.raises(pub.PublishError):
+        pub.preflight_dataset(api, 'owner/cache-smolvlm')
+    assert not calls
+    api.get_config_value = lambda key: 'owner'
+    api.dataset_list = lambda **kw: (_ for _ in ()).throw(HTTPFailure(403))
+    with pytest.raises(pub.PublishError) as exc:
+        pub.preflight_dataset(api, 'owner/cache-smolvlm')
+    assert exc.value.status_code == 403 and 'SECRET' not in str(exc.value)
+
+
 def test_create_hardlink_allowlist_and_idempotent_retry(cache):
     api = FakeAPI(cache)
     assert pub.preflight_dataset(api, 'owner/cache-smolvlm') is None
