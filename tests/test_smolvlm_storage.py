@@ -6,12 +6,63 @@ import shutil
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from efficient_vlm_ad.hf_data import prepare_data
 from efficient_vlm_ad.smolvlm.cache import FEATURE_FILE, prepare_features
 from efficient_vlm_ad.smolvlm.config import load_config
 from efficient_vlm_ad.smolvlm.model import build_model_and_processor
 from smolvlm_helpers import create_local_run
+
+
+def test_cli_features_fetches_hf_photos_with_stale_root_and_reuses_cache(tmp_path, monkeypatch):
+    import efficient_vlm_ad.smolvlm.storage as storage
+    from efficient_vlm_ad.smolvlm.cli import main
+    from efficient_vlm_ad.smolvlm.cache import _prepared, validate_cache
+    config = create_local_run(tmp_path / 'cli')
+    cfg = load_config(config)
+    prepare_data(cfg, disable_progress=True)
+    metadata, _, _ = _prepared(cfg)
+    root = Path(metadata['root'])
+    files = {p.relative_to(root).as_posix(): p for p in root.rglob('*') if p.is_file()}
+    prepared = Path(cfg.project.output_dir) / 'prepared_data'
+    metadata['root'] = str(tmp_path / 'old-session')
+    (prepared / 'manifest.json').write_text(json.dumps(metadata))
+    before = {p.name: p.read_bytes() for p in prepared.iterdir()}
+    raw = yaml.safe_load(config.read_text())
+    raw['data']['local_dir'] = None
+    config.write_text(yaml.safe_dump(raw))
+    calls = []
+    def info(**kwargs):
+        return SimpleNamespace(sha='photos-commit', siblings=[
+            SimpleNamespace(rfilename=name, size=p.stat().st_size) for name, p in files.items()])
+    def download(**kwargs):
+        assert kwargs['revision'] == 'photos-commit'
+        name = kwargs['filename']
+        assert name.endswith(('.png', '.jpg'))
+        target = Path(kwargs['local_dir']) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(files[name], target)
+        calls.append(name)
+    monkeypatch.setattr(storage, 'HfApi', lambda: SimpleNamespace(repo_info=info))
+    def unavailable(**kwargs):
+        raise OSError('HF image download unavailable')
+    monkeypatch.setattr(storage, 'hf_hub_download', unavailable)
+    with pytest.raises(OSError, match='HF image download unavailable'):
+        main(['prepare-features', '--config', str(config), '--no-progress'])
+    assert not (Path(cfg.cache.dir) / FEATURE_FILE).exists()
+    assert before == {p.name: p.read_bytes() for p in prepared.iterdir()}
+    monkeypatch.setattr(storage, 'hf_hub_download', download)
+    assert main(['prepare-features', '--config', str(config), '--no-progress']) == 0
+    assert calls and len(calls) == len(set(calls))
+    assert before == {p.name: p.read_bytes() for p in prepared.iterdir()}
+    cfg = load_config(config)
+    model, processor = build_model_and_processor(cfg)
+    assert validate_cache(cfg, processor, model.geometry)['num_samples'] == 2
+    def unexpected_hf():
+        raise AssertionError('Valid feature cache must not request source photos')
+    monkeypatch.setattr(storage, 'HfApi', unexpected_hf)
+    assert main(['prepare-features', '--config', str(config), '--no-progress']) == 0
 
 
 @pytest.fixture(scope='module')

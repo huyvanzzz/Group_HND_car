@@ -1,5 +1,7 @@
 # Kaggle MVPruner Finetune Notebooks Implementation Plan
 
+> Authentication update: source data is now public. Historical HF-secret instructions below are superseded; current notebooks and bootstrap do not require an HF token.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add one debug and one full Kaggle notebook for direct MVPruner finetuning without an align stage.

@@ -57,7 +57,7 @@ def check_storage_space(cache_dir, output_dir, required_bytes, *, reserve_bytes=
 
 
 def _hub_snapshot(repo_id, filenames, *, revision=None):
-    info = HfApi().repo_info(repo_id=repo_id, repo_type='dataset', revision=revision, files_metadata=True)
+    info = HfApi().repo_info(repo_id=repo_id, repo_type='dataset', revision=revision, files_metadata=True, token=False)
     if not info.sha:
         raise ValueError('Cannot resolve Hub source revision')
     sizes = {file.rfilename: file.size for file in info.siblings}
@@ -80,7 +80,7 @@ def ensure_prepared(cfg, prepared_repo_id=''):
     stage.mkdir(parents=True, exist_ok=True)
     for name in PREPARED_FILES:
         hf_hub_download(repo_id=prepared_repo_id, repo_type='dataset', revision=revision,
-                        filename=name, local_dir=stage)
+                        filename=name, local_dir=stage, token=False)
         if (stage / name).stat().st_size != sizes[name]:
             raise ValueError(f'Prepared download size mismatch: {name}')
         if (directory / name).exists() and _digest(directory / name) != _digest(stage / name):
@@ -132,7 +132,7 @@ def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
         raise ValueError('Raw image download source mismatch')
     info = HfApi().repo_info(repo_id=cfg.data.hf_repo_id, repo_type='dataset',
                             revision=source['revision'] if source else cfg.data.revision,
-                            files_metadata=True)
+                            files_metadata=True, token=False)
     if not info.sha:
         raise ValueError('Cannot resolve raw image source revision')
     sizes = {f.rfilename: f.size for f in info.siblings}
@@ -155,7 +155,7 @@ def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
         path = directory / name
         if not path.is_file() or path.stat().st_size != sizes[name]:
             hf_hub_download(repo_id=cfg.data.hf_repo_id, repo_type='dataset',
-                            revision=info.sha, filename=name, local_dir=directory)
+                            revision=info.sha, filename=name, local_dir=directory, token=False)
         if not path.is_file() or path.stat().st_size != sizes[name]:
             raise ValueError(f'Raw image download size mismatch: {name}')
     for record in unique.values():
@@ -254,7 +254,7 @@ def _fetch_cache_file(directory, state_path, state, name, cfg):
     # while any existing partial bytes already reduce disk_usage().free.
     check_storage_space(directory, cfg.project.output_dir, state['sizes'][name])
     hf_hub_download(repo_id=state['repo_id'], repo_type='dataset', revision=state['revision'],
-                    filename=name, local_dir=directory)
+                    filename=name, local_dir=directory, token=False)
     if not path.is_file() or path.stat().st_size != state['sizes'][name]:
         raise ValueError(f'Cache download size mismatch: {name}')
     completed[name] = _digest(path) if name != FEATURE_FILE else 'size_verified'

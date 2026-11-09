@@ -137,10 +137,14 @@ def prepare_features(cfg, model, processor, *, subset='full', disable_progress=F
     shape = (len(unique), geometry['num_views'], geometry['vision_tokens'], geometry['vision_dim'])
     if not unique:
         raise ValueError('Cannot cache an empty dataset')
-    directory.mkdir(parents=True, exist_ok=True)
     required_bytes = int(np.prod(shape)) * 2
-    from .storage import check_storage_space
+    from .storage import check_storage_space, _ensure_raw_images
+    if image_root is None:
+        # CLI and notebook share source resolution without rewriting prepared files.
+        image_root = _ensure_raw_images(cfg, metadata, records,
+            directory.with_name(directory.name + '.raw-images'), feature_bytes=required_bytes)
     check_storage_space(directory, cfg.project.output_dir, required_bytes)
+    directory.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
     temporary = directory / f'{FEATURE_FILE}.{token}.tmp'
     array = None

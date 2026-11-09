@@ -17,6 +17,26 @@ def sources():
     return notebook, [''.join(cell['source']) for cell in notebook['cells']]
 
 
+def test_public_hf_setup_still_loads_kaggle_publisher_secret(monkeypatch):
+    import os
+    import sys
+    monkeypatch.setattr(os, 'environ', dict(os.environ))
+    for name in ('KAGGLE_API_TOKEN', 'KAGGLE_USERNAME', 'KAGGLE_KEY'):
+        monkeypatch.delenv(name, raising=False)
+    requested = []
+    class Secrets:
+        def get_secret(self, name):
+            requested.append(name)
+            if name == 'KAGGLE_API_TOKEN':
+                return 'test-publisher-token'
+            raise KeyError(name)
+    monkeypatch.setitem(sys.modules, 'kaggle_secrets', SimpleNamespace(UserSecretsClient=Secrets))
+    _, cells = sources()
+    exec(compile(cells[1], 'public_setup_cell', 'exec'), {})
+    assert os.environ['KAGGLE_API_TOKEN'] == 'test-publisher-token'
+    assert 'HF_TOKEN' not in requested
+
+
 def test_smolvlm_protocol_and_isolation():
     raw = yaml.safe_load(CONFIG.read_text(encoding='utf-8'))
     baseline = yaml.safe_load((ROOT / 'configs/dinov2_t5_efficient_mini_kaggle_2gpu_unpruned.yaml').read_text(encoding='utf-8'))

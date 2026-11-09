@@ -13,7 +13,7 @@ def test_inspect_data_cli_outputs_safe_metadata(tmp_path):
     payload = json.loads(result.stdout)
 
     assert payload["hf_repo_id"] == "local/fake"
-    assert payload["token_present"] is True
+    assert payload["token_present"] is False
     assert "hf_should_not_be_printed" not in result.stdout
 
 

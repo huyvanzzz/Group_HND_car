@@ -30,14 +30,7 @@ def main() -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--only-binary=tokenizers", "-e", ".[mvpruner]"])
     subprocess.call([sys.executable, "-m", "pip", "install", "pycocoevalcap"])
 
-    try:
-        from kaggle_secrets import UserSecretsClient
-
-        token = UserSecretsClient().get_secret("HF_TOKEN")
-        if token:
-            os.environ["HF_TOKEN"] = token
-    except Exception as exc:
-        print(f"HF_TOKEN secret was not loaded: {exc}")
+    # Source data is public; no Hugging Face secret is required.
 
     import torch
     import tokenizers
