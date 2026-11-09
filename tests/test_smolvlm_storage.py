@@ -133,6 +133,7 @@ def test_prepared_files_kept_and_missing_not_recreated(run, monkeypatch, tmp_pat
     before = {p.name: p.read_bytes() for p in prepared.iterdir()}
     assert ensure_prepared(cfg)['counts']['train'] == 3
     assert before == {p.name: p.read_bytes() for p in prepared.iterdir()}
+
     shutil.copytree(prepared, tmp_path / 'remote')
     (prepared / 'val.jsonl').unlink()
     with pytest.raises(ValueError, match='prepared'):
@@ -141,6 +142,21 @@ def test_prepared_files_kept_and_missing_not_recreated(run, monkeypatch, tmp_pat
     assert ensure_prepared(cfg, 'owner/prepared')['counts']['test'] == 3
     assert before == {p.name: p.read_bytes() for p in prepared.iterdir()}
     assert all(c[1] == 'commit-one' for c in calls)
+
+
+def test_extraction_root_override_keeps_prepared_identity(run, native_cache):
+    from efficient_vlm_ad.smolvlm.cache import _prepared
+    cfg, processor, geometry = run
+    root = _prepared(cfg)[0]['root']
+    manifest = Path(cfg.project.output_dir) / 'prepared_data/manifest.json'
+    metadata = json.loads(manifest.read_text())
+    metadata['root'] = 'previous-session-root'
+    manifest.write_text(json.dumps(metadata))
+    before = manifest.read_bytes()
+    model, processor = build_model_and_processor(cfg)
+    result = prepare_features(cfg, model, processor, image_root=root, disable_progress=True)
+    assert result['num_samples'] == 2
+    assert manifest.read_bytes() == before
 
 
 def test_partial_prepared_conflict_never_overwrites(run, monkeypatch, tmp_path):
@@ -175,6 +191,7 @@ def test_space_groups_filesystems_and_checks_actual_destination(tmp_path, monkey
 def test_extract_reuses_prepared_and_requires_images(run, monkeypatch):
     from efficient_vlm_ad.smolvlm.storage import resolve_cache
     cfg, processor, geometry = run
+    cfg = replace(cfg, data=replace(cfg.data, local_dir='missing-local-images'))
     prepared = Path(cfg.project.output_dir) / 'prepared_data/manifest.json'
     meta = json.loads(prepared.read_text()); meta['root'] = 'missing-images'
     prepared.write_text(json.dumps(meta))
@@ -183,3 +200,43 @@ def test_extract_reuses_prepared_and_requires_images(run, monkeypatch):
         resolve_cache(cfg, cache_tmp_dir=cfg.cache.dir, processor=processor, geometry=geometry,
                       extractor=lambda *_: calls.append(True))
     assert not calls
+
+
+def test_missing_raw_images_download_from_hf_without_modifying_prepared(run, monkeypatch, tmp_path):
+    import efficient_vlm_ad.smolvlm.storage as storage
+    from efficient_vlm_ad.smolvlm.cache import _prepared
+    cfg, processor, geometry = run
+    metadata, records, _ = _prepared(cfg)
+    source_root = Path(metadata['root'])
+    prepared = Path(cfg.project.output_dir) / 'prepared_data'
+    before = {p.name: p.read_bytes() for p in prepared.iterdir()}
+    remote_files = {p.relative_to(source_root).as_posix(): p for p in source_root.rglob('*') if p.is_file()}
+    downloads = []
+    def info(**kwargs):
+        assert kwargs['repo_id'] == cfg.data.hf_repo_id
+        return SimpleNamespace(sha='raw-image-commit', siblings=[
+            SimpleNamespace(rfilename=name, size=p.stat().st_size) for name, p in remote_files.items()])
+    def download(**kwargs):
+        assert kwargs['revision'] == 'raw-image-commit'
+        name = kwargs['filename']
+        assert name.lower().endswith(('.png', '.jpg', '.jpeg'))
+        path = Path(kwargs['local_dir']) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(remote_files[name], path)
+        downloads.append(name)
+        return str(path)
+    monkeypatch.setattr(storage, 'HfApi', lambda: SimpleNamespace(repo_info=info))
+    monkeypatch.setattr(storage, 'hf_hub_download', download)
+    cfg = replace(cfg, data=replace(cfg.data, local_dir=None))
+    # A stale prepared manifest root must not require rewriting the prepared bytes.
+    metadata['root'] = str(tmp_path / 'old-session')
+    (prepared / 'manifest.json').write_text(json.dumps(metadata))
+    before = {p.name: p.read_bytes() for p in prepared.iterdir()}
+    root = storage._ensure_raw_images(cfg, metadata, records, tmp_path / 'raw', feature_bytes=32)
+    assert root == tmp_path / 'raw'
+    assert downloads and len(downloads) == len(set(downloads))
+    from efficient_vlm_ad.data import normalize_camera_paths
+    for rows in records.values():
+        for record in rows:
+            assert all(p.is_file() for p in normalize_camera_paths(root, record.camera_paths, cfg.data.view_order))
+    assert before == {p.name: p.read_bytes() for p in prepared.iterdir()}

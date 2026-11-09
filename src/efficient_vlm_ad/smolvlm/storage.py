@@ -11,6 +11,7 @@ import shutil
 from huggingface_hub import HfApi, hf_hub_download
 
 from ..data import normalize_camera_paths
+from ..hf_data import _remote_camera_path
 from .cache import (CHECKPOINT_RESERVE_BYTES, FEATURE_FILE, _digest, _prepared,
                     record_key, validate_cache, validate_cache_metadata)
 
@@ -112,6 +113,54 @@ def _save_state(path, state):
     os.replace(temp, path)
 
 
+def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
+    """Fetch referenced source photos only; never regenerate prepared records."""
+    unique = {record_key(r, cfg.data.view_order): r for rows in records.values() for r in rows}
+    root = Path(cfg.data.local_dir or metadata['root'])
+    if all(path.is_file() for r in unique.values()
+           for path in normalize_camera_paths(root, r.camera_paths, cfg.data.view_order)):
+        return root
+    if cfg.data.local_dir:
+        raise FileNotFoundError('Missing raw images in configured local dataset directory')
+    directory = Path(directory).resolve()
+    source_file = directory / '.source.json'
+    source = json.loads(source_file.read_text()) if source_file.exists() else None
+    if source and source['repo_id'] != cfg.data.hf_repo_id:
+        raise ValueError('Raw image download source mismatch')
+    info = HfApi().repo_info(repo_id=cfg.data.hf_repo_id, repo_type='dataset',
+                            revision=source['revision'] if source else cfg.data.revision,
+                            files_metadata=True)
+    if not info.sha:
+        raise ValueError('Cannot resolve raw image source revision')
+    sizes = {f.rfilename: f.size for f in info.siblings}
+    repository_files = set(sizes)
+    names = sorted({_remote_camera_path(r.camera_paths[camera], repository_files)
+                    for r in unique.values() for camera in cfg.data.view_order})
+    if any(type(sizes[name]) is not int or sizes[name] < 0 for name in names):
+        raise ValueError('Unknown raw image download size')
+    missing_bytes = sum(sizes[name] for name in names
+                        if not (directory / name).is_file()
+                        or (directory / name).stat().st_size != sizes[name])
+    # Raw photos and extracted features coexist on the tmp filesystem.
+    check_storage_space(directory, cfg.project.output_dir, missing_bytes + feature_bytes)
+    directory.mkdir(parents=True, exist_ok=True)
+    _save_state(source_file, {'repo_id': cfg.data.hf_repo_id, 'revision': info.sha})
+    print('[STORAGE] ' + json.dumps({'source': 'raw_images_huggingface',
+          'repo_id': cfg.data.hf_repo_id, 'revision': info.sha,
+          'image_count': len(names), 'raw_image_dir': str(directory)}), flush=True)
+    for name in names:
+        path = directory / name
+        if not path.is_file() or path.stat().st_size != sizes[name]:
+            hf_hub_download(repo_id=cfg.data.hf_repo_id, repo_type='dataset',
+                            revision=info.sha, filename=name, local_dir=directory)
+        if not path.is_file() or path.stat().st_size != sizes[name]:
+            raise ValueError(f'Raw image download size mismatch: {name}')
+    for record in unique.values():
+        if not all(p.is_file() for p in normalize_camera_paths(directory, record.camera_paths, cfg.data.view_order)):
+            raise FileNotFoundError('Downloaded source photos do not match prepared camera paths')
+    return directory
+
+
 def resolve_cache(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='',
                   processor=None, geometry=None, attach=None, extractor=None):
     """Resolve one explicit source, never rebuild prepared data or silently fall back."""
@@ -167,13 +216,11 @@ def resolve_cache(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='',
         raise ValueError('Missing or incomplete cache; restore the original download source, no automatic extraction')
     metadata, records, _ = _prepared(cfg)
     unique = {record_key(r, cfg.data.view_order): r for rows in records.values() for r in rows}
-    for record in unique.values():
-        paths = normalize_camera_paths(metadata['root'], record.camera_paths, cfg.data.view_order)
-        for path in paths:
-            if not Path(path).is_file():
-                raise FileNotFoundError('Missing raw images for extraction; provide images at prepared manifest root or use a feature cache')
     required = len(unique) * geometry['num_views'] * geometry['vision_tokens'] * geometry['vision_dim'] * 2
     check_storage_space(directory, cfg.project.output_dir, required)
+    image_root = _ensure_raw_images(cfg, metadata, records,
+                                    directory.with_name(directory.name + '.raw-images'), feature_bytes=required)
+    local_cfg = replace(local_cfg, data=replace(local_cfg.data, local_dir=str(image_root)))
     if extractor is None:
         from .model import build_model_and_processor
         from .cache import prepare_features
@@ -181,7 +228,7 @@ def resolve_cache(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='',
         model, native_processor = build_model_and_processor(local_cfg)
         device = cfg.runtime.device if cfg.runtime.device != 'auto' else ('cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
-        prepare_features(local_cfg, model, native_processor, subset=metadata.get('subset', 'full'))
+        prepare_features(local_cfg, model, native_processor, subset=metadata.get('subset', 'full'), image_root=image_root)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

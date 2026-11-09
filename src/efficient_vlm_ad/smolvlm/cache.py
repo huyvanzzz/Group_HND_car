@@ -119,7 +119,7 @@ def validate_cache(cfg, processor, geometry, *, full=True):
     return manifest
 
 
-def prepare_features(cfg, model, processor, *, subset='full', disable_progress=False, debug=None):
+def prepare_features(cfg, model, processor, *, subset='full', disable_progress=False, debug=None, image_root=None):
     metadata, records, hashes = _prepared(cfg)
     if subset not in {'full', 'smoke'} or metadata.get('subset', 'full') != subset:
         raise ValueError('Requested subset must match the prepared dataset subset')
@@ -150,7 +150,7 @@ def prepare_features(cfg, model, processor, *, subset='full', disable_progress=F
         model.eval()
         with torch.no_grad():
             for row, record in progress(enumerate(unique.values()), total=len(unique), desc='smolvlm-features', disable=disable_progress):
-                paths = normalize_camera_paths(metadata['root'], record.camera_paths, cfg.data.view_order)
+                paths = normalize_camera_paths(image_root or metadata['root'], record.camera_paths, cfg.data.view_order)
                 with ExitStack() as stack:
                     images = [stack.enter_context(Image.open(path)).convert('RGB') for path in paths]
                     inputs = processor.image_processor(images=[images], return_tensors='pt')
