@@ -101,6 +101,53 @@ def fake_hub(monkeypatch, source):
     return calls
 
 
+@pytest.mark.parametrize('source', ['huggingface', 'kaggle', 'tmp'])
+def test_separate_image_cell_skips_feature_cache_sources(run, native_cache, monkeypatch, source):
+    import efficient_vlm_ad.smolvlm.storage as storage
+    cfg, processor, geometry = run
+    if source == 'tmp':
+        shutil.copytree(native_cache[0].cache.dir, cfg.cache.dir)
+    def unexpected(*args, **kwargs):
+        raise AssertionError('Feature cache must not trigger photo downloading')
+    monkeypatch.setattr(storage, '_ensure_raw_images', unexpected)
+    assert storage.prepare_source_images(cfg, cache_tmp_dir=cfg.cache.dir,
+        hf_repo_id='owner/cache' if source == 'huggingface' else '',
+        kaggle_dataset='owner/cache-smolvlm' if source == 'kaggle' else '',
+        processor=processor, geometry=geometry) is None
+
+
+def test_separate_image_cell_reuses_local_photos_without_feature_extraction(run, monkeypatch):
+    import efficient_vlm_ad.smolvlm.storage as storage
+    cfg, processor, geometry = run
+    root = storage.prepare_source_images(cfg, cache_tmp_dir=cfg.cache.dir,
+                                          processor=processor, geometry=geometry)
+    assert root == Path(cfg.data.local_dir)
+    assert not Path(cfg.cache.dir).exists()
+
+
+def test_download_retry_uses_saved_plan_without_reloading_prepared_or_hf_metadata(tmp_path, monkeypatch):
+    import efficient_vlm_ad.smolvlm.storage as storage
+    record = SimpleNamespace(camera_paths={'Front': 'photo.jpg'})
+    plan = storage.SourceImageDownload(tmp_path, 'owner/public', 'pinned-commit',
+        {'photo.jpg': 4}, ('photo.jpg',), (record,), ('Front',))
+    def unexpected(*args, **kwargs):
+        raise AssertionError('Retry must not reload preparation')
+    monkeypatch.setattr(storage, '_prepared', unexpected)
+    monkeypatch.setattr(storage, 'HfApi', unexpected)
+    calls = []
+    def download(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise OSError('download interrupted')
+        (tmp_path / 'photo.jpg').write_bytes(b'1234')
+    monkeypatch.setattr(storage, 'hf_hub_download', download)
+    with pytest.raises(OSError, match='interrupted'):
+        storage.download_source_images(plan)
+    assert storage.download_source_images(plan) == tmp_path
+    assert storage.download_source_images(plan) == tmp_path
+    assert len(calls) == 2 and all(call['revision'] == 'pinned-commit' for call in calls)
+
+
 def test_existing_cache_relocated_and_readonly_without_raw_images(run, native_cache, tmp_path):
     from efficient_vlm_ad.smolvlm.storage import resolve_cache
     from efficient_vlm_ad.smolvlm.data import CachedVLMDataset

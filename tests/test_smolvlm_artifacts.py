@@ -130,13 +130,23 @@ def test_notebook_cache_resolution_invalidates_old_publish_on_failure():
     cell = next(s for s in cells if 'cache_location = resolve_cache(' in s)
     namespace = dict(storage_result={'status': 'ready'}, cache_location=object(),
                      cfg=object(), PREPARED_DATA_HF_REPO_ID='', CACHE_TMP_DIR='tmp',
-                     CACHE_KAGGLE_DATASET='', CACHE_HF_REPO_ID='', ensure_prepared=lambda *a: None)
+                     CACHE_KAGGLE_DATASET='', CACHE_HF_REPO_ID='', ensure_prepared=lambda *a: None,
+                     source_image_download=None, download_source_images=lambda plan: None)
     def fail(*args, **kwargs):
         raise RuntimeError('cache source failed')
     namespace['resolve_cache'] = fail
     with pytest.raises(RuntimeError, match='cache source failed'):
         exec(compile(cell, 'cache_cell', 'exec'), namespace)
     assert namespace['storage_result'] is None and namespace['cache_location'] is None
+
+
+def test_notebook_download_cell_does_not_repeat_preparation_on_retry():
+    _, cells = sources()
+    prepare = next(s for s in cells if 'source_image_download = prepare_source_images(' in s)
+    download = next(s for s in cells if 'source_image_root = download_source_images(' in s)
+    assert 'ensure_prepared(' in prepare
+    assert 'ensure_prepared(' not in download and 'prepare_source_images(' not in download
+    assert download.index('download_source_images(') < download.index('resolve_cache(')
 
 
 def test_notebook_ready_guard_binds_cache_and_runtime_yaml(tmp_path):

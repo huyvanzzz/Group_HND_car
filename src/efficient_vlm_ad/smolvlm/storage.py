@@ -116,8 +116,19 @@ def _save_state(path, state):
     os.replace(temp, path)
 
 
-def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
-    """Fetch referenced source photos only; never regenerate prepared records."""
+@dataclass(frozen=True)
+class SourceImageDownload:
+    directory: Path
+    repo_id: str
+    revision: str
+    sizes: dict
+    names: tuple
+    records: tuple
+    view_order: tuple
+
+
+def _plan_raw_images(cfg, metadata, records, directory, *, feature_bytes):
+    """Resolve metadata and space once, without downloading image payloads."""
     # Thousands of per-image notebook widgets overwhelm Kaggle's output UI.
     disable_progress_bars()
     unique = {record_key(r, cfg.data.view_order): r for rows in records.values() for r in rows}
@@ -153,11 +164,21 @@ def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
     print('[STORAGE] ' + json.dumps({'source': 'raw_images_huggingface',
           'repo_id': cfg.data.hf_repo_id, 'revision': info.sha,
           'image_count': len(names), 'raw_image_dir': str(directory)}), flush=True)
+    return SourceImageDownload(directory, cfg.data.hf_repo_id, info.sha, sizes,
+                               tuple(names), tuple(unique.values()), tuple(cfg.data.view_order))
+
+
+def download_source_images(plan):
+    """Run/retry only image downloads using the previously prepared file list."""
+    if plan is None or isinstance(plan, Path):
+        return plan
+    disable_progress_bars()
+    directory, names, sizes = plan.directory, plan.names, plan.sizes
     def download_image(name):
         path = directory / name
         if not path.is_file() or path.stat().st_size != sizes[name]:
-            hf_hub_download(repo_id=cfg.data.hf_repo_id, repo_type='dataset',
-                            revision=info.sha, filename=name, local_dir=directory, token=False)
+            hf_hub_download(repo_id=plan.repo_id, repo_type='dataset',
+                            revision=plan.revision, filename=name, local_dir=directory, token=False)
         if not path.is_file() or path.stat().st_size != sizes[name]:
             raise ValueError(f'Raw image download size mismatch: {name}')
     # Match snapshot_download's default concurrency without fetching unrelated files.
@@ -165,10 +186,35 @@ def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
         for _ in progress(pool.map(download_image, names),
                           desc='HF source images', total=len(names)):
             pass  # Consume results so download failures propagate before extraction.
-    for record in unique.values():
-        if not all(p.is_file() for p in normalize_camera_paths(directory, record.camera_paths, cfg.data.view_order)):
+    for record in plan.records:
+        if not all(p.is_file() for p in normalize_camera_paths(directory, record.camera_paths, plan.view_order)):
             raise FileNotFoundError('Downloaded source photos do not match prepared camera paths')
     return directory
+
+
+def _ensure_raw_images(cfg, metadata, records, directory, *, feature_bytes):
+    return download_source_images(_plan_raw_images(cfg, metadata, records, directory,
+                                                   feature_bytes=feature_bytes))
+
+
+def prepare_source_images(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='',
+                          processor=None, geometry=None):
+    """Prepare the notebook download cell; selected feature caches need no photos."""
+    directory = Path(cache_tmp_dir).resolve()
+    if kaggle_dataset or hf_repo_id or all((directory / name).is_file() for name in CACHE_FILES):
+        return None
+    state_path = directory.with_name(directory.name + '.download.json')
+    if state_path.exists() or (directory.exists() and any(directory.iterdir())):
+        raise ValueError('Missing or incomplete cache; restore the original download source, no automatic extraction')
+    metadata, records, _ = _prepared(cfg)
+    if processor is None or geometry is None:
+        from .model import load_processor_and_geometry
+        processor, geometry = load_processor_and_geometry(cfg)
+    unique = {record_key(r, cfg.data.view_order) for rows in records.values() for r in rows}
+    required = len(unique) * geometry['num_views'] * geometry['vision_tokens'] * geometry['vision_dim'] * 2
+    check_storage_space(directory, cfg.project.output_dir, required)
+    return _plan_raw_images(cfg, metadata, records,
+                            directory.with_name(directory.name + '.raw-images'), feature_bytes=required)
 
 
 def resolve_cache(cfg, *, cache_tmp_dir, kaggle_dataset='', hf_repo_id='',
