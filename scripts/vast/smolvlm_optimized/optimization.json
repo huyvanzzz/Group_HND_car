@@ -1,0 +1,9 @@
+{
+  "mixed_precision": "fp16",
+  "feature_dtype": "float16",
+  "persistent_workers": true,
+  "no_sync": true,
+  "grad_scaler_initial_scale": 256.0,
+  "allocator": "expandable_segments:True",
+  "world_size": 2
+}

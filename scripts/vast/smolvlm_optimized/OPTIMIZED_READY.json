@@ -1,0 +1,28 @@
+{
+  "ready": true,
+  "scope": "two_gpu_smoke_full_tail_validation_checkpoint_rng_scaler_resume",
+  "file_sha256": {
+    "optimized.yaml": "2e5f631adfe067efe8508c7d0ef7bf984beff85194cba2bc2cf51865164a6fba",
+    "optimization.json": "dc879b467951611b7fb11b0bd353c1e564e2e333413f318a4e9c9a16a3a17657",
+    "optimized_entry.py": "87a32de523a9e22ccea794297d1c5f61eb22e953fc389ce3de92dfe6d65915ce",
+    "run_training.py": "5fbf53005b4d83137ed4749aaef9e3874c43e00988a156a529be0d1f625f142d",
+    "distributed_evaluate.py": "a67b0b4b3907262b2fe8bb072c1f3bae83d6ab536445a65f552fda04f4ec24aa"
+  },
+  "precision": "fp16_amp_fp32_weights_optimizer_ce",
+  "batch_per_gpu": 6,
+  "accumulation": 8,
+  "world_size": 2,
+  "effective_batch": 96,
+  "gradient_checkpointing": false,
+  "epochs": 8,
+  "no_sync_fp16_full_window_relative_gradient_difference": 0.00015847942521033274,
+  "numerical_bitwise_parity": false,
+  "validation_batch_per_gpu": 32,
+  "evaluate_batch_per_gpu": 32,
+  "validation_world_size": 2,
+  "evaluate_world_size": 2,
+  "benchmark_batch": 1,
+  "benchmark_world_size": 1,
+  "benchmark_max_samples": 100,
+  "distributed_validation_evaluate_smoke_passed": true
+}
