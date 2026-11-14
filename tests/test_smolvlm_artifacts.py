@@ -41,17 +41,19 @@ def test_smolvlm_protocol_and_isolation():
     raw = yaml.safe_load(CONFIG.read_text(encoding='utf-8'))
     baseline = yaml.safe_load((ROOT / 'configs/dinov2_t5_efficient_mini_kaggle_2gpu_unpruned.yaml').read_text(encoding='utf-8'))
     assert raw['data'] == baseline['data']
-    assert raw['model'] == {'model_id': 'HuggingFaceTB/SmolVLM-256M-Instruct', 'revision': '7e3e67edbbed1bf9888184d9df282b700a323964'}
+    assert {k: v for k, v in raw['model'].items() if k != 'prompt_camera_order'} == {'model_id': 'HuggingFaceTB/SmolVLM-256M-Instruct', 'revision': '7e3e67edbbed1bf9888184d9df282b700a323964'}
     assert raw['project']['output_dir'] == 'outputs/smolvlm_256m_kaggle_2gpu_no_pruner'
     assert raw['cache']['dir'] == raw['project']['output_dir'] + '/cache'
-    assert raw['runtime']['precision'] == 'fp32'
+    assert raw['runtime']['precision'] == 'fp16'
+    assert raw['model']['prompt_camera_order'] == list(reversed(raw['data']['view_order']))
     training = raw['training']
-    assert training['batch_size'] == 8 and training['gradient_accumulation_steps'] == 4
-    assert training['align_epochs'] == 0 and training['finetune_epochs'] == 8
+    assert training['batch_size'] == 6 and training['gradient_accumulation_steps'] == 8
+    assert training['align_epochs'] == 0 and training['finetune_epochs'] == 2
     assert training['gradient_checkpointing'] is True
     assert training['entropy_weight'] == 0 and training['seed'] == 42
     assert raw['generation'] == baseline['generation']
-    assert raw['evaluation']['eval_batch_size'] == 4
+    assert raw['evaluation']['eval_batch_size'] == 16
+    assert raw['evaluation']['benchmark_max_samples'] == 100
 
 
 def test_notebook_code_syntax_and_workflow_contract():
@@ -184,8 +186,9 @@ def test_epoch_limited_notebook_skips_intermediate_eval_but_archives_rng(tmp_pat
     status=profile/'training_status.json'
     cell=next(s for s in cells if "checkpoint = PROFILE / 'checkpoints/finetune_best.pt'" in s)
     calls=[]
-    namespace={'PROFILE':profile,'cfg':SimpleNamespace(training=SimpleNamespace(finetune_epochs=10)),
-               'json':json,'run_backend':lambda *args:calls.append(args)}
+    namespace={'PROFILE':profile,'cfg':SimpleNamespace(training=SimpleNamespace(finetune_epochs=2)),
+               'json':json,'run_backend':lambda *args:calls.append(args),
+               'run_distributed_backend':lambda *args, **kwargs:calls.append(args)}
     status.write_text(json.dumps({'completed_epochs':1}))
     exec(compile(cell,'evaluate_cell','exec'),namespace)
     assert calls==[]
@@ -200,7 +203,7 @@ def test_epoch_limited_notebook_skips_intermediate_eval_but_archives_rng(tmp_pat
     for name in ('metrics.json','benchmark.json'):
         (profile/name).write_text('{}')
     (profile/'predictions.jsonl').write_text('')
-    status.write_text(json.dumps({'completed_epochs':10}))
+    status.write_text(json.dumps({'completed_epochs':2}))
     exec(compile(cell,'evaluate_cell','exec'),namespace)
     assert [args[0] for args in calls]==['evaluate','benchmark']
     assert calls[0][2].endswith('finetune_best.pt')
@@ -217,3 +220,74 @@ def test_epoch_limited_notebook_skips_intermediate_eval_but_archives_rng(tmp_pat
         assert f'profile/checkpoints/{checkpoint}' in names
         assert f'profile/checkpoints/{checkpoint}.rng/rank_00001.pt' in names
     assert 'profile/training_status.json' in names
+
+
+def test_fp16_notebook_preflight_and_fresh_fp32_inference_contract():
+    _, cells = sources()
+    joined = '\n'.join(cells)
+    preflight = next(s for s in cells if "'--stress'" in s)
+    assert preflight.index("'--stress-phase', 'train'") < preflight.index("'--stress-phase', 'evaluate'")
+    assert "mixed_precision='fp16'" in preflight
+    assert "mixed_precision='no'" in preflight
+    assert "PREFLIGHT_PASSED = False" in preflight and "PREFLIGHT_PASSED = True" in preflight
+    train = next(s for s in cells if 'LOCAL_LATEST =' in s)
+    assert 'if not PREFLIGHT_PASSED:' in train
+    assert "'--mixed_precision', 'fp16'" in train
+    evaluation = next(s for s in cells if "checkpoint = PROFILE / 'checkpoints/finetune_best.pt'" in s)
+    assert "run_distributed_backend('evaluate'" in evaluation
+    assert "'--batch-size', '16'" in evaluation and "'--max-samples', '100'" in evaluation
+    assert "'--batch-size', '1'" in evaluation
+    assert "compresslevel=1" in joined
+    assert '8 * 4 * 2' not in joined
+
+
+def test_gpu_stress_failure_keeps_training_gate_closed():
+    _, cells = sources()
+    preflight = next(s for s in cells if "'--stress'" in s)
+    calls = []
+    def launch(command, *args, **kwargs):
+        calls.append((command, args, kwargs))
+        if 'evaluate' in args:
+            raise RuntimeError('rank failed')
+    namespace = {'PREFLIGHT_PASSED': True, 'DIAGNOSE_PASSED': True, 'ACCUMULATION_PASSED': True,
+                 'run_backend': lambda *args: None,
+                 'run_distributed_backend': launch}
+    with pytest.raises(RuntimeError, match='rank failed'):
+        exec(compile(preflight, 'gpu_preflight', 'exec'), namespace)
+    assert namespace['PREFLIGHT_PASSED'] is False
+    assert len(calls) == 2
+    namespace['run_distributed_backend'] = lambda *args, **kwargs: None
+    exec(compile(preflight, 'gpu_preflight', 'exec'), namespace)
+    assert namespace['PREFLIGHT_PASSED'] is True
+
+
+def test_preflight_cells_require_prior_success_and_invalidate_stale_flags():
+    _, cells = sources()
+    diagnose = next(s for s in cells if "run_backend('diagnose-train'" in s)
+    accumulation = next(s for s in cells if "run_backend('verify-accumulation'" in s)
+    stress = next(s for s in cells if "'--stress'" in s)
+    assert accumulation != stress
+    calls = []
+    ns = {'run_backend': lambda *args: calls.append(args),
+          'run_distributed_backend': lambda *args, **kwargs: calls.append(args),
+          'PREFLIGHT_PASSED': True}
+    for cell in (accumulation, stress):
+        with pytest.raises(RuntimeError, match='Run'):
+            exec(compile(cell, 'out_of_order', 'exec'), ns)
+        assert ns['PREFLIGHT_PASSED'] is False
+        assert calls == []
+    exec(compile(diagnose, 'diagnose', 'exec'), ns)
+    assert ns['DIAGNOSE_PASSED'] is True
+    with pytest.raises(RuntimeError, match='Run'):
+        exec(compile(stress, 'no_accumulation', 'exec'), ns)
+    exec(compile(accumulation, 'accumulation', 'exec'), ns)
+    exec(compile(stress, 'stress', 'exec'), ns)
+    assert ns['PREFLIGHT_PASSED'] is True
+    def fail(*args):
+        raise RuntimeError('probe failed')
+    ns['run_backend'] = fail
+    for cell, flag in ((accumulation, 'ACCUMULATION_PASSED'), (diagnose, 'DIAGNOSE_PASSED')):
+        with pytest.raises(RuntimeError, match='probe failed'):
+            exec(compile(cell, 'failed_probe', 'exec'), ns)
+        assert ns[flag] is False and ns['PREFLIGHT_PASSED'] is False
+    assert ns['ACCUMULATION_PASSED'] is False

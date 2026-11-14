@@ -14,6 +14,7 @@ def _native_accumulation_worker(rank, store, output):
     from efficient_vlm_ad.smolvlm.text import CachedBatchCollator
     from efficient_vlm_ad.pipeline import _SingleProcessAccelerator
     from efficient_vlm_ad.training_accumulation import window_size, window_boundary, loss_for_backward
+    from efficient_vlm_ad.smolvlm.pipeline import accumulation_context
     import copy
 
     torch.set_num_threads(1)
@@ -50,20 +51,26 @@ def _native_accumulation_worker(rank, store, output):
             for index in range(3):
                 size = window_size(index, 3, 2)
                 seed(epoch, rank, index)
-                result = model(**batches[rank, index])
-                expected_ce = torch.nn.functional.cross_entropy(
-                    result.logits[:, :-1].reshape(-1, result.logits.shape[-1]),
-                    batches[rank,index]['labels'][:,1:].reshape(-1), ignore_index=-100)
-                torch.testing.assert_close(result.loss, expected_ce)
-                backend.backward(loss_for_backward(result.loss, 2, size))
+                boundary = window_boundary(index, 3, 2)
+                class DDPContext:
+                    def no_sync(self, wrapped):
+                        return wrapped.no_sync()
+                with accumulation_context(DDPContext(), model, boundary):
+                    result = model(**batches[rank, index])
+                    expected_ce = torch.nn.functional.cross_entropy(
+                        result.logits[:, :-1].reshape(-1, result.logits.shape[-1]),
+                        batches[rank,index]['labels'][:,1:].reshape(-1), ignore_index=-100)
+                    torch.testing.assert_close(result.loss, expected_ce)
+                    backend.backward(loss_for_backward(result.loss, 2, size))
                 for name, parameter in model.named_parameters():
                     if not parameter.requires_grad:
                         assert parameter.grad is None, name
                         continue
                     assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
-                    gathered = [torch.empty_like(parameter.grad) for _ in range(2)]
-                    dist.all_gather(gathered, parameter.grad)
-                    torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=0, msg=name)
+                    if boundary:
+                        gathered = [torch.empty_like(parameter.grad) for _ in range(2)]
+                        dist.all_gather(gathered, parameter.grad)
+                        torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=0, msg=name)
                 if window_boundary(index, 3, 2):
                     for other_rank in range(2):
                         for micro in range(index // 2 * 2, index + 1):
@@ -129,6 +136,17 @@ def _production_train_worker(rank, store, config, output, resume=None, epochs_pe
         state = pipeline.train(load_config(config), resume=resume, debug=True, disable_progress=True, epochs_per_run=epochs_per_run)
         torch.save(seed_trace, Path(output) / f'seed_trace_rank_{rank}.pt')
         torch.save(state, Path(output) / f'production_rank_{rank}.pt')
+        # One sample across two ranks exercises an empty local validation/eval shard.
+        cfg = load_config(config)
+        native, processor = pipeline.build_model_and_processor(cfg)
+        native.load_state_dict(torch.load(Path(cfg.project.output_dir) / 'checkpoints/finetune_latest.pt',
+            weights_only=False)['model_state_dict'])
+        tiny_val = pipeline.partition_loader(
+            pipeline.loader(cfg, native, processor, 'val', max_samples=1), rank, 2)
+        value = pipeline.validation(native, tiny_val, torch.device('cpu'), disable_progress=True)
+        assert value > 0
+        pipeline.inference(cfg, Path(cfg.project.output_dir) / 'checkpoints/finetune_latest.pt',
+            max_samples=1, skip_meteor=True, disable_progress=True)
     finally:
         dist.destroy_process_group()
 

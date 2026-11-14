@@ -26,7 +26,7 @@ def test_native_defaults(tmp_path):
     {'training': {'pin_memory': 'false'}}, {'generation': {'early_stopping': 'false'}},
     {'training': {'align_epochs': 1}}, {'training': {'beta_decay_updates': 10}},
     {'model': {'fusion': {}}}, {'training': {'batch_size': True}},
-    {'runtime': {'precision': 'fp16'}}, {'training': {'entropy_weight': 0.1}},
+    {'runtime': {'precision': 'bf16'}}, {'training': {'entropy_weight': 0.1}},
     {'generation': {'num_beams': 0}}, {'data': {'hf_repo_id': 'x', 'view_order': ['Front']}},
     {'model': {'revision': True}}, {'data': {'revision': 123}},
     {'data': {'expected_counts': []}}, {'training': {'text_learning_rate': .001}},

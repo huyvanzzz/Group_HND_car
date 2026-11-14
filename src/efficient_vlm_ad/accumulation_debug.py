@@ -29,6 +29,8 @@ def compare_accumulation_gradients(model, batches, accelerator, loss_fn, *, rtol
     versions = [(p, p._version) for p in model.parameters()]
     buffers = [(b, b.detach().clone()) for b in model.buffers()]
     initial_rng = _rng_state()
+    scaler = getattr(accelerator, "scaler", None)
+    scale = float(scaler.get_scale()) if scaler is not None else 1.
     cases = []
     try:
         for size in dict.fromkeys((steps, 1)):
@@ -37,8 +39,9 @@ def compare_accumulation_gradients(model, batches, accelerator, loss_fn, *, rtol
             for batch in batches[:size]:
                 with accelerator.autocast():
                     raw = loss_fn(batch)
-                (raw / size).backward()
-            reference = {name: p.grad.detach().float().cpu().clone() if p.grad is not None else None
+                reference_loss = raw / size
+                (scaler.scale(reference_loss) if scaler is not None else reference_loss).backward()
+            reference = {name: p.grad.detach().float().cpu().clone() / scale if p.grad is not None else None
                          for name, p in parameters}
             model.zero_grad(set_to_none=True)
             _restore_rng_state(replay_rng)
@@ -52,7 +55,7 @@ def compare_accumulation_gradients(model, batches, accelerator, loss_fn, *, rtol
             checked, max_error, actual_squared, reference_squared = 0, 0., 0., 0.
             for name, p in parameters:
                 ref = reference.pop(name)
-                actual = p.grad.detach().float().cpu() if p.grad is not None else None
+                actual = p.grad.detach().float().cpu() / scale if p.grad is not None else None
                 if ref is None and actual is None:
                     missing.append(name)
                     continue

@@ -1,4 +1,8 @@
 """Strict native identity and distributed training state (no T5 retie)."""
+import copy
+from collections import defaultdict
+import math
+import numbers
 import json
 import random
 import numpy as np
@@ -12,11 +16,14 @@ RNG_POLICY = 'post_prepare_seed_plus_rank_v1'
 
 
 def recipe(cfg):
-    return {**accumulation_metadata(cfg), 'backend': 'smolvlm_native_v1', 'rng_policy': RNG_POLICY,
+    result = {**accumulation_metadata(cfg), 'backend': 'smolvlm_native_v1', 'rng_policy': RNG_POLICY,
             'batch_size': cfg.training.batch_size, 'seed': cfg.training.seed,
             'learning_rate': cfg.training.learning_rate, 'weight_decay': cfg.training.weight_decay,
             'scheduler_gamma': cfg.training.scheduler_gamma, 'max_grad_norm': cfg.training.max_grad_norm,
             'objective': 'mean_microbatch_native_ce', 'validation': 'target_token_weighted_ce'}
+    if cfg.runtime.precision == 'fp16':
+        result.update(mixed_precision='fp16', no_sync_policy='non_boundary_microbatches_v1')
+    return result
 
 
 def read(path, model, cfg=None, *, training=False, world_size=None):
@@ -25,6 +32,8 @@ def read(path, model, cfg=None, *, training=False, world_size=None):
     if not signature or signature != model.architecture_signature:
         raise ValueError('SmolVLM checkpoint requires matching native architecture identity')
     if training:
+        if cfg.runtime.precision == 'fp16':
+            _validate_scaler_state(payload.get('grad_scaler_state_dict'))
         meta = payload.get('metadata', {})
         if meta.get('recipe') != recipe(cfg):
             raise ValueError('SmolVLM training recipe mismatch')
@@ -90,7 +99,117 @@ def save(path, model, optimizer, scheduler, metadata, accelerator):
             'architecture_signature': model.architecture_signature,
             'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(),
             'metadata': metadata}
+        scaler = getattr(accelerator, 'scaler', None)
+        if scaler is not None:
+            payload['grad_scaler_state_dict'] = scaler.state_dict()
         temporary = path.with_suffix('.tmp')
         torch.save(payload, temporary)
         temporary.replace(path)
     accelerator.wait_for_everyone()
+
+
+def _validate_scaler_state(state):
+    keys = {'scale', 'growth_factor', 'backoff_factor', 'growth_interval', '_growth_tracker'}
+    if not isinstance(state, dict) or set(state) != keys:
+        raise ValueError('Missing or malformed grad scaler state')
+    for key in ('scale', 'growth_factor', 'backoff_factor'):
+        value = state[key]
+        if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value):
+            raise ValueError('Malformed grad scaler state')
+    if (state['scale'] <= 0 or state['growth_factor'] <= 1
+            or not 0 < state['backoff_factor'] < 1
+            or type(state['growth_interval']) is not int or state['growth_interval'] < 1
+            or type(state['_growth_tracker']) is not int
+            or not 0 <= state['_growth_tracker'] < state['growth_interval']):
+        raise ValueError('Malformed grad scaler state')
+    try:
+        candidate = torch.amp.GradScaler('cpu')
+        candidate.load_state_dict(state)
+        # Materialize the scale through the actual implementation on CPU.
+        candidate.scale(torch.ones((), requires_grad=True))
+        if not math.isfinite(candidate.get_scale()) or candidate.get_scale() <= 0:
+            raise ValueError('Invalid scale')
+    except (KeyError, TypeError, ValueError, RuntimeError, OverflowError) as exc:
+        raise ValueError('Malformed grad scaler state') from exc
+
+
+def restore_training_state(payload, optimizer, scheduler, *, scaler=None, precision='fp32'):
+    """Validate private candidates before restoring live optimizer, scheduler and scaler."""
+    if precision == 'fp16':
+        _validate_scaler_state(payload.get('grad_scaler_state_dict'))
+        if scaler is None or not scaler.is_enabled():
+            raise ValueError('FP16 resume requires an enabled grad scaler')
+    try:
+        optimizer_state = payload['optimizer_state_dict']
+        scheduler_state = payload['scheduler_state_dict']
+        if not isinstance(optimizer_state, dict) or set(optimizer_state) != {'state', 'param_groups'}:
+            raise ValueError('Malformed optimizer state')
+        if not isinstance(optimizer_state['state'], dict) or not isinstance(optimizer_state['param_groups'], list):
+            raise ValueError('Malformed optimizer state containers')
+        if not isinstance(scheduler_state, dict) or set(scheduler_state) != set(scheduler.state_dict()):
+            raise ValueError('Malformed scheduler state')
+        for key, expected in scheduler.state_dict().items():
+            value = scheduler_state[key]
+            if type(value) is not type(expected):
+                raise ValueError('Malformed scheduler state value')
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError('Nonfinite scheduler state')
+            if isinstance(value, list) and (len(value) != len(expected) or any(
+                    isinstance(item, bool) or not isinstance(item, numbers.Real) or not math.isfinite(item)
+                    for item in value)):
+                raise ValueError('Malformed scheduler rates')
+        if scheduler_state.get('last_epoch', 0) < -1 or scheduler_state.get('_step_count', 0) < 0:
+            raise ValueError('Malformed scheduler progress')
+        # Share Parameter objects, never their mutable optimizer containers. Native
+        # load_state_dict rebuilds the candidate state without modifying tensor values.
+        candidate_optimizer = copy.copy(optimizer)
+        candidate_optimizer.param_groups = [dict(group, params=list(group['params']))
+                                            for group in optimizer.param_groups]
+        candidate_optimizer.state = defaultdict(dict)
+        candidate_optimizer.defaults = optimizer.defaults.copy()
+        candidate_optimizer.load_state_dict(optimizer_state)
+        adam = isinstance(candidate_optimizer, (torch.optim.Adam, torch.optim.AdamW))
+        require_moments = payload.get('metadata', {}).get('optimizer_step', 0) > 0
+        for group in candidate_optimizer.param_groups:
+            if adam:
+                for key in ('lr', 'weight_decay', 'eps'):
+                    value = group[key]
+                    if (isinstance(value, bool) or not isinstance(value, numbers.Real)
+                            or not math.isfinite(value) or value < 0):
+                        raise ValueError('Malformed Adam optimizer group')
+                betas = group['betas']
+                if not isinstance(betas, (tuple, list)) or len(betas) != 2 or any(
+                        isinstance(value, bool) or not isinstance(value, numbers.Real)
+                        or not math.isfinite(value) or not 0 <= value < 1 for value in betas):
+                    raise ValueError('Malformed Adam optimizer betas')
+                for key in ('amsgrad', 'maximize', 'capturable', 'differentiable', 'decoupled_weight_decay'):
+                    if key in group and type(group[key]) is not bool:
+                        raise ValueError('Malformed Adam optimizer boolean')
+                for key in ('foreach', 'fused'):
+                    if group.get(key) is not None and type(group[key]) is not bool:
+                        raise ValueError('Malformed Adam optimizer option')
+            for parameter in group['params']:
+                state = candidate_optimizer.state.get(parameter, {})
+                if adam and (state or (require_moments and parameter.requires_grad)):
+                    required = {'step', 'exp_avg', 'exp_avg_sq'}
+                    if group.get('amsgrad'):
+                        required.add('max_exp_avg_sq')
+                    if set(state) != required:
+                        raise ValueError('Malformed Adam optimizer slots')
+                for key, value in state.items():
+                    if not isinstance(value, torch.Tensor) or not bool(torch.isfinite(value).all()):
+                        raise ValueError('Malformed optimizer tensor')
+                    if key == 'step':
+                        if value.numel() != 1 or value.item() < 0 or value.item() != int(value.item()):
+                            raise ValueError('Malformed optimizer step')
+                    elif value.shape != parameter.shape:
+                        raise ValueError('Malformed optimizer tensor shape')
+        candidate_scheduler = copy.copy(scheduler)
+        candidate_scheduler.optimizer = candidate_optimizer
+        candidate_scheduler.load_state_dict(scheduler_state)
+    except (KeyError, TypeError, ValueError, RuntimeError, AttributeError, IndexError) as exc:
+        raise ValueError('Malformed native optimizer/scheduler training state') from exc
+    optimizer.load_state_dict(optimizer_state)
+    scheduler.load_state_dict(scheduler_state)
+    if precision == 'fp16':
+        scaler.load_state_dict(payload['grad_scaler_state_dict'])

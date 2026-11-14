@@ -8,10 +8,22 @@ from ..config import (CAMERA_ORDER, ProjectConfig, DataConfig, CacheConfig,
                       RuntimeConfig, TrainingConfig, GenerationConfig, EvaluationConfig)
 
 
+def validate_prompt_camera_order(order):
+    if (not isinstance(order, (list, tuple)) or len(order) != len(CAMERA_ORDER)
+            or any(not isinstance(camera, str) for camera in order)
+            or sorted(order) != sorted(CAMERA_ORDER)):
+        raise ValueError('model.prompt_camera_order must be an exact permutation of the six canonical cameras')
+    return list(order)
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     model_id: str = 'HuggingFaceTB/SmolVLM-256M-Instruct'
     revision: str | None = '7e3e67edbbed1bf9888184d9df282b700a323964'
+    prompt_camera_order: list[str] = field(default_factory=lambda: list(CAMERA_ORDER))
+
+    def __post_init__(self):
+        validate_prompt_camera_order(self.prompt_camera_order)
 
 
 @dataclass(frozen=True)
@@ -32,8 +44,8 @@ class SmolVLMConfig:
     def __post_init__(self):
         if self.data.view_order != CAMERA_ORDER:
             raise ValueError('data.view_order must match the six canonical cameras')
-        if self.runtime.precision != 'fp32':
-            raise ValueError('runtime.precision must be fp32')
+        if self.runtime.precision not in {'fp32', 'fp16'}:
+            raise ValueError('runtime.precision must be fp32 or fp16')
         if self.training.align_epochs != 0 or type(self.training.align_epochs) is not int:
             raise ValueError('native SmolVLM supports finetune only: align_epochs=0')
         if self.training.vision_training != 'feature_cache' or self.training.entropy_weight != 0:

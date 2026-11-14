@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from transformers import AutoConfig, AutoProcessor, Idefics3ForConditionalGeneration
 
+from .config import validate_prompt_camera_order
+
 MODEL_ID = 'HuggingFaceTB/SmolVLM-256M-Instruct'
 MODEL_REVISION = '7e3e67edbbed1bf9888184d9df282b700a323964'
 CAMERA_ORDER = ['Front', 'Front-Left', 'Front-Right', 'Back', 'Back-Left', 'Back-Right']
@@ -71,8 +73,9 @@ def processor_policy(processor):
 
 class CachedSmolVLM(nn.Module):
     def __init__(self, native, processor, *, gradient_checkpointing=True,
-                 model_id=MODEL_ID, model_revision=None):
+                 model_id=MODEL_ID, model_revision=None, prompt_camera_order=CAMERA_ORDER):
         super().__init__()
+        self.prompt_camera_order = validate_prompt_camera_order(prompt_camera_order)
         self.native = native
         self.processor = processor
         cfg = native.config
@@ -98,11 +101,14 @@ class CachedSmolVLM(nn.Module):
             if isinstance(obj, list):
                 return [clean(v) for v in obj]
             return obj
-        return _canonical(dict(model_id=self.model_id, model_revision=self.model_revision,
+        signature = dict(model_id=self.model_id, model_revision=self.model_revision,
             native_config=clean(config), geometry=self.geometry, fusion='no_pruner',
             processor=processor_policy(self.processor), generation_special_tokens={
                 key:getattr(self.native.generation_config,key) for key in
-                ('bos_token_id','eos_token_id','pad_token_id')}))
+                ('bos_token_id','eos_token_id','pad_token_id')})
+        if self.prompt_camera_order != CAMERA_ORDER:
+            signature['prompt_camera_order'] = self.prompt_camera_order
+        return _canonical(signature)
 
     def train(self, mode=True):
         super().train(mode)
@@ -138,7 +144,8 @@ class CachedSmolVLM(nn.Module):
             raise ValueError(f'visual_features must have shape {shape}')
         connector=self.native.model.connector
         weight=next(connector.parameters())
-        return connector(visual_features.flatten(0,1).to(device=weight.device,dtype=weight.dtype))
+        dtype = visual_features.dtype if weight.device.type == 'cuda' and torch.is_autocast_enabled() else weight.dtype
+        return connector(visual_features.flatten(0,1).to(device=weight.device,dtype=dtype))
 
     def _context(self, input_ids, extra=0):
         if input_ids.shape[1]+extra > self.native.config.text_config.max_position_embeddings:
@@ -190,4 +197,5 @@ def build_model_and_processor(cfg):
         raise ValueError('actual native attention modules must be vision eager and text sdpa')
     gc=getattr(getattr(cfg,'training',None),'gradient_checkpointing',True)
     return CachedSmolVLM(native,processor,gradient_checkpointing=gc,
-                        model_id=model_id,model_revision=revision),processor
+                        model_id=model_id,model_revision=revision,
+                        prompt_camera_order=getattr(cfg.model,'prompt_camera_order',CAMERA_ORDER)),processor

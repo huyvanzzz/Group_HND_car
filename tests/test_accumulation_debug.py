@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import json
 from pathlib import Path
 
@@ -119,3 +120,22 @@ def test_debug_command_exits_with_failure_if_comparison_fails(monkeypatch, capsy
     with pytest.raises(SystemExit, match='do not start full training'):
         module.main(['--config', 'runtime.yaml'])
     assert 'FAIL full_window' in capsys.readouterr().out
+
+
+def test_real_cpu_scaler_probe_matches_and_preserves_scaler():
+    class Backend:
+        num_processes = 1
+        gradient_accumulation_steps = 2
+        scaler = torch.amp.GradScaler('cpu', init_scale=256)
+        def autocast(self): return nullcontext()
+        def backward(self, loss): self.scaler.scale(loss / 2).backward()
+    model = torch.nn.Linear(2, 1)
+    backend = Backend()
+    before = backend.scaler.state_dict().copy()
+    rng = torch.get_rng_state().clone()
+    report = compare_accumulation_gradients(model, [torch.ones(2, 2), torch.full((2, 2), 2.)], backend,
+                                          lambda b: model(b).square().mean())
+    assert report['ok']
+    assert backend.scaler.state_dict() == before
+    assert torch.equal(rng, torch.get_rng_state())
+    assert all(p.grad is None for p in model.parameters())

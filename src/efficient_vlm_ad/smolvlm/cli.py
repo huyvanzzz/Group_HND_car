@@ -25,8 +25,14 @@ def main(argv=None):
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--debug-numerics', action='store_true')
     parser.add_argument('--debug-samples', type=int, default=1)
+    parser.add_argument('--stress', action='store_true', help='Disposable longest-batch safety probe; no training checkpoint is written')
+    parser.add_argument('--stress-phase', choices=['train', 'evaluate'], default=None)
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
+    if args.stress and args.command != 'diagnose-train':
+        parser.error('--stress requires diagnose-train')
+    if args.stress_phase is not None and not args.stress:
+        parser.error('--stress-phase requires --stress')
     if args.batch_size is not None:
         if args.batch_size < 1:
             parser.error('--batch-size must be positive')
@@ -68,7 +74,11 @@ def main(argv=None):
         processor, geometry = load_processor_and_geometry(cfg)
         result = validate_cache(cfg, processor, geometry)
     elif args.command == 'diagnose-train':
-        result = pipeline.diagnose(cfg, debug_samples=args.debug_samples)
+        if args.stress:
+            from .stress import run_stress
+            result = run_stress(cfg, phase=args.stress_phase or 'train', disable_progress=args.no_progress)
+        else:
+            result = pipeline.diagnose(cfg, debug_samples=args.debug_samples)
     elif args.command == 'verify-accumulation':
         result = pipeline.verify_accumulation(cfg)
     elif args.command == 'train':
@@ -79,9 +89,17 @@ def main(argv=None):
             parser.error('--checkpoint is required')
         from .model import build_model_and_processor
         from .checkpoint import read
+        import torch
         model, _ = build_model_and_processor(cfg)
         payload = read(args.checkpoint, model, cfg, training=True)
         model.load_state_dict(payload['model_state_dict'], strict=True)
+        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+            lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
+        # Verification restores private CPU state and never starts CUDA/DDP or training.
+        scaler = torch.amp.GradScaler('cpu') if cfg.runtime.precision == 'fp16' else None
+        pipeline.checkpoint.restore_training_state(payload, optimizer, scheduler,
+            scaler=scaler, precision=cfg.runtime.precision)
         result = {'ok': True, 'metadata': payload['metadata']}
     else:
         if not args.checkpoint:

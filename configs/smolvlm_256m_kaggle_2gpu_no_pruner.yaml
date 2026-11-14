@@ -9,20 +9,21 @@ cache:
   dir: outputs/smolvlm_256m_kaggle_2gpu_no_pruner/cache
 runtime:
   device: auto
-  precision: fp32
+  precision: fp16
 model:
   model_id: HuggingFaceTB/SmolVLM-256M-Instruct
   revision: 7e3e67edbbed1bf9888184d9df282b700a323964
+  prompt_camera_order: [Back-Right, Back-Left, Back, Front-Right, Front-Left, Front]
 training:
   gradient_checkpointing: true
   vision_training: feature_cache
-  batch_size: 8
-  gradient_accumulation_steps: 4
+  batch_size: 6
+  gradient_accumulation_steps: 8
   learning_rate: 0.0001
   weight_decay: 0.05
   scheduler_gamma: 0.9
   align_epochs: 0
-  finetune_epochs: 8
+  finetune_epochs: 2
   entropy_weight: 0.0
   seed: 42
   max_grad_norm: 1.0
@@ -35,7 +36,7 @@ generation:
   early_stopping: true
   length_penalty: 1.0
 evaluation:
-  eval_batch_size: 4
+  eval_batch_size: 16
   eval_progress_log_every_samples: 256
-  benchmark_max_samples: 200
+  benchmark_max_samples: 100
   benchmark_progress_log_every_samples: 20

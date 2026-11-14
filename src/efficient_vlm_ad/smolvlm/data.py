@@ -1,4 +1,4 @@
-"""Lazy FP32 views of cached native SmolVLM vision outputs."""
+"""Lazy typed views of cached native SmolVLM vision outputs."""
 import json
 from pathlib import Path
 import numpy as np
@@ -10,7 +10,11 @@ from .cache import FEATURE_FILE, record_key, validate_cache
 
 
 class CachedVLMDataset(Dataset):
-    def __init__(self, cfg, split, max_samples=None, *, processor=None, geometry=None, validate=True):
+    def __init__(self, cfg, split, max_samples=None, *, processor=None, geometry=None, validate=True,
+                 output_dtype=np.float32):
+        self.output_dtype = np.dtype(output_dtype)
+        if self.output_dtype not in (np.dtype(np.float32), np.dtype(np.float16)):
+            raise ValueError('output_dtype must be float32 or float16')
         self.cfg = cfg
         directory = Path(cfg.cache.dir)
         if validate:
@@ -38,7 +42,7 @@ class CachedVLMDataset(Dataset):
         if self._features is None:
             self._features = np.memmap(Path(self.cfg.cache.dir) / FEATURE_FILE, mode='r', dtype=np.float16, shape=self.shape)
         record = self.records[idx]
-        features = np.array(self._features[self.index[record_key(record, self.cfg.data.view_order)]], dtype=np.float32, copy=True)
+        features = np.array(self._features[self.index[record_key(record, self.cfg.data.view_order)]], dtype=self.output_dtype, copy=True)
         return {'question': record.question, 'answer': record.answer,
                 'visual_features': torch.from_numpy(features), 'sample_id': record.sample_id,
                 'eval_id': record.eval_id}

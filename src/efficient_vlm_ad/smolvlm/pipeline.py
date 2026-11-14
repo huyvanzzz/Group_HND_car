@@ -1,5 +1,6 @@
 """Native cached causal-LM lifecycle; no T5/pruning training policy."""
 from dataclasses import asdict
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import random
@@ -8,8 +9,9 @@ from itertools import islice
 import time
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate.utils import GradScalerKwargs
 
 from ..checkpointing import load_rank_rng_state, _restore_rng_state, _rng_state
 from ..progress_logging import ProgressEventWriter, MinimalProgressWriter
@@ -53,10 +55,14 @@ def seed(value):
     torch.manual_seed(value)
 
 
-def accelerator_for(cfg):
-    return Accelerator(cpu=cfg.runtime.device == 'cpu', mixed_precision='no',
+def accelerator_for(cfg, *, inference=False):
+    precision = 'no' if inference or cfg.runtime.precision == 'fp32' else 'fp16'
+    if precision == 'fp16' and (cfg.runtime.device == 'cpu' or not torch.cuda.is_available()):
+        raise ValueError('SmolVLM FP16 training requires CUDA; use fp32 for CPU checks')
+    return Accelerator(cpu=cfg.runtime.device == 'cpu', mixed_precision=precision,
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
         step_scheduler_with_optimizer=False,
+        kwargs_handlers=[GradScalerKwargs(init_scale=256.)] if precision == 'fp16' else [],
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True, data_seed=cfg.training.seed))
 
 
@@ -66,16 +72,37 @@ def inputs(batch, device):
 
 
 def loader(cfg, model, processor, split, *, generation=False, max_samples=None, train=False):
-    dataset = CachedVLMDataset(cfg, split, max_samples=max_samples, validate=False)
+    dtype = np.float16 if cfg.runtime.precision == 'fp16' and not generation else np.float32
+    dataset = CachedVLMDataset(cfg, split, max_samples=max_samples, validate=False, output_dtype=dtype)
     collate = CachedBatchCollator(processor,
         image_seq_len=model.geometry['visual_tokens_per_view'],
         max_length=model.native.config.text_config.max_position_embeddings,
-        generation=generation, max_new_tokens=cfg.generation.max_new_tokens)
+        generation=generation, max_new_tokens=cfg.generation.max_new_tokens,
+        prompt_camera_order=cfg.model.prompt_camera_order)
     return DataLoader(dataset, batch_size=cfg.training.batch_size if train else
         (1 if generation and split == 'benchmark' else cfg.evaluation.eval_batch_size),
         shuffle=train, collate_fn=collate, num_workers=cfg.training.num_workers,
+        persistent_workers=cfg.training.num_workers > 0,
         pin_memory=cfg.training.pin_memory,
         generator=torch.Generator().manual_seed(cfg.training.seed))
+
+
+def partition_loader(batches, rank, world_size):
+    """Exact inference shards: no padding and no second Accelerate sharding."""
+    if not 0 <= rank < world_size:
+        raise ValueError('Invalid rank/world size')
+    return DataLoader(Subset(batches.dataset, range(rank, len(batches.dataset), world_size)),
+        batch_size=batches.batch_size, collate_fn=batches.collate_fn,
+        num_workers=batches.num_workers, pin_memory=batches.pin_memory,
+        persistent_workers=batches.num_workers > 0, generator=batches.generator)
+
+
+def accumulation_context(accelerator, model, boundary):
+    return nullcontext() if boundary else accelerator.no_sync(model)
+
+
+def clean_predictions(texts):
+    return [text.strip() for text in texts]
 
 
 def setup(cfg, *, accelerator=None):
@@ -88,9 +115,16 @@ def setup(cfg, *, accelerator=None):
     return model, processor
 
 
-def metadata(cfg, model):
+def metadata(cfg, model, *, inference=False):
+    mixed = cfg.runtime.precision == 'fp16' and not inference
     return {'backend': 'smolvlm_native', 'model_revision': cfg.model.revision,
-        'visual_tokens': model.visual_token_len, 'cache_dtype': 'float16', 'compute_dtype': 'float32',
+        'visual_tokens': model.visual_token_len, 'cache_dtype': 'float16',
+        'compute_dtype': 'mixed_fp16_fp32' if mixed else 'float32',
+        'feature_input_dtype': 'float16' if mixed else 'float32',
+        'parameter_dtype': 'float32', 'optimizer_state_dtype': 'float32',
+        'precision': 'fp16' if mixed else 'fp32',
+        'persistent_workers': cfg.training.num_workers > 0,
+        'prompt_camera_order': list(cfg.model.prompt_camera_order),
         'gradient_checkpointing': model.native.model.text_model.is_gradient_checkpointing,
         'gradient_checkpointing_configured': cfg.training.gradient_checkpointing,
         'gradient_checkpointing_active': bool(model.native.model.text_model.training and model.native.model.text_model.is_gradient_checkpointing),
@@ -100,18 +134,27 @@ def metadata(cfg, model):
 
 
 @torch.no_grad()
-def validation(model, batches, device, disable_progress=False):
+def validation(model, batches, device, disable_progress=False, *, accelerator=None):
+    was_training = model.training
     model.eval()
-    total, tokens = 0., 0
-    for batch in progress_bar(batches, desc='validate-finetune', total=len(batches), disable=disable_progress):
-        values = inputs(batch, device)
-        count = int((values['labels'][:, 1:] != -100).sum())
-        loss = model(**values).loss
-        total += float(loss) * count
-        tokens += count
-    if not tokens:
-        raise ValueError('Validation contains no supervised target tokens')
-    return total / tokens
+    totals = torch.zeros(2, dtype=torch.float64, device=device)
+    try:
+        for batch in progress_bar(batches, desc='validate-finetune', total=len(batches), disable=disable_progress):
+            values = inputs(batch, device)
+            count = (values['labels'][:, 1:] != -100).sum()
+            with accelerator.autocast() if accelerator is not None else nullcontext():
+                loss = model(**values).loss
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError('Nonfinite validation CE')
+            totals[0] += loss.double() * count
+            totals[1] += count
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(totals)
+        if not bool(totals[1] > 0):
+            raise ValueError('Validation contains no supervised target tokens')
+        return float(totals[0] / totals[1])
+    finally:
+        model.train(was_training)
 
 
 def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, disable_progress=False,
@@ -122,6 +165,7 @@ def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, 
     model, processor = setup(cfg, accelerator=accelerator)
     batches = loader(cfg, model, processor, 'train', train=True)
     val_batches = loader(cfg, model, processor, 'val')
+    val_batches = partition_loader(val_batches, accelerator.process_index, accelerator.num_processes)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
         lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.training.scheduler_gamma)
@@ -130,8 +174,8 @@ def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, 
     if resume:
         payload = checkpoint.read(resume, model, cfg, training=True, world_size=accelerator.num_processes)
         model.load_state_dict(payload['model_state_dict'], strict=True)
-        optimizer.load_state_dict(payload['optimizer_state_dict'])
-        scheduler.load_state_dict(payload['scheduler_state_dict'])
+        checkpoint.restore_training_state(payload, optimizer, scheduler, scaler=accelerator.scaler,
+            precision=cfg.runtime.precision)
         previous = payload['metadata']
         start_epoch, cursor = previous['epoch'], previous['batch_cursor']
         updates, global_step, best = previous['optimizer_step'], previous['global_step'], previous['best_val_loss']
@@ -158,7 +202,9 @@ def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, 
             'training_seed_by_rank': [cfg.training.seed+r for r in range(accelerator.num_processes)],
             'rng_restored': resume is not None, 'sampler_seed': cfg.training.seed,
             'sampler_epoch': start_epoch, 'batch_cursor': cursor,
-            'epochs_per_run': epochs_per_run, 'target_epochs': cfg.training.finetune_epochs})
+            'epochs_per_run': epochs_per_run, 'target_epochs': cfg.training.finetune_epochs,
+            'no_sync': True,
+            'grad_scaler_scale': accelerator.scaler.get_scale() if accelerator.scaler else None})
     progress = ProgressEventWriter(cfg.project.output_dir, enabled=accelerator.is_main_process)
     best_epoch = None
     optimizer.zero_grad(set_to_none=True)
@@ -199,32 +245,39 @@ def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, 
             except StopIteration:
                 iterator = iter(batches)
                 batch = next(iterator)
-            raw = model(**inputs(batch, accelerator.device)).loss
-            if not bool(torch.isfinite(raw)):
-                raise FloatingPointError('Nonfinite native CE')
             size = window_size(index, remaining, A)
-            accelerator.backward(loss_for_backward(raw, A, size))
+            boundary = window_boundary(index, remaining, A)
+            with accumulation_context(accelerator, model, boundary):
+                with accelerator.autocast():
+                    raw = model(**inputs(batch, accelerator.device)).loss
+                if not bool(torch.isfinite(raw)):
+                    raise FloatingPointError('Nonfinite native CE')
+                accelerator.backward(loss_for_backward(raw, A, size))
             global_step += 1
-            if window_boundary(index, remaining, A):
+            if boundary:
                 if cfg.training.max_grad_norm is not None:
                     norm = accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
                         cfg.training.max_grad_norm)
                 else:
+                    accelerator.unscale_gradients(optimizer)
                     norm = torch.stack([p.grad.detach().float().norm() for p in model.parameters()
                         if p.requires_grad and p.grad is not None]).norm()
-                if not bool(torch.isfinite(norm)):
+                if accelerator.scaler is None and not bool(torch.isfinite(norm)):
                     raise FloatingPointError('Nonfinite gradient norm')
                 optimizer.step()
                 skipped = accelerator.optimizer_step_was_skipped
                 if not skipped:
                     updates += 1
                 optimizer.zero_grad(set_to_none=True)
-                if accelerator.is_main_process and ((debug and index < debug_samples*A) or global_step % cfg.training.progress_log_every_steps == 0 or index+1 == remaining):
+                if accelerator.is_main_process and (skipped or (debug and index < debug_samples*A) or global_step % cfg.training.progress_log_every_steps == 0 or index+1 == remaining):
                     event(cfg, 'TRAIN_STEP', {'epoch': epoch, 'global_step': global_step,
                         'optimizer_step': updates, 'window_size': size, 'raw_loss': float(raw.detach()),
                         'optimizer_skipped': skipped, 'accumulation_config': A,
                         'accumulation_backend': accelerator.gradient_accumulation_steps,
-                        'gradient_norm_before_clipping': float(norm), 'gradients_finite': bool(torch.isfinite(norm)),
+                        'gradient_norm_before_clipping': float(norm) if bool(torch.isfinite(norm)) else None,
+                        'gradients_finite': bool(torch.isfinite(norm)),
+                        'grad_scaler_scale': accelerator.scaler.get_scale() if accelerator.scaler else None,
+                        'no_sync': True,
                         'debug_numerics': debug_numerics,
                         'cuda_peak_memory_bytes': torch.cuda.max_memory_allocated() if accelerator.device.type=='cuda' else None})
             if accelerator.is_main_process:
@@ -247,15 +300,12 @@ def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, 
         if completed:
             scheduler.step()
         accelerator.wait_for_everyone()
-        # Validate complete, unsharded split once; other ranks await the result.
+        # Exact rank shards, with one token-weighted reduction after all local forwards.
         train_loss = float(epoch_loss)/remaining if accelerator.is_main_process else None
         progress.write('validation_start', stage='finetune', epoch=epoch+1,
             global_step=global_step, train_loss=train_loss)
-        value = validation(native, val_batches, accelerator.device, disable_progress=disable_progress) if accelerator.is_main_process else 0.
-        scalar = torch.tensor(value, device=accelerator.device)
-        if accelerator.num_processes > 1:
-            torch.distributed.broadcast(scalar, src=0)
-        value = float(scalar)
+        value = validation(native, val_batches, accelerator.device,
+            disable_progress=disable_progress or not accelerator.is_main_process, accelerator=accelerator)
         progress.write('validation_end', stage='finetune', epoch=epoch+1,
             global_step=global_step, train_loss=train_loss, val_loss=value,
             **_progress_memory(accelerator.device))
@@ -270,7 +320,7 @@ def train(cfg, resume=None, debug=False, debug_numerics=False, debug_samples=1, 
             'val_loss': value, 'world_size': accelerator.num_processes,
             'cuda_rng_state_sizes': [state.numel() for state in torch.cuda.get_rng_state_all()]
                 if torch.cuda.is_available() else []}
-        # Validation runs on rank zero only; its temporary mode is not saved training state.
+        # Active mode is runtime information, not checkpoint identity.
         state.pop('gradient_checkpointing_active')
         if accelerator.is_main_process:
             event(cfg, 'EPOCH', {'epoch': epoch, 'completed': completed,
@@ -314,19 +364,28 @@ def diagnose(cfg, debug_samples=1):
     model, processor = setup(cfg)
     model.to(accelerator.device).train()
     batch = next(iter(loader(cfg, model, processor, 'train', train=True)))
-    raw = model(**inputs(batch, accelerator.device)).loss
+    with accelerator.autocast():
+        raw = model(**inputs(batch, accelerator.device)).loss
+        autocast_active = torch.is_autocast_enabled(accelerator.device.type)
     event(cfg, 'NUMERICS', {**metadata(cfg, model), 'stage': 'diagnose_forward',
-        'loss': float(raw.detach()), 'ok': bool(torch.isfinite(raw)),
+        'loss': float(raw.detach()) if bool(torch.isfinite(raw)) else None, 'ok': bool(torch.isfinite(raw)),
+        'feature_input_dtype': str(batch['visual_features'].dtype).removeprefix('torch.'),
+        'loss_dtype': str(raw.dtype).removeprefix('torch.'), 'autocast_active': autocast_active,
         'input_shape': list(batch['input_ids'].shape),
         'feature_shape': list(batch['visual_features'].shape),
         'supervised_tokens': (batch['labels'][:,1:]!=-100).sum(1).tolist()[:debug_samples]})
+    if not bool(torch.isfinite(raw)):
+        raise FloatingPointError('Native diagnose has nonfinite CE')
     accelerator.backward(loss_for_backward(raw, cfg.training.gradient_accumulation_steps, 1))
-    gradients = {name: {'finite': bool(torch.isfinite(p.grad).all()), 'norm': float(p.grad.norm())}
+    scale = accelerator.scaler.get_scale() if accelerator.scaler is not None else 1.
+    gradients = {name: {'finite': bool(torch.isfinite(p.grad).all()),
+                       'norm': float((p.grad.double() / scale).norm()) if bool(torch.isfinite(p.grad).all()) else None}
                  for name, p in model.named_parameters() if p.requires_grad and p.grad is not None}
     missing = [name for name,p in model.named_parameters() if p.requires_grad and p.grad is None]
     ok = bool(torch.isfinite(raw)) and bool(gradients) and not missing and all(v['finite'] for v in gradients.values())
     report = {**metadata(cfg, model), 'stage': 'diagnose_backward', 'ok': ok,
               'loss': float(raw.detach()), 'gradients': gradients, 'missing_gradients': missing,
+              'grad_scaler_scale': scale, 'gradient_norms_unscaled': True,
               'cuda_peak_memory_bytes': torch.cuda.max_memory_allocated() if accelerator.device.type == 'cuda' else None}
     event(cfg, 'NUMERICS', report)
     if not ok:
@@ -372,13 +431,16 @@ def inference(cfg, checkpoint_path, *, benchmark=False, max_samples=None, skip_m
               disable_progress=False):
     if max_samples is not None and (type(max_samples) is not int or max_samples<1):
         raise ValueError('max_samples must be a positive integer')
-    model, processor = setup(cfg)
+    accelerator = accelerator_for(cfg, inference=True)
+    if benchmark and accelerator.num_processes != 1:
+        raise ValueError('Benchmark requires one process/GPU')
+    model, processor = setup(cfg, accelerator=accelerator)
     payload = checkpoint.read(checkpoint_path, model)
     model.load_state_dict(payload['model_state_dict'], strict=True)
     checkpoint_metadata = payload['metadata']
     del payload
-    device = torch.device(cfg.runtime.device if cfg.runtime.device != 'auto' else ('cuda' if torch.cuda.is_available() else 'cpu'))
-    model.to(device).eval()
+    device = accelerator.device
+    model.to(device=device, dtype=torch.float32).eval()
     data = loader(cfg, model, processor, 'test', generation=True,
         max_samples=max_samples if max_samples is not None else (cfg.evaluation.benchmark_max_samples if benchmark else None))
     if benchmark:
@@ -387,40 +449,49 @@ def inference(cfg, checkpoint_path, *, benchmark=False, max_samples=None, skip_m
     if not total:
         raise ValueError('Inference requires at least one sample')
     stage = 'benchmark' if benchmark else 'evaluate'
-    event(cfg, 'INFERENCE', {**metadata(cfg, model), 'stage': stage,
-        'checkpoint': str(checkpoint_path), 'num_samples': total,
-        'checkpoint_gradient_checkpointing': checkpoint_metadata.get('gradient_checkpointing')})
+    source_indices = list(range(accelerator.process_index, total, accelerator.num_processes))
+    if not benchmark and accelerator.num_processes > 1:
+        data = partition_loader(data, accelerator.process_index, accelerator.num_processes)
+    local_total = len(data.dataset)
+    if accelerator.is_main_process:
+        event(cfg, 'INFERENCE', {**metadata(cfg, model, inference=True), 'stage': stage,
+            'checkpoint': str(checkpoint_path), 'num_samples': total,
+            'world_size': accelerator.num_processes,
+            'checkpoint_gradient_checkpointing': checkpoint_metadata.get('gradient_checkpointing')})
     kwargs = asdict(cfg.generation)
     prefill_kwargs = {key:kwargs[key] for key in ('num_beams','early_stopping','length_penalty')}
     rows, e2e, gen, counts = [], [], [], []
     warmup_samples = min(3, total) if benchmark else 0
     if benchmark:
-        with prefill.preserve_rng():
+        with prefill.preserve_rng(), torch.autocast(device_type=device.type, enabled=False):
             for batch in progress_bar(islice(data, warmup_samples), desc='benchmark-warmup',
                     total=warmup_samples, disable=disable_progress):
                 model.generate_from_features(**inputs(batch, device), **kwargs)
         sync(device)
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(device)
-    writer = MinimalProgressWriter(cfg.project.output_dir, ('benchmark' if benchmark else 'eval')+'_progress.jsonl')
+    writer = MinimalProgressWriter(cfg.project.output_dir, ('benchmark' if benchmark else 'eval')+'_progress.jsonl',
+        enabled=accelerator.is_main_process)
     log_every = (cfg.evaluation.benchmark_progress_log_every_samples if benchmark
                  else cfg.evaluation.eval_progress_log_every_samples)
     started, processed, next_log_at = time.perf_counter(), 0, log_every
-    _minimal_progress(writer, stage, 0, total, started)
-    for batch in progress_bar(data, desc=stage, total=len(data), disable=disable_progress):
+    _minimal_progress(writer, stage, 0, local_total, started)
+    for batch in progress_bar(data, desc=stage, total=len(data), disable=disable_progress or not accelerator.is_main_process):
         sync(device)
         start = time.perf_counter()
         values = inputs(batch, device)
         sync(device)
         generation_start = time.perf_counter()
-        output = model.generate_from_features(**values, **kwargs)
+        with torch.autocast(device_type=device.type, enabled=False):
+            output = model.generate_from_features(**values, **kwargs)
         sync(device)
         generation_end = time.perf_counter()
-        texts = processor.tokenizer.batch_decode(output, skip_special_tokens=True)
+        texts = clean_predictions(processor.tokenizer.batch_decode(output, skip_special_tokens=True))
         decode_end = time.perf_counter()
         for index, text in enumerate(texts):
             rows.append({'eval_id': batch['eval_ids'][index], 'sample_id': batch['sample_ids'][index],
-                'reference': batch['answers'][index], 'prediction': text})
+                'reference': batch['answers'][index], 'prediction': text,
+                '_source_index': source_indices[processed+index]})
         if benchmark:
             eos = model.native.generation_config.eos_token_id
             eos = {eos} if isinstance(eos, int) else set(eos or [])
@@ -430,15 +501,15 @@ def inference(cfg, checkpoint_path, *, benchmark=False, max_samples=None, skip_m
             gen.append(generation_end-generation_start)
             e2e.append(decode_end-start)
         processed += len(texts)
-        if processed >= next_log_at or processed == total:
-            _minimal_progress(writer, stage, processed, total, started)
+        if processed >= next_log_at or processed == local_total:
+            _minimal_progress(writer, stage, processed, local_total, started)
             while next_log_at <= processed:
                 next_log_at += log_every
     output_dir = Path(cfg.project.output_dir)
     if benchmark:
         generation_peak = torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else None
         prefill_seconds, prefill_flops = [], []
-        with prefill.preserve_rng():
+        with prefill.preserve_rng(), torch.autocast(device_type=device.type, enabled=False):
             for batch in progress_bar(islice(data, warmup_samples), desc='benchmark-prefill-warmup',
                     total=warmup_samples, disable=disable_progress):
                 prefill.measure_prefill_seconds(model, inputs(batch, device), **prefill_kwargs)
@@ -454,7 +525,7 @@ def inference(cfg, checkpoint_path, *, benchmark=False, max_samples=None, skip_m
                         _minimal_progress(writer, phase, current, total, phase_started)
         summary = summarize_latencies(e2e_seconds=e2e, generation_seconds=gen, output_tokens=counts,
             prefill_seconds=prefill_seconds, prefill_flops=prefill_flops)
-        summary.update(metadata(cfg, model))
+        summary.update(metadata(cfg, model, inference=True))
         measurement = prefill.measurement_metadata(num_beams=cfg.generation.num_beams, warmup_samples=warmup_samples)
         import transformers
         summary.update(prefill_measurement=measurement, flops_measurement=dict(measurement),
@@ -469,6 +540,28 @@ def inference(cfg, checkpoint_path, *, benchmark=False, max_samples=None, skip_m
         write_json(output_dir/'benchmark.json', summary)
         event(cfg, 'BENCHMARK', summary)
         return summary
+    if accelerator.num_processes > 1:
+        gathered = [None] * accelerator.num_processes if accelerator.is_main_process else None
+        torch.distributed.gather_object(rows, gathered, dst=0)
+        if accelerator.is_main_process:
+            rows = [row for shard in gathered for row in shard]
+    metrics = None
+    if accelerator.is_main_process:
+        rows.sort(key=lambda row: row['_source_index'])
+        if [row['_source_index'] for row in rows] != list(range(total)):
+            raise ValueError('Distributed evaluation has duplicate or missing source indices')
+        for row in rows:
+            row.pop('_source_index')
+        metrics = _write_evaluation(cfg, rows, skip_meteor=skip_meteor)
+    if accelerator.num_processes > 1:
+        result = [metrics]
+        torch.distributed.broadcast_object_list(result, src=0)
+        metrics = result[0]
+    return metrics
+
+
+def _write_evaluation(cfg, rows, *, skip_meteor=False):
+    output_dir = Path(cfg.project.output_dir)
     write_predictions(output_dir/'predictions.jsonl', rows)
     diagnostics = write_generation_diagnostics(output_dir/'generation_diagnostics.json', rows)
     metrics = caption_metrics(rows, skip_meteor=skip_meteor)
