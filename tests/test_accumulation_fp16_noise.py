@@ -24,7 +24,8 @@ class ScaledBackend:
 
 
 def measured_probe(*, repeat_noise=.0005, actual_noise=.0006, extra_division=False,
-                   reverse_small=False, nonfinite=False):
+                   reverse_small=False, nonfinite=False,
+                   small_repeat_noise=None, small_actual_noise=None, small_coefficient=.01):
     model = torch.nn.ParameterDict({
         'large': torch.nn.Parameter(torch.zeros(4)),
         'small': torch.nn.Parameter(torch.zeros(1)),
@@ -38,6 +39,11 @@ def measured_probe(*, repeat_noise=.0005, actual_noise=.0006, extra_division=Fal
             calls[name] += 1
             phase = index // 8 if index < 24 else index - 24
             factor = (1., 1. + repeat_noise, 1. + actual_noise)[phase]
+            if name == 'small':
+                if phase == 1 and small_repeat_noise is not None:
+                    factor = 1. + small_repeat_noise
+                if phase == 2 and small_actual_noise is not None:
+                    factor = 1. + small_actual_noise
             if name == 'small' and reverse_small and phase == 2:
                 factor = -1.
             return gradient * (float('inf') if nonfinite else factor)
@@ -47,7 +53,7 @@ def measured_probe(*, repeat_noise=.0005, actual_noise=.0006, extra_division=Fal
     state = torch.get_rng_state().clone()
     scaler_state = backend.scaler.state_dict().copy()
     report = compare_accumulation_gradients(model, [None] * 8, backend,
-        lambda _: model['large'].sum() * 100 + model['small'].sum() * .01,
+        lambda _: model['large'].sum() * 100 + model['small'].sum() * small_coefficient,
         fp16_noise_check=True)
     assert torch.equal(state, torch.get_rng_state())
     assert backend.scaler.state_dict() == scaler_state
@@ -91,6 +97,24 @@ def test_fp16_rejects_nonfinite_gradients():
     report = measured_probe(nonfinite=True)
     assert not report['ok']
     assert all(not case['finite'] for case in report['cases'])
+
+
+def test_fp16_low_noise_single_tensor_replay_does_not_underestimate_system_noise():
+    # Kaggle: global replay 0.02562%, but one k_proj replay only 0.002574%.
+    # Its backend error 0.01111% is below global replay, not a scaling failure.
+    report = measured_probe(repeat_noise=.0002562144, actual_noise=.000231076,
+        small_repeat_noise=.0000257363, small_actual_noise=.000111145, small_coefficient=1.)
+    assert report['ok']
+    for case in report['cases']:
+        assert not case['failed_parameters']
+        assert case['tensor_relative_L2_floor'] == pytest.approx(case['relative_L2_limit'])
+
+
+def test_fp16_system_noise_does_not_remove_individual_tensor_cap():
+    report = measured_probe(repeat_noise=.00057, actual_noise=.00061,
+        small_repeat_noise=.000026, small_actual_noise=.003)
+    assert not report['ok']
+    assert all('small' in case['failed_parameters'] for case in report['cases'])
 
 
 def test_smol_verify_wires_noise_check_and_replays_native_dropout(tmp_path, monkeypatch):
