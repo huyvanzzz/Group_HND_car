@@ -30,3 +30,17 @@ Các test dùng model/tokenizer nhỏ thật, bao phủ camera/processor parity,
 CPU không xác nhận T4 đủ VRAM, tốc độ hay chất lượng DriveLM. Hai phép stress trên Kaggle vẫn phải pass trước khi train. Chưa commit/push hoặc chạy full training.
 
 Kết quả ngày 2026-11-14: full suite **1.152 passed, 4 skipped**, 428,89 giây; notebook syntax và `git diff --check` pass. Các cảnh báo trong lượt chạy là pin memory trên CPU và fixture beam 1 có `early_stopping=True`. Kiểm tra bổ sung xác nhận log checkpointing active của stress đúng với mode training và mọi skipped update ngoài interval cũng được ghi.
+
+## Verify accumulation FP16 khi GPU có dao động số học
+
+Log Kaggle thực tế cho thấy ngay cả reference backward chạy lại với cùng RNG cũng vượt `allclose` cũ: relative L2 khoảng 0,0275% ở cửa sổ đủ và 0,0510% ở nhóm dư; backend lệch khoảng 0,0216% và 0,0566%. Vì vậy `verify-accumulation` của SmolVLM FP16 dùng marker `comparison_implementation: fp16_replay_noise_v1`:
+
+- Mỗi cửa sổ có reference, replay reference và backend; cùng microbatches, RNG và GradScaler scale. Không có optimizer step hoặc scaler update; không tạo thêm model hoặc giữ thêm một bản gradient đầy đủ.
+- Giữ `mismatched_tensor_count` và các chênh lệch elementwise cũ làm diagnostics. Điều kiện pass dùng relative L2, cosine và norm ratio ở cả mức toàn mô hình và từng tensor, để tensor lớn không che lỗi của tensor nhỏ.
+- Giới hạn relative L2 là `min(0.002, max(0.0001, 3 * replay_relative_L2))`; norm ratio lệch tối đa 0,002, cosine tối thiểu 0,999998. Reference replay cũng phải ổn định. Tensor có gradient gần zero vẫn được xét bằng absolute tolerance cũ. Đây là guardrail của phép chẩn đoán, không phải ngưỡng được paper bảo đảm về chất lượng model.
+- Gradient thiếu/NaN/Inf, reference không ổn định, sai scaling hoặc sai tensor vượt giới hạn đều fail. JSON có thêm `reference_repeat`, `relative_L2`, `cosine_similarity`, `relative_L2_limit`, `failed_parameters` và `failed_parameter_diagnostics`.
+- Nhánh FP32 giữ nguyên phép so cũ. Không sửa training, loss, config, notebook, checkpoint hay cache. Verify FP16 thêm một lượt reference backward, nên tốn thời gian hơn phép kiểm tra trước.
+
+Sau khi cập nhật source trên Kaggle, chạy lại cell verify; chỉ khi pass mới tiếp tục các cell stress và train. Không bỏ gate hoặc tự tăng giới hạn nếu còn fail; xem diagnostics từng tensor. Chưa có phép chạy CUDA local để xác nhận gate mới trên T4.
+
+Kiểm chứng bản sửa verify: **125 tests passed** (50,09 giây), bao gồm replay noise có kiểm soát, chia thừa 8 lần, sai tensor nhỏ, reference không ổn định, NaN/Inf, native model có dropout/checkpointing, FP32 accumulation và lifecycle resume; `git diff --check` pass. Không commit/push.

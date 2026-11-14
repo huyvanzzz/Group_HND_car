@@ -407,7 +407,8 @@ def verify_accumulation(cfg):
             batch = next(iterator)
         values.append(batch)
     report = compare_accumulation_gradients(model, values, accelerator,
-        lambda batch: model(**inputs(batch, accelerator.device)).loss)
+        lambda batch: model(**inputs(batch, accelerator.device)).loss,
+        fp16_noise_check=cfg.runtime.precision == 'fp16')
     report['backend_accumulation_steps'] = accelerator.gradient_accumulation_steps
     write_json(Path(cfg.project.output_dir)/'debug'/'gradient_accumulation_verify.json', report)
     if not report['ok']:

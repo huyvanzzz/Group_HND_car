@@ -13,13 +13,16 @@ from .checkpointing import _rng_state, _restore_rng_state
 from .training_accumulation import loss_for_backward
 
 
-def compare_accumulation_gradients(model, batches, accelerator, loss_fn, *, rtol=1e-4, atol=1e-6):
+def compare_accumulation_gradients(model, batches, accelerator, loss_fn, *, rtol=1e-4, atol=1e-6,
+                                   fp16_noise_check=False):
     """Compare backend gradients to mean(raw losses), replaying dropout/Gumbel RNG.
 
     No optimizer is created or stepped. Reference gradients live on CPU, and
     each forward graph is freed immediately after backward. This probe expects
     a disposable model with no preexisting gradients.
     """
+    if fp16_noise_check:
+        return _compare_fp16_replay(model, batches, accelerator, loss_fn, rtol=rtol, atol=atol)
     if accelerator.num_processes != 1:
         raise ValueError('Accumulation debug is a single-process probe; run without accelerate launch')
     steps = accelerator.gradient_accumulation_steps
@@ -95,6 +98,150 @@ def compare_accumulation_gradients(model, batches, accelerator, loss_fn, *, rtol
         'optimizer_steps': 0, 'weights_and_buffers_unchanged': unchanged,
         'rtol': rtol, 'atol': atol, 'cases': cases,
     }
+
+
+def _gradient_comparison(parameters, reference, scale, *, rtol, atol):
+    """One CPU gradient snapshot plus scalar statistics, not a second model copy."""
+    stats, missing = {}, []
+    sums = dict(diff2=0., actual2=0., ref2=0., dot=0.)
+    maximum, mismatches, finite = 0., [], True
+    for name, parameter in parameters:
+        ref = reference[name]
+        actual = parameter.grad.detach().float().cpu() / scale if parameter.grad is not None else None
+        if ref is None or actual is None:
+            missing.append(name)
+            finite = False
+            stats[name] = {'finite': False, 'pointwise_ok': False}
+            continue
+        valid = bool(torch.isfinite(actual).all() and torch.isfinite(ref).all())
+        pointwise = valid and torch.allclose(actual, ref, rtol=rtol, atol=atol)
+        if not pointwise:
+            mismatches.append(name)
+        finite = finite and valid
+        if not valid:
+            stats[name] = {'finite': False, 'pointwise_ok': False}
+            continue
+        x, y = actual.double(), ref.double()
+        values = dict(diff2=float((x-y).square().sum()), actual2=float(x.square().sum()),
+                      ref2=float(y.square().sum()), dot=float((x*y).sum()))
+        error = float((actual-ref).abs().max())
+        maximum = max(maximum, error)
+        stats[name] = {**_relative_metrics(values), 'finite': True,
+                       'pointwise_ok': bool(pointwise), 'max_abs_error': error}
+        for key in sums:
+            sums[key] += values[key]
+    summary = {**_relative_metrics(sums), 'finite': finite,
+        'pointwise_ok': not mismatches and not missing,
+        'checked_tensors': len(parameters)-len(missing), 'parameters_without_gradient': missing,
+        'max_abs_error': maximum if finite else None,
+        'reference_gradient_norm': math.sqrt(sums['ref2']) if finite else None,
+        'mismatched_tensor_count': len(mismatches), 'mismatched_parameters': mismatches[:20]}
+    if not finite:
+        for key in ('relative_L2', 'cosine_similarity', 'gradient_norm_ratio'):
+            summary[key] = None
+    return summary, stats
+
+
+def _relative_metrics(values):
+    ref2, actual2 = values['ref2'], values['actual2']
+    return {
+        'relative_L2': math.sqrt(values['diff2']/ref2) if ref2 > 0 else (0. if actual2 == 0 else None),
+        'gradient_norm_ratio': math.sqrt(actual2/ref2) if ref2 > 0 else None,
+        'cosine_similarity': max(-1., min(1., values['dot']/math.sqrt(ref2*actual2)))
+            if ref2*actual2 > 0 else (1. if ref2 == actual2 == 0 else None),
+    }
+
+
+def _bounded_fp16_error(stats):
+    # Diagnostic guardrails, not a claim about acceptable task-quality changes.
+    return (stats['finite'] and stats.get('relative_L2') is not None
+        and stats['relative_L2'] <= .002
+        and (stats.get('gradient_norm_ratio') is None or abs(stats['gradient_norm_ratio']-1.) <= .002)
+        and stats.get('cosine_similarity') is not None and stats['cosine_similarity'] >= .999998)
+
+
+def _within_replay_noise(actual, repeat):
+    if not actual['finite'] or not repeat['finite']:
+        return False
+    # Preserve the original absolute tolerance for negligible/zero-gradient tensors.
+    if not (repeat['pointwise_ok'] or _bounded_fp16_error(repeat)):
+        return False
+    if actual['pointwise_ok']:
+        return True
+    limit = min(.002, max(1e-4, 3.*(repeat.get('relative_L2') or 0.)))
+    return _bounded_fp16_error(actual) and actual['relative_L2'] <= limit
+
+
+def _compare_fp16_replay(model, batches, accelerator, loss_fn, *, rtol, atol):
+    if accelerator.num_processes != 1:
+        raise ValueError('Accumulation debug is a single-process probe')
+    steps = accelerator.gradient_accumulation_steps
+    if len(batches) < steps:
+        raise ValueError(f'Need {steps} real microbatches to check the configured full window')
+    scaler = getattr(accelerator, 'scaler', None)
+    if scaler is None or not scaler.is_enabled():
+        raise ValueError('FP16 replay check requires an enabled GradScaler')
+    scale = float(scaler.get_scale())
+    scaler_before = scaler.state_dict().copy()
+    parameters = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+    versions = [(p, p._version) for p in model.parameters()]
+    buffers = [(b, b.detach().clone()) for b in model.buffers()]
+    initial_rng = _rng_state()
+    cases = []
+
+    def backward(size, rng, *, backend):
+        model.zero_grad(set_to_none=True)
+        _restore_rng_state(rng)
+        for batch in batches[:size]:
+            with accelerator.autocast():
+                raw = loss_fn(batch)
+            if backend:
+                accelerator.backward(loss_for_backward(raw, steps, size))
+            else:
+                scaler.scale(raw/size).backward()
+
+    try:
+        for size in dict.fromkeys((steps, 1)):
+            rng = _rng_state()
+            backward(size, rng, backend=False)
+            reference = {name: p.grad.detach().float().cpu().clone()/scale if p.grad is not None else None
+                         for name, p in parameters}
+            backward(size, rng, backend=False)
+            repeat, repeat_tensors = _gradient_comparison(parameters, reference, scale, rtol=rtol, atol=atol)
+            backward(size, rng, backend=True)
+            actual, actual_tensors = _gradient_comparison(parameters, reference, scale, rtol=rtol, atol=atol)
+            failed = [name for name, _ in parameters
+                      if not _within_replay_noise(actual_tensors[name], repeat_tensors[name])]
+            repeat['ok'] = (_bounded_fp16_error(repeat) and repeat['checked_tensors'] > 0
+                and repeat['reference_gradient_norm'] is not None and repeat['reference_gradient_norm'] > 0
+                and all(item['finite'] and (item['pointwise_ok'] or _bounded_fp16_error(item))
+                        for item in repeat_tensors.values()))
+            limit = min(.002, max(1e-4, 3.*(repeat['relative_L2'] or 0.)))
+            ok = (repeat['ok'] and _bounded_fp16_error(actual) and actual['relative_L2'] <= limit
+                  and not failed)
+            cases.append({**actual, 'name': 'full_window' if size == steps else 'tail_window',
+                'window_size': size, 'backward_loss_multiplier': steps/size,
+                'reference_repeat': repeat, 'relative_L2_limit': limit,
+                'failed_parameters': failed[:20], 'failed_parameter_count': len(failed),
+                'failed_parameter_diagnostics': {name: {'backend': actual_tensors[name],
+                    'reference_repeat': repeat_tensors[name]} for name in failed[:20]}, 'ok': bool(ok)})
+            del reference
+    finally:
+        model.zero_grad(set_to_none=True)
+        _restore_rng_state(initial_rng)
+    unchanged = all(p._version == version for p, version in versions)
+    unchanged = unchanged and all(torch.equal(b, old) for b, old in buffers)
+    scaler_unchanged = scaler.state_dict() == scaler_before
+    return {'ok': unchanged and scaler_unchanged and all(case['ok'] for case in cases),
+        'comparison_implementation': 'fp16_replay_noise_v1',
+        'scope': 'single_process_gradient_comparison', 'ddp_replay_verified': False,
+        'configured_accumulation_steps': steps, 'backend_accumulation_steps': steps,
+        'optimizer_steps': 0, 'weights_and_buffers_unchanged': unchanged,
+        'scaler_unchanged': scaler_unchanged, 'grad_scaler_scale': scale,
+        'rtol': rtol, 'atol': atol,
+        'fp16_noise_policy': {'replay_multiplier': 3., 'relative_L2_floor': 1e-4,
+            'relative_L2_cap': .002, 'norm_ratio_deviation_cap': .002, 'minimum_cosine': .999998},
+        'cases': cases}
 
 
 def diagnose_accumulation(cfg):
