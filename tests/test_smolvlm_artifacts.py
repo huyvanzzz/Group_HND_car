@@ -231,7 +231,7 @@ def test_fp16_notebook_preflight_and_fresh_fp32_inference_contract():
     assert "mixed_precision='no'" in preflight
     assert "PREFLIGHT_PASSED = False" in preflight and "PREFLIGHT_PASSED = True" in preflight
     train = next(s for s in cells if 'LOCAL_LATEST =' in s)
-    assert 'if not PREFLIGHT_PASSED:' in train
+    assert 'if RUN_PREFLIGHT_CHECKS and not PREFLIGHT_PASSED:' in train
     assert "'--mixed_precision', 'fp16'" in train
     evaluation = next(s for s in cells if "checkpoint = PROFILE / 'checkpoints/finetune_best.pt'" in s)
     assert "run_distributed_backend('evaluate'" in evaluation
@@ -249,7 +249,8 @@ def test_gpu_stress_failure_keeps_training_gate_closed():
         calls.append((command, args, kwargs))
         if 'evaluate' in args:
             raise RuntimeError('rank failed')
-    namespace = {'PREFLIGHT_PASSED': True, 'DIAGNOSE_PASSED': True, 'ACCUMULATION_PASSED': True,
+    namespace = {'RUN_PREFLIGHT_CHECKS': True,
+                 'PREFLIGHT_PASSED': True, 'DIAGNOSE_PASSED': True, 'ACCUMULATION_PASSED': True,
                  'run_backend': lambda *args: None,
                  'run_distributed_backend': launch}
     with pytest.raises(RuntimeError, match='rank failed'):
@@ -270,7 +271,7 @@ def test_preflight_cells_require_prior_success_and_invalidate_stale_flags():
     calls = []
     ns = {'run_backend': lambda *args: calls.append(args),
           'run_distributed_backend': lambda *args, **kwargs: calls.append(args),
-          'PREFLIGHT_PASSED': True}
+          'PREFLIGHT_PASSED': True, 'RUN_PREFLIGHT_CHECKS': True}
     for cell in (accumulation, stress):
         with pytest.raises(RuntimeError, match='Run'):
             exec(compile(cell, 'out_of_order', 'exec'), ns)
@@ -291,3 +292,37 @@ def test_preflight_cells_require_prior_success_and_invalidate_stale_flags():
             exec(compile(cell, 'failed_probe', 'exec'), ns)
         assert ns[flag] is False and ns['PREFLIGHT_PASSED'] is False
     assert ns['ACCUMULATION_PASSED'] is False
+
+
+def test_preflight_switch_skips_all_three_cells_without_claiming_pass():
+    _, cells = sources()
+    setup = next(s for s in cells if 'GRADIENT_CHECKPOINTING = True' in s)
+    assert 'RUN_PREFLIGHT_CHECKS = False' in setup
+    checks = [next(s for s in cells if marker in s) for marker in (
+        "run_backend('diagnose-train'", "run_backend('verify-accumulation'", "'--stress'")]
+    def unexpected(*args, **kwargs):
+        pytest.fail('Disabled preflight must not launch a model probe')
+    ns = {'RUN_PREFLIGHT_CHECKS': False, 'run_backend': unexpected,
+          'run_distributed_backend': unexpected,
+          'DIAGNOSE_PASSED': True, 'ACCUMULATION_PASSED': True, 'PREFLIGHT_PASSED': True}
+    for cell in checks:
+        exec(compile(cell, 'skipped_probe', 'exec'), ns)
+    assert ns['DIAGNOSE_PASSED'] is False
+    assert ns['ACCUMULATION_PASSED'] is False
+    assert ns['PREFLIGHT_PASSED'] is False
+
+
+@pytest.mark.parametrize('enabled,passed,blocked', [(False,False,False), (True,False,True), (True,True,False)])
+def test_train_gate_honors_switch_but_always_validates_storage(enabled, passed, blocked):
+    _, cells = sources()
+    train = next(s for s in cells if 'LOCAL_LATEST =' in s)
+    guard = train.split('checkpoint_dir =', 1)[0]
+    calls = []
+    ns = {'RUN_PREFLIGHT_CHECKS': enabled, 'PREFLIGHT_PASSED': passed,
+          'assert_storage_ready': lambda: calls.append('storage')}
+    if blocked:
+        with pytest.raises(RuntimeError, match='Run diagnose'):
+            exec(compile(guard, 'train_gate', 'exec'), ns)
+    else:
+        exec(compile(guard, 'train_gate', 'exec'), ns)
+    assert calls == ['storage']

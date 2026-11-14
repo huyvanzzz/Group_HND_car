@@ -65,3 +65,8 @@ Giới hạn động vẫn bị chặn ở 1%: toàn mô hình dùng `min(0.01, 
 Chỉ nới verify FP16; không sửa FP32, training, config, notebook, cache hoặc checkpoint. Không có JSON của lần fail mới nhất khi thực hiện yêu cầu nới ngưỡng, nên chưa xác định điều kiện fail ở lần đó. Cần cập nhật code và chạy lại cell verify trên Kaggle; không cần extract cache hoặc chạy lại cell probe thủ công cũ.
 
 Kiểm thử policy nới: **129 passed**, 47,71 giây; bao phủ noise vừa phải được chấp nhận, quiet-reference vẫn không cho pass sai lệch quá giới hạn động, sai gradient tensor nhỏ, chia thừa 8 lần, NaN/Inf và reference không ổn định. `git diff --check` pass; chưa commit/push hoặc chạy bản nới trên GPU.
+
+
+## Optional notebook preflight
+
+`RUN_PREFLIGHT_CHECKS = False` in the first code cell skips the diagnose, accumulation verification and GPU stress cells (code cells 7, 8 and 9) during Run All. Skipped checks retain false pass flags. Set the switch to `True` to restore sequential verification and block training on a failed check. Cache/storage validation, checkpoint identity/RNG verification on resume and training numeric checks remain unchanged. This switch does not change model or training configuration.
