@@ -13,6 +13,17 @@ from .checkpointing import _rng_state, _restore_rng_state
 from .training_accumulation import loss_for_backward
 
 
+_FP16_NOISE_POLICY = {
+    'version': 'relaxed_fp16_v1',
+    'replay_multiplier': 5.,
+    'relative_L2_floor': .002,
+    'relative_L2_cap': .01,
+    'norm_ratio_deviation_cap': .01,
+    'minimum_cosine': .9999,
+    'tensor_noise_floor': 'global_reference_replay',
+}
+
+
 def compare_accumulation_gradients(model, batches, accelerator, loss_fn, *, rtol=1e-4, atol=1e-6,
                                    fp16_noise_check=False):
     """Compare backend gradients to mean(raw losses), replaying dropout/Gumbel RNG.
@@ -155,12 +166,20 @@ def _relative_metrics(values):
 def _bounded_fp16_error(stats):
     # Diagnostic guardrails, not a claim about acceptable task-quality changes.
     return (stats['finite'] and stats.get('relative_L2') is not None
-        and stats['relative_L2'] <= .002
-        and (stats.get('gradient_norm_ratio') is None or abs(stats['gradient_norm_ratio']-1.) <= .002)
-        and stats.get('cosine_similarity') is not None and stats['cosine_similarity'] >= .999998)
+        and stats['relative_L2'] <= _FP16_NOISE_POLICY['relative_L2_cap']
+        and (stats.get('gradient_norm_ratio') is None
+             or abs(stats['gradient_norm_ratio']-1.) <= _FP16_NOISE_POLICY['norm_ratio_deviation_cap'])
+        and stats.get('cosine_similarity') is not None
+        and stats['cosine_similarity'] >= _FP16_NOISE_POLICY['minimum_cosine'])
 
 
-def _within_replay_noise(actual, repeat, *, relative_L2_floor=1e-4):
+def _fp16_relative_limit(repeat_error, *, floor=None):
+    floor = _FP16_NOISE_POLICY['relative_L2_floor'] if floor is None else floor
+    return min(_FP16_NOISE_POLICY['relative_L2_cap'],
+        max(floor, _FP16_NOISE_POLICY['replay_multiplier']*(repeat_error or 0.)))
+
+
+def _within_replay_noise(actual, repeat, *, relative_L2_floor=None):
     if not actual['finite'] or not repeat['finite']:
         return False
     # Preserve the original absolute tolerance for negligible/zero-gradient tensors.
@@ -168,11 +187,13 @@ def _within_replay_noise(actual, repeat, *, relative_L2_floor=1e-4):
         return False
     if actual['pointwise_ok']:
         return True
-    limit = min(.002, max(relative_L2_floor, 3.*(repeat.get('relative_L2') or 0.)))
+    limit = _fp16_relative_limit(repeat.get('relative_L2'), floor=relative_L2_floor)
     return _bounded_fp16_error(actual) and actual['relative_L2'] <= limit
 
 
 def _compare_fp16_replay(model, batches, accelerator, loss_fn, *, rtol, atol):
+    # Only this FP16 diagnostic opts into wider numeric tolerances; FP32 is unchanged.
+    rtol, atol = max(rtol, .001), max(atol, 1e-5)
     if accelerator.num_processes != 1:
         raise ValueError('Accumulation debug is a single-process probe')
     steps = accelerator.gradient_accumulation_steps
@@ -210,7 +231,7 @@ def _compare_fp16_replay(model, batches, accelerator, loss_fn, *, rtol, atol):
             repeat, repeat_tensors = _gradient_comparison(parameters, reference, scale, rtol=rtol, atol=atol)
             backward(size, rng, backend=True)
             actual, actual_tensors = _gradient_comparison(parameters, reference, scale, rtol=rtol, atol=atol)
-            limit = min(.002, max(1e-4, 3.*(repeat['relative_L2'] or 0.)))
+            limit = _fp16_relative_limit(repeat['relative_L2'])
             # A single tensor's replay can land unusually close by chance. Use
             # measured system noise as its floor, retaining all per-tensor caps.
             failed = [name for name, _ in parameters
@@ -229,8 +250,8 @@ def _compare_fp16_replay(model, batches, accelerator, loss_fn, *, rtol, atol):
                 'failed_parameters': failed[:20], 'failed_parameter_count': len(failed),
                 'failed_parameter_diagnostics': {name: {'backend': actual_tensors[name],
                     'reference_repeat': repeat_tensors[name],
-                    'relative_L2_limit': min(.002, max(limit,
-                        3.*(repeat_tensors[name].get('relative_L2') or 0.)))}
+                    'relative_L2_limit': _fp16_relative_limit(
+                        repeat_tensors[name].get('relative_L2'), floor=limit)}
                     for name in failed[:20]}, 'ok': bool(ok)})
             del reference
     finally:
@@ -246,9 +267,7 @@ def _compare_fp16_replay(model, batches, accelerator, loss_fn, *, rtol, atol):
         'optimizer_steps': 0, 'weights_and_buffers_unchanged': unchanged,
         'scaler_unchanged': scaler_unchanged, 'grad_scaler_scale': scale,
         'rtol': rtol, 'atol': atol,
-        'fp16_noise_policy': {'replay_multiplier': 3., 'relative_L2_floor': 1e-4,
-            'tensor_noise_floor': 'global_reference_replay',
-            'relative_L2_cap': .002, 'norm_ratio_deviation_cap': .002, 'minimum_cosine': .999998},
+        'fp16_noise_policy': dict(_FP16_NOISE_POLICY),
         'cases': cases}
 
 

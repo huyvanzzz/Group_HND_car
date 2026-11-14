@@ -46,3 +46,22 @@ Sau khi cập nhật source trên Kaggle, chạy lại cell verify; chỉ khi pa
 Kiểm chứng bản sửa verify: **125 tests passed** (50,09 giây), bao gồm replay noise có kiểm soát, chia thừa 8 lần, sai tensor nhỏ, reference không ổn định, NaN/Inf, native model có dropout/checkpointing, FP32 accumulation và lifecycle resume; `git diff --check` pass. Không commit/push.
 
 Follow-up từ JSON Kaggle: toàn mô hình pass về sai lệch, nhưng một `layers.22.self_attn.k_proj.weight` bị loại do replay cục bộ tình cờ rất nhỏ (relative L2 0,00002574), tạo limit 0,0001 trong khi backend lệch 0,00011114. Rule tensor được sửa thành `min(0.002, max(0.0001, 3*global_replay_L2, 3*local_replay_L2))`: dùng dao động hệ thống làm sàn, không tăng trần 0,2% hoặc bỏ kiểm tra từng tensor. JSON thêm `tensor_relative_L2_floor` và policy `tensor_noise_floor: global_reference_replay`; diagnostics tensor fail ghi limit riêng. Không thêm lượt backward so với bản replay trước.
+
+### Policy hiện hành: nới đồng bộ theo yêu cầu người dùng
+
+Các ngưỡng 0,2%/hệ số 3 phía trên là lịch sử. Policy hiện hành được ghi trong JSON bằng `fp16_noise_policy.version: relaxed_fp16_v1`:
+
+| Kiểm tra FP16 | Ngưỡng hiện hành |
+|---|---:|
+| Elementwise rtol / atol | 0,001 / 0,00001 |
+| Relative L2, toàn mô hình và từng tensor | Trần 1% |
+| Độ lệch gradient norm ratio | Tối đa 1% |
+| Cosine similarity | Tối thiểu 0,9999 |
+| Sàn relative L2 | 0,2% |
+| Hệ số so với replay noise | 5 |
+
+Giới hạn động vẫn bị chặn ở 1%: toàn mô hình dùng `min(0.01, max(0.002, 5*global_replay_L2))`, từng tensor lấy thêm `5*local_replay_L2`. Vì thế đây không phải cho pass mọi gradient. Reference dao động quá lớn, gradient thiếu/NaN/Inf, đổi weights/buffers/scaler, lỗi chia thừa accumulation vẫn bị từ chối. Đây là phép kiểm tra chẩn đoán có tolerance do thực nghiệm chọn; không chứng minh hai gradient tương đương tuyệt đối hay bảo đảm chất lượng cuối cùng.
+
+Chỉ nới verify FP16; không sửa FP32, training, config, notebook, cache hoặc checkpoint. Không có JSON của lần fail mới nhất khi thực hiện yêu cầu nới ngưỡng, nên chưa xác định điều kiện fail ở lần đó. Cần cập nhật code và chạy lại cell verify trên Kaggle; không cần extract cache hoặc chạy lại cell probe thủ công cũ.
+
+Kiểm thử policy nới: **129 passed**, 47,71 giây; bao phủ noise vừa phải được chấp nhận, quiet-reference vẫn không cho pass sai lệch quá giới hạn động, sai gradient tensor nhỏ, chia thừa 8 lần, NaN/Inf và reference không ổn định. `git diff --check` pass; chưa commit/push hoặc chạy bản nới trên GPU.

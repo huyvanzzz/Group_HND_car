@@ -63,13 +63,13 @@ def measured_probe(*, repeat_noise=.0005, actual_noise=.0006, extra_division=Fal
 
 
 def test_fp16_accepts_small_measured_replay_noise_but_keeps_elementwise_diagnostics():
-    report = measured_probe()
+    report = measured_probe(repeat_noise=.0025, actual_noise=.003)
     assert report['ok'] and report['optimizer_steps'] == 0
     assert report['comparison_implementation'] == 'fp16_replay_noise_v1'
     for case in report['cases']:
         assert case['mismatched_tensor_count'] > 0
-        assert case['reference_repeat']['relative_L2'] == pytest.approx(.0005, rel=.001)
-        assert case['relative_L2'] == pytest.approx(.0006, rel=.001)
+        assert case['reference_repeat']['relative_L2'] == pytest.approx(.0025, rel=.001)
+        assert case['relative_L2'] == pytest.approx(.003, rel=.001)
         assert case['cosine_similarity'] > .999999
         assert case['ok'] and not case['failed_parameters']
 
@@ -88,7 +88,7 @@ def test_fp16_cannot_hide_wrong_small_tensor_in_global_norm():
 
 
 def test_fp16_rejects_unstable_reference_instead_of_adapting_without_limit():
-    report = measured_probe(repeat_noise=.01, actual_noise=.0006)
+    report = measured_probe(repeat_noise=.05, actual_noise=.0006)
     assert not report['ok']
     assert all(not case['reference_repeat']['ok'] for case in report['cases'])
 
@@ -112,9 +112,29 @@ def test_fp16_low_noise_single_tensor_replay_does_not_underestimate_system_noise
 
 def test_fp16_system_noise_does_not_remove_individual_tensor_cap():
     report = measured_probe(repeat_noise=.00057, actual_noise=.00061,
-        small_repeat_noise=.000026, small_actual_noise=.003)
+        small_repeat_noise=.000026, small_actual_noise=.02)
     assert not report['ok']
     assert all('small' in case['failed_parameters'] for case in report['cases'])
+
+
+def test_fp16_relaxed_policy_is_explicit_and_accepts_moderate_replay_noise():
+    report = measured_probe(repeat_noise=.003, actual_noise=.004,
+        small_repeat_noise=.0025, small_actual_noise=.0045, small_coefficient=1.)
+    assert report['ok']
+    assert report['rtol'] == .001 and report['atol'] == .00001
+    policy = report['fp16_noise_policy']
+    assert policy['relative_L2_cap'] == .01
+    assert policy['norm_ratio_deviation_cap'] == .01
+    assert policy['relative_L2_floor'] == .002
+    assert policy['replay_multiplier'] == 5.
+    assert policy['minimum_cosine'] == .9999
+    assert policy['version'] == 'relaxed_fp16_v1'
+
+
+def test_fp16_relaxed_policy_keeps_global_limit_when_replay_is_quiet():
+    report = measured_probe(repeat_noise=0., actual_noise=.005)
+    assert not report['ok']
+    assert all(case['relative_L2'] > case['relative_L2_limit'] for case in report['cases'])
 
 
 def test_smol_verify_wires_noise_check_and_replays_native_dropout(tmp_path, monkeypatch):
